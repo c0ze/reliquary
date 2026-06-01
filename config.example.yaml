@@ -1,0 +1,25 @@
+# Mem0 config for Reliquary. Copy to config.yaml (gitignored) and adjust.
+# Service hostnames (qdrant, embedder) are the docker-compose service names.
+
+vector_store:
+  provider: qdrant
+  config:
+    host: qdrant
+    port: 6333
+    # Must match your embedding model's output dimensionality.
+    embedding_model_dims: 768
+
+embedder:
+  # The bundled embedder container (Text-Embeddings-Inference) exposes an
+  # OpenAI-compatible /v1/embeddings endpoint. mem0's "openai" provider points
+  # at any such endpoint; the api_key is unused but must be non-empty.
+  provider: openai
+  config:
+    model: nomic-embed-text-v1.5
+    openai_base_url: http://embedder/v1
+    api_key: not-needed
+    embedding_dims: 768
+
+# No `llm:` section needed in MCP-only mode (--no-chat-upstream): the LLM is
+# only used for chat completions and infer=true writes. Add one if you enable
+# those.

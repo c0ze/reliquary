@@ -1,0 +1,12 @@
+# Runtime dependencies for the Reliquary MCP memory server.
+#
+# Abstract floors reflecting the APIs the code relies on. For reproducible
+# deploys, generate and commit a lockfile from a known-good environment:
+#
+#     pip install -r requirements.txt && pip freeze > requirements.lock
+#     # deploy with: pip install -r requirements.lock
+mem0ai>=0.1.0
+qdrant-client>=1.7.0
+httpx>=0.27.0
+uvicorn>=0.30.0
+PyYAML>=6.0
