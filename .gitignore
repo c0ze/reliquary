@@ -1,0 +1,22 @@
+# Secrets & local config
+.env
+config.yaml
+*.local.yaml
+requirements.lock
+
+# Data — never commit your corpus or the vector store
+data/
+corpus/
+*.jsonl
+qdrant_storage/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# OS / editor
+.DS_Store
