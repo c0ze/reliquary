@@ -195,6 +195,13 @@ class Mem0ChatProxy:
                 await self.handle_health(send)
                 return
 
+            if method == "GET" and path == "/status":
+                if not self._require_claude_auth(decode_headers(scope)):
+                    await self._send_unauthorized(send)
+                    return
+                await self.handle_status(send)
+                return
+
             if method == "GET" and (
                 path == "/.well-known/oauth-protected-resource"
                 or path.startswith("/.well-known/oauth-protected-resource/")
@@ -252,6 +259,10 @@ class Mem0ChatProxy:
                 return
 
             if path == "/mem0/search":
+                # Debug search returns raw memories; never expose it unauthenticated.
+                if not self._require_claude_auth(decode_headers(scope)):
+                    await self._send_unauthorized(send)
+                    return
                 await self.handle_debug_search(scope, receive, send)
                 return
 
@@ -300,6 +311,11 @@ class Mem0ChatProxy:
                 return
 
     async def handle_health(self, send) -> None:
+        # Minimal and unauthenticated. The detailed status below can leak
+        # taxonomy/domain names + config, so it lives behind auth at /status.
+        await self.send_json(send, 200, {"status": "ok", "name": MCP_SERVER_NAME})
+
+    async def handle_status(self, send) -> None:
         await self.send_json(
             send,
             200,
@@ -1113,6 +1129,21 @@ class Mem0ChatProxy:
         if not origin:
             return True
         return origin in set(self.settings.mcp_allowed_origins)
+
+    def _require_claude_auth(self, headers: dict[str, str]) -> bool:
+        """True only when the request carries the Claude endpoint's bearer (or a
+        valid derived OAuth token for it). Used to gate the privileged HTTP
+        helpers (/status, /mem0/search) with the same auth as /claude/mcp."""
+        profile = self.endpoint_profiles.get(self.settings.claude_mcp_path)
+        return bool(profile and self.is_allowed_token(profile, headers))
+
+    async def _send_unauthorized(self, send) -> None:
+        await self.send_json(
+            send,
+            401,
+            {"error": "Missing or invalid bearer token"},
+            extra_headers={"www-authenticate": 'Bearer realm="reliquary"'},
+        )
 
     def is_allowed_token(self, profile: EndpointProfile, headers: dict[str, str]) -> bool:
         authorization = headers.get("authorization", "").strip()

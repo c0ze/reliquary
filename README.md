@@ -43,8 +43,10 @@ Caddy, or Traefik.
 | `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory` |
 | `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `search`, `fetch` (lean snippet shape); `add_memory` if `MEM0_OPENAI_ALLOW_WRITE=true` |
 
-Also: `GET /healthz`, `GET /mem0/search?q=...` (debug), and the OAuth 2.1
-discovery/authorize/token/revoke routes under `/.well-known/*` and `/oauth/*`.
+Also: `GET /healthz` (minimal, public), `GET /status` and `GET /mem0/search?q=...`
+(both **require the Claude bearer** — they return config/taxonomy and raw
+memories respectively), and the OAuth 2.1 discovery/authorize/token/revoke routes
+under `/.well-known/*` and `/oauth/*`.
 
 ### Connecting Claude.ai
 
