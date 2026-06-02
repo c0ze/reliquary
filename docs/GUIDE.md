@@ -93,16 +93,16 @@ server — MCP + OAuth + the Mem0 client). No chat LLM is involved in retrieval.
 |------|--------|------|---------|
 | `/claude/mcp` | POST | Bearer or OAuth | Full MCP: `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_delete` |
 | `/openai/mcp` | POST | Bearer (or no-auth) | Lean MCP: `search`, `fetch`, + `add_memory` & `delete` if writes enabled |
-
-> `delete`/`mem0_delete` (write-gated, same as `add_memory`) removes a memory by
-> id. It only deletes memories **written through this server** — imported corpus
-> records are protected, so an agent can't erase your curated corpus. `add_memory`
-> returns the new id so a write can be undone without a search.
 | `/healthz` | GET | none | Liveness check |
 | `/status` | GET | Claude bearer | Config + taxonomy introspection |
 | `/mem0/search?q=` | GET | Claude bearer | Raw debug search (returns memories directly) |
 | `/.well-known/oauth-*`, `/oauth/*` | — | — | OAuth 2.1 discovery / authorize / token / revoke |
 | `/favicon.ico`, `/icon[-<size>].png` | GET | none | Brand assets (also embedded in MCP `serverInfo`) |
+
+> `delete`/`mem0_delete` (write-gated, same as `add_memory`) removes a memory by
+> id. It only deletes memories **written through this server** — imported corpus
+> records are protected, so an agent can't erase your curated corpus. `add_memory`
+> returns the new id so a write can be undone without a search.
 
 ---
 
