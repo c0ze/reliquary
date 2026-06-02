@@ -30,7 +30,7 @@ from helpers import (
     decode_headers,
     extract_assistant_text_from_response,
     extract_text_content,
-    added_memory_id,
+    added_memory_ids,
     extract_text_from_stream_event,
     format_fetched_document,
     json_dumps,
@@ -793,7 +793,10 @@ class Mem0ChatProxy:
                 "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"id": {"type": "string", "description": "Memory id from mem0_search or mem0_add_memory."}},
+                    "properties": {
+                        "id": {"type": "string", "description": "Memory id from mem0_search or mem0_add_memory."},
+                        "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
+                    },
                     "required": ["id"],
                     "additionalProperties": False,
                 },
@@ -831,7 +834,7 @@ class Mem0ChatProxy:
                             structured={"error": "read_only_endpoint"},
                             is_error=True,
                         )
-                    return await self.handle_delete_tool(arguments)
+                    return await self.handle_delete_tool(arguments, allow_user_id=False)
                 return self.mcp_tool_result(
                     text=f"Unknown tool: {tool_name}",
                     structured={"error": "unknown_tool"},
@@ -871,7 +874,7 @@ class Mem0ChatProxy:
                         structured={"error": "read_only_endpoint"},
                         is_error=True,
                     )
-                return await self.handle_delete_tool(arguments)
+                return await self.handle_delete_tool(arguments, allow_user_id=True)
         except Exception as exc:
             LOG.exception("MCP tool failed: %s", tool_name)
             return self.mcp_tool_result(
@@ -1051,14 +1054,19 @@ class Mem0ChatProxy:
                 metadata[key] = str(value).strip()
 
         result = await self.add_memory(text, user_id=user_id, metadata=metadata, infer=infer)
-        new_id = added_memory_id(result)
-        id_note = f" (id={new_id})" if new_id else ""
+        new_ids = added_memory_ids(result)
+        if len(new_ids) == 1:
+            id_note = f" (id={new_ids[0]})"
+        elif new_ids:
+            id_note = f" (ids={', '.join(new_ids)})"
+        else:
+            id_note = ""
         return self.mcp_tool_result(
             text=f"Stored memory for user_id={user_id}{id_note}: {trim_text(text, 160)}",
-            structured={"id": new_id, "user_id": user_id, "infer": infer, "metadata": metadata},
+            structured={"ids": new_ids, "user_id": user_id, "infer": infer, "metadata": metadata},
         )
 
-    async def handle_delete_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def handle_delete_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
         record_id = str(arguments.get("id") or "").strip()
         if not record_id:
             return self.mcp_tool_result(
@@ -1066,15 +1074,28 @@ class Mem0ChatProxy:
                 structured={"error": "missing_id"},
                 is_error=True,
             )
+        # Scope deletion to a user_id, the same way add/search resolve it: an
+        # override is honoured only on the full (Claude) endpoint; the lean
+        # endpoint always uses the default. You can only delete within that scope.
+        effective_user_id = (
+            str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
+        )
         # Resolve the id to a live memory. Imported corpus records surface their
         # import_record_id in search (not the vector-store point id), so they
-        # won't resolve here — and we additionally refuse anything not written
-        # through this server, so the curated corpus can't be deleted via MCP.
+        # won't resolve here.
         existing = await self.fetch_live_memory(record_id)
         if existing is None:
             return self.mcp_tool_result(
                 text=f"No deletable memory found for id={record_id}. "
                 "Only memories created via add_memory can be deleted; imported corpus records cannot.",
+                structured={"error": "not_found", "id": record_id},
+                is_error=True,
+            )
+        # Only the owner's own writes are deletable: refuse other users' records
+        # and anything not written through this server (the curated corpus).
+        if existing.get("user_id") != effective_user_id:
+            return self.mcp_tool_result(
+                text=f"No deletable memory found for id={record_id} under user_id={effective_user_id}.",
                 structured={"error": "not_found", "id": record_id},
                 is_error=True,
             )
@@ -1135,6 +1156,9 @@ class Mem0ChatProxy:
             "text": memory_text,
             "url": self._document_url(record_id, metadata),
             "metadata": metadata,
+            # mem0 returns the owning user_id at the top level (not in metadata);
+            # delete uses it to enforce that you can only delete your own writes.
+            "user_id": str(result.get("user_id") or "") or None,
         }
 
     async def handle_chat_completions(self, scope: dict[str, Any], receive, send) -> None:

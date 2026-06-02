@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from helpers import (  # noqa: E402
-    added_memory_id,
+    added_memory_ids,
     coerce_threshold,
     decode_headers,
     extract_assistant_text_from_response,
@@ -143,15 +143,15 @@ def test_format_fetched_document_handles_missing_fields():
     assert format_fetched_document({}) == "# Document"
 
 
-def test_added_memory_id():
-    assert added_memory_id({"results": [{"id": "abc", "event": "ADD"}]}) == "abc"
-    # first id wins when several atomic facts are stored
-    assert added_memory_id({"results": [{"id": "1"}, {"id": "2"}]}) == "1"
-    # unexpected / empty shapes degrade to None
-    assert added_memory_id({"results": []}) is None
-    assert added_memory_id({"results": [{"memory": "no id"}]}) is None
-    assert added_memory_id("nope") is None
-    assert added_memory_id({}) is None
+def test_added_memory_ids():
+    assert added_memory_ids({"results": [{"id": "abc", "event": "ADD"}]}) == ["abc"]
+    # all ids returned when infer splits into several atomic facts
+    assert added_memory_ids({"results": [{"id": "1"}, {"id": "2"}]}) == ["1", "2"]
+    # unexpected / empty shapes degrade to an empty list
+    assert added_memory_ids({"results": []}) == []
+    assert added_memory_ids({"results": [{"memory": "no id"}]}) == []
+    assert added_memory_ids("nope") == []
+    assert added_memory_ids({}) == []
 
 
 if __name__ == "__main__":

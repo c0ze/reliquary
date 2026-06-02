@@ -155,18 +155,20 @@ def trim_text(text: str, limit: int) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
-def added_memory_id(add_result: Any) -> str | None:
-    """Pull the new memory id out of a mem0 ``add()`` result.
+def added_memory_ids(add_result: Any) -> list[str]:
+    """Pull every new memory id out of a mem0 ``add()`` result, in order.
 
-    mem0 returns ``{"results": [{"id": ..., "event": "ADD"}, ...]}`` (several
-    entries when infer=True splits text into atomic facts). Returns the first id,
-    or None if the shape is unexpected — callers degrade gracefully.
+    mem0 returns ``{"results": [{"id": ..., "event": "ADD"}, ...]}`` — and with
+    infer=True a single write can split into several atomic facts, each with its
+    own id. Returning all of them keeps the "the returned id(s) undo the write"
+    contract honest (a single-id response would orphan the rest on delete).
     """
+    ids: list[str] = []
     if isinstance(add_result, dict):
         for item in add_result.get("results") or []:
             if isinstance(item, dict) and item.get("id"):
-                return str(item["id"])
-    return None
+                ids.append(str(item["id"]))
+    return ids
 
 
 def format_fetched_document(document: dict[str, Any]) -> str:
