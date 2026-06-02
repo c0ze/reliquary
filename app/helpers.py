@@ -155,6 +155,24 @@ def trim_text(text: str, limit: int) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
+def format_fetched_document(document: dict[str, Any]) -> str:
+    """Render a fetched memory as readable text for the MCP ``content`` block.
+
+    The full document is returned in ``structuredContent``, but clients that
+    don't consume it (e.g. the Claude.ai connector surface) only show
+    ``content[].text`` to the model — so the body must live there too, not just
+    a confirmation line. The MCP tools spec recommends mirroring structured
+    content into a text block for exactly this back-compat reason.
+    """
+    title = str(document.get("title") or document.get("id") or "Document").strip()
+    body = str(document.get("text") or "").strip()
+    url = str(document.get("url") or "").strip()
+    header = f"# {title}"
+    if url:
+        header += f"\n{url}"
+    return f"{header}\n\n{body}".strip() if body else header
+
+
 def safe_mcp_headers(headers: dict[str, str]) -> dict[str, str]:
     safe_names = {
         "host",

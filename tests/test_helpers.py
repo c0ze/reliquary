@@ -13,6 +13,7 @@ from helpers import (  # noqa: E402
     extract_assistant_text_from_response,
     extract_text_content,
     extract_text_from_stream_event,
+    format_fetched_document,
     json_dumps,
     latest_user_text,
     lean_add_memory_args,
@@ -124,6 +125,21 @@ def test_preview_body_caps_and_flags():
     assert len(body) <= 10
     body2, truncated2 = preview_body("short", limit=10)
     assert (body2, truncated2) == ("short", False)
+
+
+def test_format_fetched_document_includes_body():
+    doc = {"id": "abc", "title": "NAS", "url": "mem0://record/abc", "text": "Synology DS220+ at 192.168.11.3."}
+    out = format_fetched_document(doc)
+    # The body must be in the text content, not just structuredContent.
+    assert "Synology DS220+" in out
+    assert "# NAS" in out
+    assert "mem0://record/abc" in out
+
+
+def test_format_fetched_document_handles_missing_fields():
+    assert format_fetched_document({"title": "Only title"}) == "# Only title"
+    assert format_fetched_document({"id": "x"}) == "# x"
+    assert format_fetched_document({}) == "# Document"
 
 
 if __name__ == "__main__":

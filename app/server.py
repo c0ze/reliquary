@@ -31,6 +31,7 @@ from helpers import (
     extract_assistant_text_from_response,
     extract_text_content,
     extract_text_from_stream_event,
+    format_fetched_document,
     json_dumps,
     latest_user_text,
     lean_add_memory_args,
@@ -953,15 +954,17 @@ class Mem0ChatProxy:
         if self.catalog is not None:
             document = self.catalog.fetch_document(record_id)
             if document is not None:
+                # The body goes in the text content too, not just structuredContent,
+                # so clients that don't read structuredContent still get the document.
                 return self.mcp_tool_result(
-                    text=f"Fetched {document['title']} ({document['url']}).",
+                    text=format_fetched_document(document),
                     structured=document,
                 )
 
         live = await self.fetch_live_memory(record_id)
         if live is not None:
             return self.mcp_tool_result(
-                text=f"Fetched live memory {live.get('title', record_id)}.",
+                text=format_fetched_document(live),
                 structured=live,
             )
 
