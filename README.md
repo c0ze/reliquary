@@ -63,8 +63,8 @@ Caddy, or Traefik.
 
 | Endpoint | For | Auth | Tools |
 |----------|-----|------|-------|
-| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory` |
-| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `search`, `fetch` (lean snippet shape); `add_memory` if `MEM0_OPENAI_ALLOW_WRITE=true` |
+| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_delete` |
+| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `search`, `fetch` (lean snippet shape); `add_memory` + `delete` if `MEM0_OPENAI_ALLOW_WRITE=true` |
 
 Also: `GET /healthz` (minimal, public), `GET /status` and `GET /mem0/search?q=...`
 (both **require the Claude bearer** — they return config/taxonomy and raw
@@ -95,7 +95,7 @@ config file (see [config.example.yaml](config.example.yaml)). Highlights:
 | `MEM0_CLAUDE_MCP_TOKEN` | bearer for `/claude/mcp` (required for write + OAuth) |
 | `MEM0_OPENAI_MCP_TOKEN` | bearer for `/openai/mcp` |
 | `MEM0_OPENAI_ALLOW_NOAUTH` | `true` to allow unauthenticated `/openai/mcp` (default `false`) |
-| `MEM0_OPENAI_ALLOW_WRITE` | expose `add_memory` on `/openai/mcp` (default `false`). **Refuses to start** with `ALLOW_NOAUTH=true`, to avoid public write. |
+| `MEM0_OPENAI_ALLOW_WRITE` | expose `add_memory` + `delete` on `/openai/mcp` (default `false`). **Refuses to start** with `ALLOW_NOAUTH=true`, to avoid public write. |
 | `MEM0_OAUTH_CLIENT_ID` / `MEM0_OAUTH_ALLOW_REGISTRATION` | lock the OAuth shim to one known client |
 | `MEM0_DATASET_PATH` | curated JSONL enabling taxonomy routing + `fetch` bootstrap docs |
 

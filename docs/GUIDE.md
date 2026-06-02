@@ -91,8 +91,13 @@ server — MCP + OAuth + the Mem0 client). No chat LLM is involved in retrieval.
 
 | Path | Method | Auth | Purpose |
 |------|--------|------|---------|
-| `/claude/mcp` | POST | Bearer or OAuth | Full MCP: `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory` |
-| `/openai/mcp` | POST | Bearer (or no-auth) | Lean MCP: `search`, `fetch`, + `add_memory` if writes enabled |
+| `/claude/mcp` | POST | Bearer or OAuth | Full MCP: `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_delete` |
+| `/openai/mcp` | POST | Bearer (or no-auth) | Lean MCP: `search`, `fetch`, + `add_memory` & `delete` if writes enabled |
+
+> `delete`/`mem0_delete` (write-gated, same as `add_memory`) removes a memory by
+> id. It only deletes memories **written through this server** — imported corpus
+> records are protected, so an agent can't erase your curated corpus. `add_memory`
+> returns the new id so a write can be undone without a search.
 | `/healthz` | GET | none | Liveness check |
 | `/status` | GET | Claude bearer | Config + taxonomy introspection |
 | `/mem0/search?q=` | GET | Claude bearer | Raw debug search (returns memories directly) |
@@ -174,7 +179,7 @@ file** (`config.yaml`). Run `python app/server.py --help` for every flag.
 | `MEM0_CLAUDE_MCP_TOKEN` | — | Bearer for `/claude/mcp` (required for write + OAuth) |
 | `MEM0_OPENAI_MCP_TOKEN` | — | Bearer for `/openai/mcp` |
 | `MEM0_OPENAI_ALLOW_NOAUTH` | `false` | `true` lets anyone reaching `/openai/mcp` read with no token |
-| `MEM0_OPENAI_ALLOW_WRITE` | `false` | Expose `add_memory` on `/openai/mcp`. **Refuses to start** together with `ALLOW_NOAUTH=true` (no public write) |
+| `MEM0_OPENAI_ALLOW_WRITE` | `false` | Expose `add_memory` + `delete` on `/openai/mcp`. **Refuses to start** together with `ALLOW_NOAUTH=true` (no public write) |
 | `MEM0_OAUTH_CLIENT_ID` | — | Pin the OAuth client id; only this id is accepted |
 | `MEM0_OAUTH_ALLOW_REGISTRATION` | `true` | Allow `POST /oauth/register` (DCR). Disable after the connector registers once |
 | `MEM0_OAUTH_VERBATIM_TOKEN` | `false` | Return the master bearer verbatim instead of a derived, revocable token |
