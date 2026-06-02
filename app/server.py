@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import inspect
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -50,6 +52,57 @@ MCP_SERVER_VERSION = "0.2.0"
 MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
+
+SERVER_TITLE = "Reliquary"
+SERVER_WEBSITE_URL = "https://github.com/c0ze/reliquary"
+
+# Brand assets (icon + favicon) ship alongside the code so the image is
+# self-contained. Served at /favicon.ico and /icon[-<size>].png, and the 128px
+# PNG is embedded as a data: URI in the MCP serverInfo so agent UIs can show it
+# without a second fetch (MCP Icon schema: {src, mimeType, sizes}).
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+ICON_SIZES = (16, 32, 64, 128, 256, 512)
+ICON_PATH_RE = re.compile(r"/icon-(?:%s)\.png" % "|".join(str(s) for s in ICON_SIZES))
+_ASSET_CACHE: dict[str, bytes] = {}
+_SERVER_ICONS_CACHE: list[dict[str, Any]] = []
+
+
+def load_asset(name: str) -> bytes | None:
+    """Read a brand asset by filename, caching only successful reads.
+
+    A genuine not-found returns None without caching, and a transient OS error
+    is logged and returns None too — neither is frozen in, so a later read can
+    still recover (the assets ship in the image, so this is just belt-and-braces).
+    """
+    cached = _ASSET_CACHE.get(name)
+    if cached is not None:
+        return cached
+    try:
+        with open(os.path.join(ASSETS_DIR, name), "rb") as handle:
+            data = handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        LOG.exception("Could not read brand asset %s", name)
+        return None
+    _ASSET_CACHE[name] = data
+    return data
+
+
+def server_icons() -> list[dict[str, Any]]:
+    """MCP Icon list for serverInfo: a single embedded 128px data: URI so it
+    renders with no extra request and no dependency on the public host/TLS.
+
+    Built lazily and cached only once successfully encoded, so a transient read
+    failure at startup doesn't permanently drop the icon from initialize."""
+    if _SERVER_ICONS_CACHE:
+        return _SERVER_ICONS_CACHE
+    raw = load_asset("icon-128.png")
+    if raw is None:
+        return []
+    data_uri = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    _SERVER_ICONS_CACHE.append({"src": data_uri, "mimeType": "image/png", "sizes": ["128x128"]})
+    return _SERVER_ICONS_CACHE
 
 DEFAULT_MEMORY_INSTRUCTION = """You have access to a long-term memory block for this user.
 Use it only when it is clearly relevant to the current request.
@@ -204,6 +257,15 @@ class Mem0ChatProxy:
 
             if method == "GET" and path == "/healthz":
                 await self.handle_health(send)
+                return
+
+            if method == "GET" and path == "/favicon.ico":
+                await self.send_asset(send, "favicon.ico", "image/vnd.microsoft.icon")
+                return
+
+            if method == "GET" and (path == "/icon.png" or ICON_PATH_RE.fullmatch(path)):
+                filename = "icon-512.png" if path == "/icon.png" else path.lstrip("/")
+                await self.send_asset(send, filename, "image/png")
                 return
 
             if method == "GET" and path == "/status":
@@ -495,7 +557,13 @@ class Mem0ChatProxy:
                     {
                         "protocolVersion": MCP_PROTOCOL_VERSION,
                         "capabilities": {"tools": {"listChanged": False}},
-                        "serverInfo": {"name": f"{MCP_SERVER_NAME}-{profile.name}", "version": MCP_SERVER_VERSION},
+                        "serverInfo": {
+                            "name": f"{MCP_SERVER_NAME}-{profile.name}",
+                            "title": SERVER_TITLE,
+                            "version": MCP_SERVER_VERSION,
+                            "websiteUrl": SERVER_WEBSITE_URL,
+                            **({"icons": icons} if (icons := server_icons()) else {}),
+                        },
                     },
                 ),
                 extra_headers={"Mcp-Session-Id": session_id, "MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
@@ -1538,6 +1606,20 @@ class Mem0ChatProxy:
             }
         )
         await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    @staticmethod
+    async def send_asset(send, filename: str, content_type: str) -> None:
+        data = load_asset(filename)
+        if data is None:
+            await Mem0ChatProxy.send_json(send, 404, {"error": f"Asset not found: {filename}"})
+            return
+        headers = [
+            (b"content-type", content_type.encode("latin-1")),
+            (b"cache-control", b"public, max-age=86400, immutable"),
+            (b"content-length", str(len(data)).encode("latin-1")),
+        ]
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": data, "more_body": False})
 
     @staticmethod
     async def send_json(send, status: int, data: Any, extra_headers: dict[str, str] | None = None) -> None:
