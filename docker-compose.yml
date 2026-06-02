@@ -2,11 +2,11 @@
 #
 #   cp .env.example .env            # set your bearer tokens
 #   cp config.example.yaml config.yaml
-#   docker compose up -d
+#   docker compose up -d            # qdrant + embedder (+ model pull) + app
 #
-# Three services: a Qdrant vector store, an embedding model, and the app
-# (MCP + OAuth + mem0 client). No GPU and no chat LLM are required for
-# MCP-only retrieval.
+# Three services: a Qdrant vector store, an embedding model (Ollama serving
+# nomic-embed-text, multilingual, 768-dim), and the app (MCP + OAuth + mem0).
+# No GPU and no chat LLM are required for MCP-only retrieval.
 
 services:
   qdrant:
@@ -16,26 +16,42 @@ services:
       - qdrant_storage:/qdrant/storage
     # Not published — only the app talks to it over the compose network.
 
-  # Embedding model. Text-Embeddings-Inference serves an OpenAI-compatible
-  # /v1/embeddings endpoint on port 80. nomic-embed-text is 768-dim and runs
-  # on CPU. Swap the model here AND `embedding_*dims` in config.yaml together.
-  #
-  # ⚠️ First-run integration point: confirm your mem0 `embedder` config in
-  # config.yaml points at this service and that the dims match. Alternatives:
-  # an Ollama container, or an external embeddings API (set the base_url).
+  # Embedding model. Ollama exposes an OpenAI-compatible /v1/embeddings endpoint
+  # on port 11434; mem0's "openai" embedder provider points at it (see
+  # config.example.yaml). Swap the model here AND `embedding_*dims` in
+  # config.yaml together if you change embedders.
   embedder:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    image: ollama/ollama:0.30.0
     restart: unless-stopped
-    command: ["--model-id", "nomic-ai/nomic-embed-text-v1.5"]
     volumes:
-      - hf_cache:/data
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # One-shot: pull the embedding model into the shared volume, then exit.
+  embedder-pull:
+    image: ollama/ollama:0.30.0
+    depends_on:
+      embedder:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "embedder:11434"
+    entrypoint: ["ollama", "pull", "nomic-embed-text"]
+    restart: "no"
 
   app:
     build: .
     restart: unless-stopped
     depends_on:
-      - qdrant
-      - embedder
+      qdrant:
+        condition: service_started
+      embedder:
+        condition: service_healthy
+      embedder-pull:
+        condition: service_completed_successfully
     env_file: .env
     volumes:
       - ./config.yaml:/config/config.yaml:ro
@@ -46,4 +62,4 @@ services:
 
 volumes:
   qdrant_storage:
-  hf_cache:
+  ollama_models:

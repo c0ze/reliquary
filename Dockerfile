@@ -15,10 +15,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # `from oauth import ...` imports resolve.
 COPY app/ ./app/
 
-# Run as a non-root user (least privilege).
-RUN addgroup --system --gid 1001 appuser \
-    && adduser --system --uid 1001 --ingroup appuser appuser \
-    && chown -R appuser:appuser /srv
+# Run as a non-root user (least privilege). Give it a real, writable HOME —
+# mem0 writes ~/.mem0 (telemetry / user id) at startup, which fails for a
+# system user whose home defaults to /nonexistent.
+RUN addgroup --system appuser \
+    && adduser --system --ingroup appuser --home /home/appuser appuser \
+    && mkdir -p /home/appuser \
+    && chown -R appuser:appuser /srv /home/appuser
+ENV HOME=/home/appuser
 USER appuser
 
 EXPOSE 8787
