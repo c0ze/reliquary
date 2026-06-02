@@ -16,6 +16,12 @@ Claude or ChatGPT session can search and store your long-term memories.
 > Reliquary is the serving engine. Building a corpus from your own notes/exports
 > is left to you — it ingests any JSONL of `{"id", "text", "metadata"}` records.
 
+📖 **Full guide:** [`docs/GUIDE.md`](docs/GUIDE.md) (also on the
+[project wiki](https://github.com/c0ze/reliquary/wiki)) covers architecture,
+ingestion (with an Obsidian example), embedder choices (Ollama / LM Studio /
+external APIs), auth, and external-access options (Cloudflare Tunnel / Tailscale
+/ ngrok).
+
 ## Quick start (Docker)
 
 ```bash
@@ -101,6 +107,11 @@ python app/ingest.py path/to/corpus.jsonl --config config.yaml --user-id default
 
 `metadata.title` is used as the result title; `domain`/`hall`/`room`/`topic`
 enable routing; any `source_url`/`source_ref` becomes the document URL.
+
+Building the JSONL from your own notes is up to you.
+[`examples/obsidian_to_jsonl.py`](examples/obsidian_to_jsonl.py) is a runnable
+starting point that walks an Obsidian vault and derives the taxonomy from your
+folder layout — see [`docs/GUIDE.md`](docs/GUIDE.md) for a full walkthrough.
 
 ## Development
 
