@@ -7,9 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /srv
 
-# Install deps first for layer caching.
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Install deps first for layer caching. Use the fully-resolved lock so the image
+# is reproducible and the runtime can't drift from the API the code targets.
+COPY requirements.txt requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock
 
 # App code. Running `app/server.py` puts app/ on sys.path[0], so the flat
 # `from oauth import ...` imports resolve.
