@@ -22,9 +22,10 @@ def reads_can_be_concurrent(vector_store: dict[str, Any] | None) -> bool:
     or anything unrecognized — is treated conservatively (serialized) unless the
     operator explicitly forces concurrency.
     """
-    vector_store = vector_store or {}
+    vector_store = vector_store if isinstance(vector_store, dict) else {}
     provider = str(vector_store.get("provider") or "").strip().lower()
-    config = vector_store.get("config") or {}
+    raw_config = vector_store.get("config")
+    config = raw_config if isinstance(raw_config, dict) else {}
     if provider != "qdrant":
         return False
     if config.get("path"):

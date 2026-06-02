@@ -75,6 +75,17 @@ def test_resource_scoped_token_only_valid_for_its_resource():
     token = response["access_token"]
     assert provider.verify_access_token(token, resource="https://host/openai/mcp") is True
     assert provider.verify_access_token(token, resource="https://host/claude/mcp") is False
+    # a resource-bound token must NOT validate when no resource is supplied
+    assert provider.verify_access_token(token) is False
+
+
+def test_valid_redirect_uri_rules():
+    ok = OAuthProvider.valid_redirect_uri
+    assert ok("https://chatgpt.com/callback") is True
+    assert ok("http://localhost:1234/cb") is True
+    assert ok("https://host/cb#frag") is False  # fragment not allowed
+    assert ok("http://evil.example/cb") is False  # plain http only for loopback
+    assert ok("not-a-uri") is False
 
 
 def test_resourceless_token_accepted_for_any_resource():

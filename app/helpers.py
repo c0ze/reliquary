@@ -9,6 +9,7 @@ straightforward to unit-test in isolation.
 from __future__ import annotations
 
 import json
+import math
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
 
@@ -138,9 +139,10 @@ def coerce_threshold(value: Any) -> float | None:
     if value is None or value == "":
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None  # reject NaN / Inf
 
 
 def trim_text(text: str, limit: int) -> str:

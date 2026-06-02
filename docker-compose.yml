@@ -10,7 +10,7 @@
 
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.18.1
     restart: unless-stopped
     volumes:
       - qdrant_storage:/qdrant/storage
@@ -24,7 +24,7 @@ services:
   # config.yaml points at this service and that the dims match. Alternatives:
   # an Ollama container, or an external embeddings API (set the base_url).
   embedder:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
     restart: unless-stopped
     command: ["--model-id", "nomic-ai/nomic-embed-text-v1.5"]
     volumes:

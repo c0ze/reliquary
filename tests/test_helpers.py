@@ -88,6 +88,13 @@ def test_coerce_threshold():
     assert coerce_threshold("nope") is None
 
 
+def test_coerce_threshold_rejects_non_finite():
+    assert coerce_threshold("nan") is None
+    assert coerce_threshold("inf") is None
+    assert coerce_threshold("-inf") is None
+    assert coerce_threshold(float("nan")) is None
+
+
 def test_trim_text():
     assert trim_text("a   b\n c", 100) == "a b c"
     assert trim_text("abcdefgh", 5) == "ab..."

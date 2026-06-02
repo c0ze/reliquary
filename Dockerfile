@@ -15,6 +15,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # `from oauth import ...` imports resolve.
 COPY app/ ./app/
 
+# Run as a non-root user (least privilege).
+RUN addgroup --system --gid 1001 appuser \
+    && adduser --system --uid 1001 --ingroup appuser appuser \
+    && chown -R appuser:appuser /srv
+USER appuser
+
 EXPOSE 8787
 
 # MCP-only by default (no chat upstream). Config + secrets are provided at run

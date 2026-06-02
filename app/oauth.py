@@ -127,12 +127,16 @@ class OAuthProvider:
 
     @staticmethod
     def valid_redirect_uri(uri: str) -> bool:
-        if uri.startswith("https://"):
-            return True
         try:
             parsed = urlparse(uri)
         except ValueError:
             return False
+        # No fragments in a redirect URI (RFC 6749 §3.1.2).
+        if parsed.fragment:
+            return False
+        if parsed.scheme == "https":
+            return bool(parsed.hostname)
+        # Plain http only for loopback (native/dev clients).
         return parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
 
     def authorize_form_html(self, params: dict[str, str], error: str | None = None) -> str:
@@ -271,8 +275,12 @@ class OAuthProvider:
         if entry.expires_at < time.time():  # guards the prune/check race window
             self._access_tokens.pop(key, None)
             return False
-        if entry.resource and resource and entry.resource != resource:
-            return False
+        # A token bound to a resource is only valid for that resource; the caller
+        # must present a matching one (tokens issued without a resource indicator
+        # stay usable for any MCP resource).
+        if entry.resource:
+            if not resource or entry.resource != resource:
+                return False
         return True
 
     def revoke_access_token(self, token: str | None) -> bool:
@@ -296,7 +304,11 @@ class OAuthProvider:
             return False
         method = (method or "S256").upper()
         if method == "S256":
-            digest = hashlib.sha256(verifier.encode("ascii")).digest()
+            try:
+                encoded = verifier.encode("ascii")
+            except UnicodeEncodeError:
+                return False  # untrusted input; treat as PKCE failure, not a 500
+            digest = hashlib.sha256(encoded).digest()
             computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
             return secrets.compare_digest(computed, challenge)
         if method == "PLAIN":

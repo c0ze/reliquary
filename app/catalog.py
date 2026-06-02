@@ -178,11 +178,22 @@ class CorpusCatalog:
         room = self._match_field("room", normalized_query, domain=domain) or room_any
         topic = self._match_field("topic", normalized_query, domain=domain) or topic_any
 
-        inferred_domain: str | None = None
-        if room_any and len(self.domains_by_room[room_any]) == 1:
-            inferred_domain = next(iter(self.domains_by_room[room_any]))
-        if topic_any and len(self.domains_by_topic[topic_any]) == 1:
-            inferred_domain = next(iter(self.domains_by_topic[topic_any]))
+        room_domain = (
+            next(iter(self.domains_by_room[room_any]))
+            if room_any and len(self.domains_by_room[room_any]) == 1
+            else None
+        )
+        topic_domain = (
+            next(iter(self.domains_by_topic[topic_any]))
+            if topic_any and len(self.domains_by_topic[topic_any]) == 1
+            else None
+        )
+        # If room and topic each infer a domain but disagree, infer nothing
+        # rather than letting one silently win and route to the wrong corpus.
+        if room_domain and topic_domain:
+            inferred_domain = room_domain if room_domain == topic_domain else None
+        else:
+            inferred_domain = room_domain or topic_domain
 
         if inferred_domain:
             inferred_count = self.value_counts["domain"].get(inferred_domain, 0)

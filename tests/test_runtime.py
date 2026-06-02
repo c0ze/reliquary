@@ -46,6 +46,12 @@ def test_unknown_backend_is_conservative():
     assert reads_can_be_concurrent({"provider": "qdrant", "config": {}}) is False
 
 
+def test_non_dict_config_does_not_crash():
+    # malformed config (bad YAML/env merge) must not raise AttributeError
+    assert reads_can_be_concurrent("not-a-dict") is False
+    assert reads_can_be_concurrent({"provider": "qdrant", "config": "oops"}) is False
+
+
 # --------------------------- AsyncRWLock ---------------------------
 
 

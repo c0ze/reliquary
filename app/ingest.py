@@ -10,11 +10,40 @@ from pathlib import Path
 def read_jsonl(path: Path) -> list[dict]:
     records = []
     with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
+        for lineno, line in enumerate(handle, start=1):
             line = line.strip()
-            if line:
-                records.append(json.loads(line))
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"Invalid JSON in {path} at line {lineno}: {exc}") from exc
+            if not isinstance(item, dict):
+                raise SystemExit(f"Invalid record in {path} at line {lineno}: expected a JSON object")
+            if "id" not in item or "text" not in item or "metadata" not in item:
+                raise SystemExit(
+                    f"Invalid record in {path} at line {lineno}: required keys are id, text, metadata"
+                )
+            if not isinstance(item["metadata"], dict):
+                raise SystemExit(f"Invalid record in {path} at line {lineno}: metadata must be an object")
+            records.append(item)
     return records
+
+
+def parse_embedder_dims(env_dims: str | None, fallback: int) -> int:
+    if not env_dims:
+        return fallback
+    try:
+        return int(env_dims)
+    except ValueError as exc:
+        raise SystemExit("MEM0_EMBEDDER_DIMS must be an integer.") from exc
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("--limit must be >= 0")
+    return parsed
 
 
 def expand_config_values(value):
@@ -47,7 +76,7 @@ def synthesize_embedder_config(config: dict) -> dict:
     env_dims = os.getenv("MEM0_EMBEDDER_DIMS")
 
     if env_provider:
-        dims = int(env_dims) if env_dims else vector_config.get("embedding_model_dims", 1536)
+        dims = parse_embedder_dims(env_dims, vector_config.get("embedding_model_dims", 1536))
         embedder_config = {
             "provider": env_provider,
             "config": {
@@ -70,7 +99,7 @@ def synthesize_embedder_config(config: dict) -> dict:
     )
 
     if is_lmstudio_like:
-        dims = int(env_dims) if env_dims else vector_config.get("embedding_model_dims", 768)
+        dims = parse_embedder_dims(env_dims, vector_config.get("embedding_model_dims", 768))
         config["embedder"] = {
             "provider": "lmstudio",
             "config": {
@@ -128,7 +157,7 @@ def main() -> None:
     )
     parser.add_argument("--config", default="~/.mem0/config.yaml", help="Path to your Mem0 config file.")
     parser.add_argument("--user-id", default="default", help="Mem0 user_id to attach to every imported record.")
-    parser.add_argument("--limit", type=int, default=None, help="Only ingest the first N unique records.")
+    parser.add_argument("--limit", type=non_negative_int, default=None, help="Only ingest the first N unique records.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be imported without calling Mem0.")
     parser.add_argument(
         "--infer",

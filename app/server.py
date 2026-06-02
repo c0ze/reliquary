@@ -374,7 +374,12 @@ class Mem0ChatProxy:
             or (query_string.get("user_id", [""])[0] if query_string.get("user_id") else "")
             or self.settings.user_id
         )
-        limit = int(payload.get("limit") or (query_string.get("limit", [self.settings.memory_limit])[0]))
+        limit = self._coerce_int(
+            payload.get("limit") or (query_string.get("limit", [self.settings.memory_limit])[0]),
+            default=self.settings.memory_limit,
+            minimum=1,
+            maximum=20,
+        )
         threshold = coerce_threshold(payload.get("threshold", self.settings.memory_threshold))
 
         results = await self.search_memories(query, user_id=user_id, limit=limit, threshold=threshold, filters=None)
@@ -768,7 +773,9 @@ class Mem0ChatProxy:
                 is_error=True,
             )
         user_id = str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
-        limit = max(1, min(20, int(arguments.get("limit") or self.settings.memory_limit)))
+        limit = self._coerce_int(
+            arguments.get("limit"), default=self.settings.memory_limit, minimum=1, maximum=20
+        )
         threshold = (
             coerce_threshold(arguments.get("threshold", self.settings.memory_threshold))
             if allow_threshold
@@ -978,7 +985,12 @@ class Mem0ChatProxy:
 
         original_messages = [message for message in messages if isinstance(message, dict)]
         user_id = payload.pop("mem0_user_id", None) or request_headers.get("x-mem0-user-id") or self.settings.user_id
-        mem0_limit = int(payload.pop("mem0_limit", self.settings.memory_limit))
+        mem0_limit = self._coerce_int(
+            payload.pop("mem0_limit", self.settings.memory_limit),
+            default=self.settings.memory_limit,
+            minimum=1,
+            maximum=20,
+        )
         mem0_threshold = coerce_threshold(payload.pop("mem0_threshold", self.settings.memory_threshold))
         mem0_query = payload.pop("mem0_query", None) or latest_user_text(original_messages)
         mem0_disabled = bool(payload.pop("mem0_disable", False))
@@ -1162,6 +1174,20 @@ class Mem0ChatProxy:
         if self.oauth.verify_access_token(token, resource=resource):
             return True
         return False
+
+    @staticmethod
+    def _coerce_int(value: Any, *, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+        """Best-effort int with bounds. Bad client input falls back to the
+        default + clamps instead of raising into the 500 handler."""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        if minimum is not None:
+            parsed = max(minimum, parsed)
+        if maximum is not None:
+            parsed = min(maximum, parsed)
+        return parsed
 
     @staticmethod
     def mcp_success(request_id: Any, result: Any) -> dict[str, Any]:
@@ -1469,6 +1495,8 @@ class Mem0ChatProxy:
         chunks: list[bytes] = []
         while True:
             message = await receive()
+            if message["type"] == "http.disconnect":
+                break  # client went away; stop instead of waiting forever
             if message["type"] != "http.request":
                 continue
             chunk = message.get("body", b"")

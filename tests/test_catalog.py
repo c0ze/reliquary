@@ -59,6 +59,19 @@ def test_domain_inferred_from_unique_room():
     assert matched.get("room") == "tickets"
 
 
+def test_conflicting_inferred_domains_infer_nothing():
+    # "specs" -> alpha, "roadmap" -> beta: a query mentioning both must NOT
+    # silently route to one of them.
+    cat = CorpusCatalog(
+        [
+            _record("a", domain="alpha", room="specs"),
+            _record("b", domain="beta", topic="roadmap"),
+        ]
+    )
+    matched = cat.match_query("specs roadmap")
+    assert "domain" not in matched
+
+
 def test_build_routes_orders_specific_then_global():
     cat = _catalog()
     routes = cat.build_routes("alpha specs")
