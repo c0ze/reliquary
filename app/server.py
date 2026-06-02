@@ -30,6 +30,7 @@ from helpers import (
     decode_headers,
     extract_assistant_text_from_response,
     extract_text_content,
+    added_memory_id,
     extract_text_from_stream_event,
     format_fetched_document,
     json_dumps,
@@ -699,6 +700,27 @@ class Mem0ChatProxy:
                         },
                     }
                 )
+                tools.append(
+                    {
+                        "name": "delete",
+                        "title": "Delete Memory",
+                        "description": "Delete a memory you previously stored via add_memory, by id. "
+                        "Only memories written through this server can be deleted; imported corpus "
+                        "records are protected.",
+                        "annotations": {
+                            "readOnlyHint": False,
+                            "destructiveHint": True,
+                            "idempotentHint": True,
+                            "openWorldHint": False,
+                        },
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"id": {"type": "string", "description": "Memory id from search or add_memory."}},
+                            "required": ["id"],
+                            "additionalProperties": False,
+                        },
+                    }
+                )
             return tools
 
         return [
@@ -763,6 +785,19 @@ class Mem0ChatProxy:
                     "additionalProperties": False,
                 },
             },
+            {
+                "name": "mem0_delete",
+                "title": "Mem0 Delete Memory",
+                "description": "Delete a memory previously stored via mem0_add_memory, by id. "
+                "Only user-written memories can be deleted; imported corpus records are protected.",
+                "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string", "description": "Memory id from mem0_search or mem0_add_memory."}},
+                    "required": ["id"],
+                    "additionalProperties": False,
+                },
+            },
         ]
 
     async def call_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -789,6 +824,14 @@ class Mem0ChatProxy:
                     # Enforce the lean schema: no caller-supplied user_id / metadata /
                     # routing fields. Writes always land under the default user_id.
                     return await self.handle_add_memory_tool(lean_add_memory_args(arguments))
+                if tool_name == "delete":
+                    if not profile.allow_write:
+                        return self.mcp_tool_result(
+                            text="Writing is not enabled on this endpoint.",
+                            structured={"error": "read_only_endpoint"},
+                            is_error=True,
+                        )
+                    return await self.handle_delete_tool(arguments)
                 return self.mcp_tool_result(
                     text=f"Unknown tool: {tool_name}",
                     structured={"error": "unknown_tool"},
@@ -821,6 +864,14 @@ class Mem0ChatProxy:
                         is_error=True,
                     )
                 return await self.handle_add_memory_tool(arguments)
+            if tool_name == "mem0_delete":
+                if not profile.allow_write:
+                    return self.mcp_tool_result(
+                        text=f"Tool {tool_name} is not available on the {profile.name} endpoint.",
+                        structured={"error": "read_only_endpoint"},
+                        is_error=True,
+                    )
+                return await self.handle_delete_tool(arguments)
         except Exception as exc:
             LOG.exception("MCP tool failed: %s", tool_name)
             return self.mcp_tool_result(
@@ -999,10 +1050,45 @@ class Mem0ChatProxy:
             if value is not None and str(value).strip():
                 metadata[key] = str(value).strip()
 
-        await self.add_memory(text, user_id=user_id, metadata=metadata, infer=infer)
+        result = await self.add_memory(text, user_id=user_id, metadata=metadata, infer=infer)
+        new_id = added_memory_id(result)
+        id_note = f" (id={new_id})" if new_id else ""
         return self.mcp_tool_result(
-            text=f"Stored memory for user_id={user_id}: {trim_text(text, 160)}",
-            structured={"user_id": user_id, "infer": infer, "metadata": metadata},
+            text=f"Stored memory for user_id={user_id}{id_note}: {trim_text(text, 160)}",
+            structured={"id": new_id, "user_id": user_id, "infer": infer, "metadata": metadata},
+        )
+
+    async def handle_delete_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        record_id = str(arguments.get("id") or "").strip()
+        if not record_id:
+            return self.mcp_tool_result(
+                text="A non-empty `id` is required.",
+                structured={"error": "missing_id"},
+                is_error=True,
+            )
+        # Resolve the id to a live memory. Imported corpus records surface their
+        # import_record_id in search (not the vector-store point id), so they
+        # won't resolve here — and we additionally refuse anything not written
+        # through this server, so the curated corpus can't be deleted via MCP.
+        existing = await self.fetch_live_memory(record_id)
+        if existing is None:
+            return self.mcp_tool_result(
+                text=f"No deletable memory found for id={record_id}. "
+                "Only memories created via add_memory can be deleted; imported corpus records cannot.",
+                structured={"error": "not_found", "id": record_id},
+                is_error=True,
+            )
+        if (existing.get("metadata") or {}).get("source_group") != "user-write":
+            return self.mcp_tool_result(
+                text=f"Refusing to delete id={record_id}: it is not a user-written memory "
+                "(imported corpus records are protected).",
+                structured={"error": "protected_record", "id": record_id},
+                is_error=True,
+            )
+        await self.delete_memory(record_id)
+        return self.mcp_tool_result(
+            text=f"Deleted memory {existing.get('title', record_id)} (id={record_id}).",
+            structured={"deleted": True, "id": record_id, "title": existing.get("title")},
         )
 
     def _enrich_hit(self, hit: dict[str, Any], *, route: str) -> dict[str, Any]:
@@ -1228,6 +1314,11 @@ class Mem0ChatProxy:
             )
         self._count_cache = None
         return result
+
+    async def delete_memory(self, record_id: str) -> None:
+        async with self.memory_lock.write():
+            await asyncio.to_thread(self.memory.delete, record_id)
+        self._count_cache = None
 
     def is_allowed_mcp_origin(self, headers: dict[str, str]) -> bool:
         origin = headers.get("origin")
