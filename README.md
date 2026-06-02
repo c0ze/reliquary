@@ -25,16 +25,18 @@ docker compose up -d
 curl -s http://127.0.0.1:8787/healthz
 ```
 
-Three services come up: **qdrant** (vector store), **embedder**
-(Text-Embeddings-Inference serving `nomic-embed-text` on CPU), and **app** (this
-server: MCP + OAuth + the Mem0 client). Publish `:8787` only behind a TLS
-terminator — a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/),
+Three services come up: **qdrant** (vector store), **embedder** (Ollama serving
+the multilingual 768-dim `nomic-embed-text` on CPU; a one-shot `embedder-pull`
+fetches the model on first boot), and **app** (this server: MCP + OAuth + the
+Mem0 client). Publish `:8787` only behind a TLS terminator — a
+[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/),
 Caddy, or Traefik.
 
-> **First-run integration point:** confirm the `embedder` block in `config.yaml`
-> matches the embedder service and that `embedding_*dims` agrees with the model
-> (768 for `nomic-embed-text`). The embedder is the one piece to validate; you
-> can also point it at Ollama or an external embeddings API.
+> **Embedder:** the compose default is Ollama + `nomic-embed-text` (mem0 talks to
+> it via Ollama's OpenAI-compatible `/v1/embeddings`). To use a different model
+> or an external embeddings API, edit the `embedder` block in `config.yaml` and
+> keep `embedding_model_dims` in sync with the model. Changing the embedder
+> changes the vector space — re-ingest your corpus afterwards.
 
 ## MCP endpoints & tools
 
@@ -114,5 +116,5 @@ unit-tested without the Mem0/Qdrant stack.
 ## Built on
 
 [Mem0](https://github.com/mem0ai/mem0) (memory layer), [Qdrant](https://qdrant.tech)
-(vectors), and [Hugging Face TEI](https://github.com/huggingface/text-embeddings-inference)
-(embeddings). Licensed under [MIT](LICENSE).
+(vectors), and [Ollama](https://ollama.com) (embeddings). Licensed under
+[MIT](LICENSE).
