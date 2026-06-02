@@ -2,7 +2,6 @@
 .env
 config.yaml
 *.local.yaml
-requirements.lock
 
 # Data — never commit your corpus or the vector store
 data/

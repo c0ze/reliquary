@@ -114,7 +114,11 @@ class Mem0ChatProxy:
             "concurrent" if self._concurrent_reads else "exclusive (serialized)",
             "" if override is None else " (forced by --memory-concurrent-reads)",
         )
-        self._search_supports_filters = self._detect_filters_support()
+        (
+            self._search_supports_filters,
+            self._search_user_id_param,
+            self._search_limit_param,
+        ) = self._detect_search_api()
         self._count_cache: tuple[float, int | None] | None = None
         self.mcp_sessions = MCPSessionStore(max_size=MCP_MAX_SESSIONS, ttl=MCP_SESSION_TTL)
 
@@ -150,20 +154,27 @@ class Mem0ChatProxy:
             issue_verbatim_token=settings.oauth_verbatim_token,
         )
 
-    def _detect_filters_support(self) -> bool:
-        """Decide once whether ``memory.search`` accepts a ``filters`` kwarg.
+    def _detect_search_api(self) -> tuple[bool, bool, str]:
+        """Inspect ``memory.search`` once to adapt to the installed mem0 version.
 
-        Avoids probing per-request with a broad ``except TypeError`` that could
-        silently swallow unrelated errors and drop routing filters.
+        Returns ``(supports_filters, accepts_top_level_user_id, limit_param)``.
+        mem0 2.x requires the entity id inside ``filters={"user_id": ...}`` and
+        renames ``limit`` -> ``top_k``; 1.x accepts ``user_id=`` / ``limit=``
+        directly. We pin a single version, but introspecting keeps the call site
+        honest if it ever moves, and avoids per-request probing that could
+        silently swallow unrelated errors.
         """
         try:
-            signature = inspect.signature(self.memory.search)
+            params = inspect.signature(self.memory.search).parameters
         except (TypeError, ValueError):
-            return True  # can't introspect; assume supported and let real errors surface
-        for parameter in signature.parameters.values():
-            if parameter.name == "filters" or parameter.kind is inspect.Parameter.VAR_KEYWORD:
-                return True
-        return False
+            # Can't introspect; assume the modern (2.x) API and let real errors surface.
+            return True, False, "top_k"
+        has_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+        supports_filters = "filters" in params or has_var_kw
+        # 2.x keeps **kwargs but *rejects* user_id there, so trust only an explicit param.
+        accepts_user_id = "user_id" in params
+        limit_param = "top_k" if "top_k" in params else "limit"
+        return supports_filters, accepts_user_id, limit_param
 
     def _read_lock(self):
         """Lock context for a memory read: shared when concurrent reads are safe,
@@ -1102,9 +1113,20 @@ class Mem0ChatProxy:
         threshold: float | None,
         filters: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
-        kwargs: dict[str, Any] = {"user_id": user_id, "limit": limit, "threshold": threshold}
-        if filters is not None and self._search_supports_filters:
-            kwargs["filters"] = filters
+        kwargs: dict[str, Any] = {self._search_limit_param: limit}
+        if threshold is not None:
+            kwargs["threshold"] = threshold
+        combined_filters = dict(filters) if filters else {}
+        if self._search_user_id_param:
+            # 1.x: entity id is a top-level kwarg; routing filters ride alongside.
+            kwargs["user_id"] = user_id
+            if combined_filters and self._search_supports_filters:
+                kwargs["filters"] = combined_filters
+        else:
+            # 2.x: the entity id must travel inside filters (required), so any
+            # routing filters merge into the same dict.
+            combined_filters["user_id"] = user_id
+            kwargs["filters"] = combined_filters
         try:
             async with self._read_lock():
                 result = await asyncio.to_thread(self.memory.search, query, **kwargs)

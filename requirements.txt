@@ -1,12 +1,16 @@
-# Runtime dependencies for the Reliquary MCP memory server.
+# Direct runtime dependencies for the Reliquary MCP memory server.
 #
-# Abstract floors reflecting the APIs the code relies on. For reproducible
-# deploys, generate and commit a lockfile from a known-good environment:
+# Pinned to exact versions: mem0 in particular makes breaking API changes
+# across majors (2.0 moved the entity id from a top-level `user_id=` kwarg into
+# `filters={"user_id": ...}` and renamed `limit` -> `top_k` on search()), so an
+# unpinned floor silently drifts the runtime out from under the code.
+#
+# The Docker image installs the fully-resolved transitive set from
+# requirements.lock for reproducible builds. Regenerate both after a bump:
 #
 #     pip install -r requirements.txt && pip freeze > requirements.lock
-#     # deploy with: pip install -r requirements.lock
-mem0ai>=0.1.0
-qdrant-client>=1.7.0
-httpx>=0.27.0
-uvicorn>=0.30.0
-PyYAML>=6.0
+mem0ai==2.0.4
+qdrant-client==1.18.0
+httpx==0.28.1
+uvicorn==0.48.0
+PyYAML==6.0.3
