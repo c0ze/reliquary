@@ -62,31 +62,46 @@ SERVER_WEBSITE_URL = "https://github.com/c0ze/reliquary"
 # without a second fetch (MCP Icon schema: {src, mimeType, sizes}).
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 ICON_SIZES = (16, 32, 64, 128, 256, 512)
-_ASSET_CACHE: dict[str, bytes | None] = {}
+_ASSET_CACHE: dict[str, bytes] = {}
+_SERVER_ICONS_CACHE: list[dict[str, Any]] = []
 
 
 def load_asset(name: str) -> bytes | None:
-    """Read a brand asset by filename, cached (including misses)."""
-    if name not in _ASSET_CACHE:
-        try:
-            with open(os.path.join(ASSETS_DIR, name), "rb") as handle:
-                _ASSET_CACHE[name] = handle.read()
-        except OSError:
-            _ASSET_CACHE[name] = None
-    return _ASSET_CACHE[name]
+    """Read a brand asset by filename, caching only successful reads.
+
+    A genuine not-found returns None without caching, and a transient OS error
+    is logged and returns None too — neither is frozen in, so a later read can
+    still recover (the assets ship in the image, so this is just belt-and-braces).
+    """
+    cached = _ASSET_CACHE.get(name)
+    if cached is not None:
+        return cached
+    try:
+        with open(os.path.join(ASSETS_DIR, name), "rb") as handle:
+            data = handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        LOG.exception("Could not read brand asset %s", name)
+        return None
+    _ASSET_CACHE[name] = data
+    return data
 
 
-def _server_icons() -> list[dict[str, Any]]:
+def server_icons() -> list[dict[str, Any]]:
     """MCP Icon list for serverInfo: a single embedded 128px data: URI so it
-    renders with no extra request and no dependency on the public host/TLS."""
+    renders with no extra request and no dependency on the public host/TLS.
+
+    Built lazily and cached only once successfully encoded, so a transient read
+    failure at startup doesn't permanently drop the icon from initialize."""
+    if _SERVER_ICONS_CACHE:
+        return _SERVER_ICONS_CACHE
     raw = load_asset("icon-128.png")
     if raw is None:
         return []
     data_uri = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
-    return [{"src": data_uri, "mimeType": "image/png", "sizes": ["128x128"]}]
-
-
-SERVER_ICONS = _server_icons()
+    _SERVER_ICONS_CACHE.append({"src": data_uri, "mimeType": "image/png", "sizes": ["128x128"]})
+    return _SERVER_ICONS_CACHE
 
 DEFAULT_MEMORY_INSTRUCTION = """You have access to a long-term memory block for this user.
 Use it only when it is clearly relevant to the current request.
@@ -546,7 +561,7 @@ class Mem0ChatProxy:
                             "title": SERVER_TITLE,
                             "version": MCP_SERVER_VERSION,
                             "websiteUrl": SERVER_WEBSITE_URL,
-                            **({"icons": SERVER_ICONS} if SERVER_ICONS else {}),
+                            **({"icons": icons} if (icons := server_icons()) else {}),
                         },
                     },
                 ),
