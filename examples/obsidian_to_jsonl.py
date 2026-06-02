@@ -122,6 +122,9 @@ def build_record(vault: Path, md_file: Path) -> dict:
         "id": hashlib.sha1(rel.as_posix().encode("utf-8")).hexdigest()[:16],
         "text": text,
         "metadata": metadata,
+        # Transient: the note body length (excludes the provenance header), so
+        # --min-chars filters on real content. Popped before writing.
+        "_body_chars": len(body.strip()),
     }
 
 
@@ -151,7 +154,7 @@ def main() -> None:
             if any(rel == ex or rel.startswith(ex + "/") for ex in excludes):
                 continue
             record = build_record(vault, md_file)
-            if len(record["text"]) < args.min_chars:
+            if record.pop("_body_chars") < args.min_chars:
                 continue
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1

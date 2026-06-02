@@ -56,7 +56,7 @@ AI assistants can query and append to over MCP:
 
 ### Components
 
-```
+```text
                  ┌────────────────────────────────────────────┐
    Claude.ai ───▶│  reliquary app  (ASGI / uvicorn)           │
    ChatGPT   ───▶│   • /claude/mcp   (full read+write)        │
@@ -352,7 +352,7 @@ Claude.ai Custom Connectors speak OAuth. Reliquary ships a small OAuth 2.1 shim:
    `MEM0_CLAUDE_MCP_TOKEN`** there and authorize. The connector receives a
    **derived, revocable** token (not the master).
 3. Once it works, pin the client and lock down registration:
-   ```
+   ```bash
    MEM0_OAUTH_CLIENT_ID=<the client_id Claude registered>
    MEM0_OAUTH_ALLOW_REGISTRATION=false
    ```
@@ -448,7 +448,7 @@ If you already run a reverse proxy with a public IP, terminate TLS there and
 `proxy_pass` to `127.0.0.1:8787`. Caddy gets you automatic Let's Encrypt in two
 lines:
 
-```
+```caddyfile
 mem0.example.com {
     reverse_proxy 127.0.0.1:8787
 }
