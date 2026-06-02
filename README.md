@@ -1,8 +1,23 @@
-# Reliquary
+<p align="center">
+  <img src="app/assets/icon-256.png" alt="Reliquary" width="168" height="168">
+</p>
 
-A personal **memory server for AIs** — [Mem0](https://github.com/mem0ai/mem0) +
-[Qdrant](https://qdrant.tech) behind the **Model Context Protocol (MCP)**, so any
-Claude or ChatGPT session can search and store your long-term memories.
+<h1 align="center">Reliquary</h1>
+
+<p align="center">
+  <strong>A personal memory server for AIs.</strong><br>
+  <a href="https://github.com/mem0ai/mem0">Mem0</a> + <a href="https://qdrant.tech">Qdrant</a>
+  behind the <strong>Model Context Protocol</strong> — so any Claude or ChatGPT
+  session can search and store your long-term memories.
+</p>
+
+<p align="center">
+  <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-E3B341.svg">
+  <img alt="Docker" src="https://img.shields.io/badge/Docker-coze%2Freliquary-2496ED?logo=docker&logoColor=white">
+  <img alt="MCP" src="https://img.shields.io/badge/MCP-Streamable_HTTP-6E56CF">
+  <img alt="Python 3.12+" src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white">
+  <img alt="No GPU required" src="https://img.shields.io/badge/GPU-not_required-2EA043">
+</p>
 
 - **Semantic recall** over your own corpus (vector search), with optional
   domain/hall/room/topic **routing** for sharper retrieval.
