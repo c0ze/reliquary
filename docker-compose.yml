@@ -1,0 +1,49 @@
+# Reliquary — turnkey self-hosted MCP memory server.
+#
+#   cp .env.example .env            # set your bearer tokens
+#   cp config.example.yaml config.yaml
+#   docker compose up -d
+#
+# Three services: a Qdrant vector store, an embedding model, and the app
+# (MCP + OAuth + mem0 client). No GPU and no chat LLM are required for
+# MCP-only retrieval.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.18.1
+    restart: unless-stopped
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    # Not published — only the app talks to it over the compose network.
+
+  # Embedding model. Text-Embeddings-Inference serves an OpenAI-compatible
+  # /v1/embeddings endpoint on port 80. nomic-embed-text is 768-dim and runs
+  # on CPU. Swap the model here AND `embedding_*dims` in config.yaml together.
+  #
+  # ⚠️ First-run integration point: confirm your mem0 `embedder` config in
+  # config.yaml points at this service and that the dims match. Alternatives:
+  # an Ollama container, or an external embeddings API (set the base_url).
+  embedder:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    restart: unless-stopped
+    command: ["--model-id", "nomic-ai/nomic-embed-text-v1.5"]
+    volumes:
+      - hf_cache:/data
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+      - embedder
+    env_file: .env
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+    # Publish to loopback only; put Cloudflare Tunnel / Caddy / Traefik in front
+    # for public TLS. Remove the 127.0.0.1 prefix at your own risk.
+    ports:
+      - "127.0.0.1:8787:8787"
+
+volumes:
+  qdrant_storage:
+  hf_cache:
