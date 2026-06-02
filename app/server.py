@@ -62,6 +62,7 @@ SERVER_WEBSITE_URL = "https://github.com/c0ze/reliquary"
 # without a second fetch (MCP Icon schema: {src, mimeType, sizes}).
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 ICON_SIZES = (16, 32, 64, 128, 256, 512)
+ICON_PATH_RE = re.compile(r"/icon-(?:%s)\.png" % "|".join(str(s) for s in ICON_SIZES))
 _ASSET_CACHE: dict[str, bytes] = {}
 _SERVER_ICONS_CACHE: list[dict[str, Any]] = []
 
@@ -262,7 +263,7 @@ class Mem0ChatProxy:
                 await self.send_asset(send, "favicon.ico", "image/vnd.microsoft.icon")
                 return
 
-            if method == "GET" and (path == "/icon.png" or re.fullmatch(r"/icon-(?:16|32|64|128|256|512)\.png", path)):
+            if method == "GET" and (path == "/icon.png" or ICON_PATH_RE.fullmatch(path)):
                 filename = "icon-512.png" if path == "/icon.png" else path.lstrip("/")
                 await self.send_asset(send, filename, "image/png")
                 return
