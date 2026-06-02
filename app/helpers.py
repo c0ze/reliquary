@@ -165,9 +165,11 @@ def added_memory_ids(add_result: Any) -> list[str]:
     """
     ids: list[str] = []
     if isinstance(add_result, dict):
-        for item in add_result.get("results") or []:
-            if isinstance(item, dict) and item.get("id"):
-                ids.append(str(item["id"]))
+        results = add_result.get("results")
+        if isinstance(results, list):
+            for item in results:
+                if isinstance(item, dict) and item.get("id"):
+                    ids.append(str(item["id"]))
     return ids
 
 

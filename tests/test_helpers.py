@@ -147,9 +147,13 @@ def test_added_memory_ids():
     assert added_memory_ids({"results": [{"id": "abc", "event": "ADD"}]}) == ["abc"]
     # all ids returned when infer splits into several atomic facts
     assert added_memory_ids({"results": [{"id": "1"}, {"id": "2"}]}) == ["1", "2"]
-    # unexpected / empty shapes degrade to an empty list
+    # unexpected / empty shapes degrade to an empty list (never raise)
     assert added_memory_ids({"results": []}) == []
     assert added_memory_ids({"results": [{"memory": "no id"}]}) == []
+    assert added_memory_ids({"results": [{"id": ""}]}) == []  # falsy id skipped
+    assert added_memory_ids({"results": 123}) == []  # non-list truthy: must not raise
+    assert added_memory_ids({"results": True}) == []
+    assert added_memory_ids({"results": [123, {"id": "ok"}]}) == ["ok"]  # non-dict item skipped
     assert added_memory_ids("nope") == []
     assert added_memory_ids({}) == []
 
