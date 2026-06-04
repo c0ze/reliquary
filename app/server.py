@@ -79,6 +79,20 @@ BLOB_PATH_RE = re.compile(r"/blobs/([0-9a-f]{64})\Z")
 _INLINE_SAFE_MIMETYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 _ASSET_CACHE: dict[str, bytes] = {}
 _SERVER_ICONS_CACHE: list[dict[str, Any]] = []
+_LEXICAL_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_LEXICAL_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "you",
+    "your",
+    "about",
+    "into",
+}
 
 
 def load_asset(name: str) -> bytes | None:
@@ -2076,7 +2090,136 @@ class Mem0ChatProxy:
         hits = result.get("results")
         if not isinstance(hits, list):
             return []
+        live_hits = await self.live_lexical_matches(
+            query,
+            user_id=user_id,
+            filters=filters,
+            limit=candidate_limit,
+        )
+        if live_hits:
+            by_id: dict[str, dict[str, Any]] = {}
+            for hit in hits:
+                if isinstance(hit, dict):
+                    by_id[str(hit.get("id") or "")] = hit
+            for hit in live_hits:
+                hit_id = str(hit.get("id") or "")
+                existing = by_id.get(hit_id)
+                if existing is None or self._numeric_score(hit.get("score")) > self._numeric_score(existing.get("score")):
+                    by_id[hit_id] = hit
+            hits = list(by_id.values())
         return apply_retrieval_quality(query, hits, limit=limit)
+
+    async def live_lexical_matches(
+        self,
+        query: str,
+        *,
+        user_id: str,
+        filters: dict[str, Any] | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Find exact lexical matches among user-written live memories.
+
+        Mem0 vector search is the primary retrieval path, but freshly-added
+        smoke-test tokens and image captions can rank surprisingly low. This
+        fallback is intentionally scoped to live user writes, so imported corpus
+        ranking stays vector-led while direct identifiers remain discoverable.
+        """
+        query_terms = self._lexical_terms(query)
+        if not query_terms or limit <= 0:
+            return []
+        get_all = getattr(self.memory, "get_all", None)
+        if get_all is None:
+            return []
+        try:
+            async with self._read_lock():
+                result = await asyncio.to_thread(get_all, user_id=user_id)
+        except Exception:
+            LOG.debug("Live lexical fallback failed for user_id=%s", user_id, exc_info=True)
+            return []
+
+        records = self._memory_results(result)
+        matches: list[dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            metadata = dict(record.get("metadata") or {})
+            if metadata.get("source_group") != "user-write":
+                continue
+            if not self._filters_match(metadata, filters):
+                continue
+            text = self._memory_text(record)
+            coverage = self._lexical_coverage(query_terms, text)
+            if coverage <= 0:
+                continue
+            hit = dict(record)
+            hit["score"] = max(self._numeric_score(hit.get("score")), 1.0 + coverage)
+            matches.append(hit)
+
+        matches.sort(key=lambda hit: (-self._numeric_score(hit.get("score")), str(hit.get("id") or "")))
+        return matches[:limit]
+
+    @staticmethod
+    def _memory_results(result: Any) -> list[Any]:
+        if isinstance(result, dict):
+            for key in ("results", "memories"):
+                value = result.get(key)
+                if isinstance(value, list):
+                    return value
+            return []
+        if isinstance(result, list):
+            return result
+        return []
+
+    @staticmethod
+    def _memory_text(record: dict[str, Any]) -> str:
+        value = record.get("memory", record.get("text", ""))
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, dict):
+                    content = item.get("content")
+                    if isinstance(content, str):
+                        parts.append(content)
+                elif isinstance(item, str):
+                    parts.append(item)
+            return " ".join(parts)
+        return str(value or "")
+
+    @staticmethod
+    def _lexical_terms(text: str) -> set[str]:
+        return {
+            token
+            for token in _LEXICAL_TOKEN_RE.findall(text.lower())
+            if len(token) > 2 and token not in _LEXICAL_STOPWORDS
+        }
+
+    @classmethod
+    def _lexical_coverage(cls, query_terms: set[str], text: str) -> float:
+        text_terms = cls._lexical_terms(text)
+        if not query_terms or not text_terms:
+            return 0.0
+        return len(query_terms & text_terms) / len(query_terms)
+
+    @classmethod
+    def _filters_match(cls, metadata: dict[str, Any], filters: dict[str, Any] | None) -> bool:
+        if not filters:
+            return True
+        clauses = filters.get("AND")
+        if isinstance(clauses, list):
+            return all(isinstance(clause, dict) and cls._filters_match(metadata, clause) for clause in clauses)
+        for key, value in filters.items():
+            if key == "AND":
+                continue
+            if metadata.get(key) != value:
+                return False
+        return True
+
+    @staticmethod
+    def _numeric_score(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
 
     async def add_memory(
         self,
