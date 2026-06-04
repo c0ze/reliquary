@@ -17,8 +17,21 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import threading
 import time
 from dataclasses import asdict, dataclass
+
+_BLOB_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_SAFE_BLOB_ID_RE = re.compile(r"^[0-9a-zA-Z_\-]+$")
+
+
+def _validate_blob_id(blob_id: str) -> None:
+    if not _SAFE_BLOB_ID_RE.match(blob_id):
+        raise ValueError(f"invalid blob_id: {blob_id!r}")
+
+
+_STORE_LOCK = threading.Lock()
 
 
 class BlobTooLarge(Exception):
@@ -92,6 +105,7 @@ class BlobStore:
 
     # --- sidecar -------------------------------------------------------------
     def info(self, blob_id: str) -> BlobInfo | None:
+        _validate_blob_id(blob_id)
         try:
             with open(self._sidecar_path(blob_id), "r", encoding="utf-8") as fh:
                 return BlobInfo(**json.load(fh))
@@ -112,38 +126,40 @@ class BlobStore:
 
         blob_id = hashlib.sha256(data).hexdigest()
 
-        existing = self.info(blob_id)
-        if existing is not None:
-            existing.ref_count += 1
-            self._write_sidecar(existing)
-            return existing
+        with _STORE_LOCK:
+            existing = self.info(blob_id)
+            if existing is not None:
+                existing.ref_count += 1
+                self._write_sidecar(existing)
+                return existing
 
-        sniffed_mime, ext = sniff_mimetype(data)
-        if sniffed_mime == "application/octet-stream" and mimetype:
-            final_mime = mimetype
-            ext = _MIME_EXT.get(mimetype, "bin")
-        else:
-            final_mime = sniffed_mime
+            sniffed_mime, ext = sniff_mimetype(data)
+            if sniffed_mime == "application/octet-stream" and mimetype:
+                final_mime = mimetype
+                ext = _MIME_EXT.get(mimetype, "bin")
+            else:
+                final_mime = sniffed_mime
 
-        os.makedirs(self._shard_dir(blob_id), exist_ok=True)
-        blob_path = self._blob_path(blob_id, ext)
-        tmp = f"{blob_path}.tmp"
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp, blob_path)
+            os.makedirs(self._shard_dir(blob_id), exist_ok=True)
+            blob_path = self._blob_path(blob_id, ext)
+            tmp = f"{blob_path}.tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, blob_path)
 
-        info = BlobInfo(
-            id=blob_id,
-            mimetype=final_mime,
-            size=len(data),
-            ext=ext,
-            ref_count=1,
-            created=time.time(),
-        )
-        self._write_sidecar(info)
-        return info
+            info = BlobInfo(
+                id=blob_id,
+                mimetype=final_mime,
+                size=len(data),
+                ext=ext,
+                ref_count=1,
+                created=time.time(),
+            )
+            self._write_sidecar(info)
+            return info
 
     def get(self, blob_id: str) -> tuple[bytes, str] | None:
+        _validate_blob_id(blob_id)
         info = self.info(blob_id)
         if info is None:
             return None
@@ -159,19 +175,21 @@ class BlobStore:
         Returns ``None`` if unknown, ``True`` if the blob was unlinked, ``False``
         if it was only decremented (still referenced).
         """
-        info = self.info(blob_id)
-        if info is None:
-            return None
-        info.ref_count -= 1
-        if info.ref_count > 0:
-            self._write_sidecar(info)
-            return False
-        for path in (self._blob_path(blob_id, info.ext), self._sidecar_path(blob_id)):
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
-        return True
+        _validate_blob_id(blob_id)
+        with _STORE_LOCK:
+            info = self.info(blob_id)
+            if info is None:
+                return None
+            info.ref_count -= 1
+            if info.ref_count > 0:
+                self._write_sidecar(info)
+                return False
+            for path in (self._blob_path(blob_id, info.ext), self._sidecar_path(blob_id)):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            return True
 
     # --- signed URLs ---------------------------------------------------------
     def _sig(self, blob_id: str, exp: int) -> str:
@@ -179,10 +197,12 @@ class BlobStore:
         return hmac.new(self.signing_key, msg, hashlib.sha256).hexdigest()
 
     def sign(self, blob_id: str, ttl_seconds: int) -> tuple[int, str]:
+        _validate_blob_id(blob_id)
         exp = int(time.time()) + ttl_seconds
         return exp, self._sig(blob_id, exp)
 
     def verify(self, blob_id: str, exp: int, sig: str) -> bool:
+        _validate_blob_id(blob_id)
         if exp < int(time.time()):
             return False
         return hmac.compare_digest(self._sig(blob_id, exp), sig)
