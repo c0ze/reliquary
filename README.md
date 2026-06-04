@@ -20,7 +20,8 @@
 </p>
 
 - **Semantic recall** over your own corpus (vector search), with optional
-  domain/hall/room/topic **routing** for sharper retrieval.
+  domain/hall/room/topic **routing** plus query-time reranking, recency bias,
+  and duplicate suppression for sharper retrieval.
 - **Two MCP endpoints:** a full read+write one for the Claude.ai connector, and
   a lean, deep-research-shaped read (optionally write) one for ChatGPT.
 - **OAuth 2.1 shim** (PKCE, dynamic client registration, revocable
@@ -152,6 +153,11 @@ and update records whose text or metadata changed.
 
 `metadata.title` is used as the result title; `domain`/`hall`/`room`/`topic`
 enable routing; any `source_url`/`source_ref` becomes the document URL.
+If records include `updated_at`, `created_at`, `timestamp`, or similar date
+metadata, search uses it as a small recency tiebreaker after vector similarity.
+The server also overfetches raw candidates and removes near-duplicate result
+texts at query time so repeated facts from multiple sources do not crowd out
+the result budget.
 
 Agent write-back is opt-in. `--writeback` stores successful chat turns in Mem0;
 add `--writeback-path /path/to/Agent.md` (or `MEM0_WRITEBACK_PATH`) to also
