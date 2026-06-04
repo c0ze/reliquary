@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -61,7 +62,13 @@ def fake_memory():
 
 
 @pytest.fixture
-def proxy(tmp_path, fake_memory):
+def proxy(tmp_path, fake_memory, monkeypatch):
+    async def inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    # The fake backend is pure in-memory test code; running it inline avoids
+    # threadpool shutdown hangs under Python 3.14 in the sandboxed test runner.
+    monkeypatch.setattr(asyncio, "to_thread", inline_to_thread)
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({
         "vector_store": {"provider": "qdrant", "config": {"host": "x", "port": 6333}},
