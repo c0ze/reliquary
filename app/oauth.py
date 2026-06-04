@@ -13,6 +13,13 @@ from urllib.parse import urlencode, urlparse
 AUTHORIZATION_CODE_TTL = 600
 ACCESS_TOKEN_TTL = 30 * 24 * 3600  # 30 days
 
+READ_SCOPES = {"read", "readonly", "read_only", "search"}
+
+
+def scope_is_write(scope: str | None) -> bool:
+    """Everything except an explicit read scope grants write (legacy 'mcp' = write)."""
+    return str(scope or "").strip().lower() not in READ_SCOPES
+
 
 @dataclass
 class AuthorizationCode:
@@ -86,7 +93,7 @@ class OAuthProvider:
             "resource": f"{base}{path}",
             "authorization_servers": [base],
             "bearer_methods_supported": ["header"],
-            "scopes_supported": ["mcp"],
+            "scopes_supported": ["read", "write"],
         }
 
     def authorization_server_metadata(self, headers: dict[str, str]) -> dict[str, Any]:
@@ -101,7 +108,7 @@ class OAuthProvider:
             "grant_types_supported": ["authorization_code"],
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none"],
-            "scopes_supported": ["mcp"],
+            "scopes_supported": ["read", "write"],
         }
 
     def register_client(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -288,6 +295,24 @@ class OAuthProvider:
             if not resource or entry.resource != resource:
                 return False
         return True
+
+    def access_token_scope(self, candidate: str | None, *, resource: str | None = None) -> str | None:
+        """Return the scope of a valid access token, or None if invalid/expired/unknown."""
+        if not candidate:
+            return None
+        key = candidate.strip()
+        self._prune_access_tokens()
+        entry = self._access_tokens.get(key)
+        if entry is None:
+            return None
+        if entry.expires_at < time.time():
+            self._access_tokens.pop(key, None)
+            self._persist_access_tokens()
+            return None
+        if entry.resource:
+            if not resource or entry.resource != resource:
+                return None
+        return entry.scope or "mcp"
 
     def revoke_access_token(self, token: str | None) -> bool:
         removed = self._access_tokens.pop((token or "").strip(), None) is not None
