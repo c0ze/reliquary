@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
 import logging
@@ -23,6 +24,9 @@ from catalog import CorpusCatalog
 from persistence import JsonFileStore
 from runtime import AsyncRWLock, MCPSessionStore, reads_can_be_concurrent
 from blobs import BlobStore, BlobTooLarge
+from ratelimit import RateLimiter
+from metrics import Metrics
+from audit import AuditLog
 from helpers import (
     OPENAI_SNIPPET_CHAR_CAP,
     SEARCH_PREVIEW_CHAR_CAP,
@@ -159,6 +163,10 @@ class ProxySettings:
     blob_url_ttl: int = 3600
     state_dir: str | None = None
     static_tokens: tuple[tuple[str, str, str], ...] = ()
+    audit_log_path: str | None = None
+    rate_limit_writes: int = 0
+    rate_limit_searches: int = 0
+    metrics_public: bool = False
 
 
 class Mem0ChatProxy:
@@ -246,6 +254,11 @@ class Mem0ChatProxy:
                 "Signed blob URLs will invalidate on restart."
             )
 
+        self.metrics = Metrics()
+        self.audit = AuditLog(settings.audit_log_path)
+        self.write_limiter = RateLimiter(settings.rate_limit_writes)
+        self.search_limiter = RateLimiter(settings.rate_limit_searches)
+
     def _detect_search_api(self) -> tuple[bool, bool, str]:
         """Inspect ``memory.search`` once to adapt to the installed mem0 version.
 
@@ -312,6 +325,20 @@ class Mem0ChatProxy:
                     await self._send_unauthorized(send)
                     return
                 await self.handle_status(send)
+                return
+
+            if method == "GET" and path == "/metrics":
+                if not self.settings.metrics_public and not self._require_claude_auth(decode_headers(scope)):
+                    await self._send_unauthorized(send)
+                    return
+                body = self.metrics.render(memory_count=await self.get_memory_count()).encode("utf-8")
+                headers_out = [
+                    (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
+                    (b"cache-control", b"no-store"),
+                    (b"content-length", str(len(body)).encode("latin-1")),
+                ]
+                await send({"type": "http.response.start", "status": 200, "headers": headers_out})
+                await send({"type": "http.response.body", "body": body, "more_body": False})
                 return
 
             if method == "GET" and (
@@ -658,7 +685,31 @@ class Mem0ChatProxy:
             if not isinstance(tool_arguments, dict):
                 await self.send_json(send, 400, self.mcp_error(request_id, -32602, "tools/call `arguments` must be an object"))
                 return
-            result = await self.call_mcp_tool(profile, tool_name, tool_arguments, can_write=can_write)
+            category = self._tool_category(tool_name)
+            rate_key = self._rate_key(headers)
+            limiter = (
+                self.write_limiter if category == "write"
+                else self.search_limiter if category == "read"
+                else None
+            )
+            if limiter is not None and not limiter.allow(rate_key):
+                self.metrics.record_rate_limited()
+                result = self.mcp_tool_result(
+                    text="Rate limit exceeded; slow down and retry shortly.",
+                    structured={"error": "rate_limited", "category": category},
+                    is_error=True,
+                )
+            else:
+                result = await self.call_mcp_tool(profile, tool_name, tool_arguments, can_write=can_write)
+                self.metrics.record_tool(tool_name, ok=not result.get("isError"))
+                if category == "write" and not result.get("isError"):
+                    structured = result.get("structuredContent") or {}
+                    self.audit.record(
+                        action=tool_name,
+                        endpoint=profile.name,
+                        user_id=tool_arguments.get("user_id") or self.settings.user_id,
+                        ids={k: structured.get(k) for k in ("ids", "id", "memory_id", "blob_id", "deleted", "updated") if k in structured},
+                    )
             await self.send_json(
                 send,
                 200,
@@ -673,6 +724,26 @@ class Mem0ChatProxy:
             self.mcp_error(request_id, -32601, f"Method not found: {request_method}"),
             extra_headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
         )
+
+    @staticmethod
+    def _tool_category(tool_name: str) -> str:
+        writes = {"mem0_add_memory", "add_memory", "mem0_delete", "delete",
+                  "mem0_update", "update", "add_image", "delete_image"}
+        reads = {"mem0_search", "search", "mem0_fetch", "fetch", "fetch_image"}
+        if tool_name in writes:
+            return "write"
+        if tool_name in reads:
+            return "read"
+        return "other"
+
+    @staticmethod
+    def _rate_key(headers: dict[str, str]) -> str:
+        auth = headers.get("authorization", "").strip()
+        scheme, _, token = auth.partition(" ")
+        token = token.strip()
+        if scheme.lower() == "bearer" and token:
+            return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+        return "anon"
 
     def _routing_hint(self) -> str:
         if not self.catalog or not self.catalog.routeable_domains:
@@ -2405,6 +2476,10 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         blob_url_ttl=args.blob_url_ttl,
         state_dir=args.state_dir,
         static_tokens=parse_static_tokens(args.static_tokens),
+        audit_log_path=args.audit_log,
+        rate_limit_writes=args.rate_limit_writes,
+        rate_limit_searches=args.rate_limit_searches,
+        metrics_public=args.metrics_public,
     )
 
 
@@ -2514,6 +2589,15 @@ def parse_args() -> argparse.Namespace:
         "Format: 'label:scope:token' entries separated by ';'. scope is 'read' or 'write'. "
         "Example: 'readonly:read:abc123;editor:write:def456'.",
     )
+    parser.add_argument("--audit-log", default=os.getenv("MEM0_AUDIT_LOG"),
+        help="Append a JSONL audit line per write (add/update/delete) to this path. Unset = disabled.")
+    parser.add_argument("--rate-limit-writes", type=int, default=int(os.getenv("MEM0_RATE_LIMIT_WRITES", "0")),
+        help="Max write tool calls per token per minute (0 = unlimited).")
+    parser.add_argument("--rate-limit-searches", type=int, default=int(os.getenv("MEM0_RATE_LIMIT_SEARCHES", "0")),
+        help="Max search/fetch tool calls per token per minute (0 = unlimited).")
+    parser.add_argument("--metrics-public", action=argparse.BooleanOptionalAction,
+        default=os.getenv("MEM0_METRICS_PUBLIC", "false").lower() in {"1", "true", "yes"},
+        help="Expose GET /metrics without auth (default false: requires the Claude bearer).")
     parser.add_argument("--log-level", default="info", help="Logging level, for example info or debug.")
     return parser.parse_args()
 
