@@ -182,3 +182,36 @@ def test_update_cannot_forge_blob_ref(proxy):
     metadata = rec["metadata"]
     assert metadata.get("blob_ref") == original_blob_ref, "blob_ref must not be overwritten"
     assert metadata.get("kind") == "image", "kind must not be overwritten"
+
+
+# --------------------------------------------------------------------------- #
+# 5. Hardening wiring: metrics, audit, rate limiters, tool category
+# --------------------------------------------------------------------------- #
+
+def test_proxy_has_metrics_audit_limiters(proxy):
+    from metrics import Metrics
+    from audit import AuditLog
+    from ratelimit import RateLimiter
+    assert isinstance(proxy.metrics, Metrics)
+    assert isinstance(proxy.audit, AuditLog)
+    assert isinstance(proxy.write_limiter, RateLimiter)
+    assert isinstance(proxy.search_limiter, RateLimiter)
+
+
+def test_tool_category_writes():
+    from server import Mem0ChatProxy
+    for tool in ("mem0_add_memory", "add_memory", "mem0_delete", "delete",
+                 "mem0_update", "update", "add_image", "delete_image"):
+        assert Mem0ChatProxy._tool_category(tool) == "write", f"expected write for {tool}"
+
+
+def test_tool_category_reads():
+    from server import Mem0ChatProxy
+    for tool in ("mem0_search", "search", "mem0_fetch", "fetch", "fetch_image"):
+        assert Mem0ChatProxy._tool_category(tool) == "read", f"expected read for {tool}"
+
+
+def test_tool_category_other():
+    from server import Mem0ChatProxy
+    assert Mem0ChatProxy._tool_category("mem0_status") == "other"
+    assert Mem0ChatProxy._tool_category("unknown_tool") == "other"

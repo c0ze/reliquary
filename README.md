@@ -37,6 +37,26 @@ ingestion (with an Obsidian example), embedder choices (Ollama / LM Studio /
 external APIs), auth, and external-access options (Cloudflare Tunnel / Tailscale
 / ngrok).
 
+## Hardening
+
+For a publicly reachable deployment see [`docs/INGRESS.md`](docs/INGRESS.md)
+for a reverse-proxy allowlist (Caddy + nginx examples) that blocks internal
+routes (`/status`, `/metrics`, `/blobs/*`, `/v1/*`) from the public internet.
+
+**Opt-in operational guardrails** (all default off — no behavior change unless
+explicitly configured):
+
+| Environment variable | Purpose |
+|---|---|
+| `MEM0_AUDIT_LOG` | Append-only JSONL log of every successful write (add/update/delete). Path to file; unset = disabled. |
+| `MEM0_RATE_LIMIT_WRITES` | Max write tool calls per token per minute (`0` = unlimited). |
+| `MEM0_RATE_LIMIT_SEARCHES` | Max search/fetch calls per token per minute (`0` = unlimited). |
+| `MEM0_METRICS_PUBLIC` | Set to `true` to expose `GET /metrics` without auth. Default `false` = requires the Claude bearer token. |
+
+`GET /metrics` emits Prometheus text format with per-tool call counters,
+rate-limit rejection counts, process uptime, and (when the vector store supports
+it) an approximate memory count gauge.
+
 ## Quick start (Docker)
 
 ```bash
