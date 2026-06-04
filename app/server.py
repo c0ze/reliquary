@@ -68,6 +68,9 @@ ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 ICON_SIZES = (16, 32, 64, 128, 256, 512)
 ICON_PATH_RE = re.compile(r"/icon-(?:%s)\.png" % "|".join(str(s) for s in ICON_SIZES))
 BLOB_PATH_RE = re.compile(r"/blobs/([0-9a-f]{64})\Z")
+# Passive raster image types safe to serve inline same-origin. Anything else
+# (SVG, PDF, HTML, unknown) is forced to an octet-stream download by /blobs/{id}.
+_INLINE_SAFE_MIMETYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 _ASSET_CACHE: dict[str, bytes] = {}
 _SERVER_ICONS_CACHE: list[dict[str, Any]] = []
 
@@ -775,6 +778,20 @@ class Mem0ChatProxy:
                         },
                     }
                 )
+                tools.append(
+                    {
+                        "name": "delete_image",
+                        "title": "Delete Image",
+                        "description": "Delete an image you stored via add_image, by its memory_id.",
+                        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"memory_id": {"type": "string", "description": "memory_id returned by add_image."}},
+                            "required": ["memory_id"],
+                            "additionalProperties": False,
+                        },
+                    }
+                )
             return tools
 
         return [
@@ -953,6 +970,15 @@ class Mem0ChatProxy:
                             is_error=True,
                         )
                     return await self.handle_add_image_tool(lean_add_image_args(arguments))
+                if tool_name == "delete_image":
+                    if not profile.allow_write:
+                        return self.mcp_tool_result(
+                            text="delete_image is not available on this endpoint.",
+                            structured={"error": "read_only_endpoint"},
+                            is_error=True,
+                        )
+                    # allow_user_id=False: deletes are always scoped to the default user_id.
+                    return await self.handle_delete_image_tool(arguments, allow_user_id=False)
                 return self.mcp_tool_result(
                     text=f"Unknown tool: {tool_name}",
                     structured={"error": "unknown_tool"},
@@ -1260,7 +1286,12 @@ class Mem0ChatProxy:
             if value is not None and str(value).strip():
                 metadata[key] = str(value).strip()
 
-        result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)
+        try:
+            result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)
+        except Exception:
+            # The blob is already on disk; don't leak it if the caption write fails.
+            self.blobs.delete(info.id)
+            raise
         new_ids = added_memory_ids(result)
         memory_id = new_ids[0] if new_ids else None
         if memory_id is None:
@@ -1341,10 +1372,16 @@ class Mem0ChatProxy:
                 structured={"error": "protected_record", "id": memory_id},
                 is_error=True,
             )
+        # Require both the image kind and a blob_ref. This is the marker add_image
+        # stamps; it guards against decref'ing a live blob via a plain note that
+        # merely carries a (forged) blob_ref in caller-supplied metadata. Note: a
+        # caller forging BOTH kind="image" and blob_ref via mem0_add_memory can
+        # still target a blob — acceptable in this single-user store, but see the
+        # follow-up on an authoritative memory<->blob registration.
         blob_ref = metadata.get("blob_ref")
-        if not blob_ref:
+        if metadata.get("kind") != "image" or not blob_ref:
             return self.mcp_tool_result(
-                text=f"memory_id={memory_id} is not an image (no blob_ref).",
+                text=f"memory_id={memory_id} is not an image (no image blob_ref).",
                 structured={"error": "not_an_image", "id": memory_id},
                 is_error=True,
             )
@@ -2068,11 +2105,24 @@ class Mem0ChatProxy:
             await self.send_json(send, 404, {"error": f"No blob for id={blob_id}"})
             return
         data, mimetype = result
+        # The stored mimetype is partly caller-influenced (add_image fallback), and
+        # this route is same-origin with the app. Only serve a small allowlist of
+        # passive raster images inline; everything else (SVG, PDF, HTML, unknown) is
+        # forced to a non-rendering download. nosniff is always set.
+        if mimetype in _INLINE_SAFE_MIMETYPES:
+            content_type = mimetype
+            disposition = None
+        else:
+            content_type = "application/octet-stream"
+            disposition = "attachment"
         headers = [
-            (b"content-type", mimetype.encode("latin-1", "replace")),
+            (b"content-type", content_type.encode("latin-1", "replace")),
             (b"cache-control", b"private, max-age=86400"),
             (b"content-length", str(len(data)).encode("latin-1")),
+            (b"x-content-type-options", b"nosniff"),
         ]
+        if disposition:
+            headers.append((b"content-disposition", disposition.encode("latin-1")))
         await send({"type": "http.response.start", "status": 200, "headers": headers})
         await send({"type": "http.response.body", "body": data, "more_body": False})
 
