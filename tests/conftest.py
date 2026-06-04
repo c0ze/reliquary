@@ -1,0 +1,79 @@
+"""Shared test fixtures: an in-memory fake mem0 backend + a constructed proxy."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
+
+import pytest  # noqa: E402
+
+from server import Mem0ChatProxy, ProxySettings  # noqa: E402
+
+
+class FakeMemory:
+    """Minimal in-memory stand-in for mem0's Memory, matching the shapes the
+    server's handlers expect (results lists, get/add/update/delete)."""
+
+    def __init__(self) -> None:
+        self._store: dict[str, dict] = {}
+        self._counter = 0
+
+    def search(self, query, *, user_id=None, limit=None, top_k=None, filters=None, threshold=None, **kw):
+        uid = user_id or (filters or {}).get("user_id")
+        hits = [dict(rec, score=1.0) for rec in self._store.values() if uid is None or rec["user_id"] == uid]
+        cap = limit or top_k
+        if cap:
+            hits = hits[:cap]
+        return {"results": hits}
+
+    def get(self, memory_id):
+        return self._store.get(memory_id)
+
+    def get_all(self, user_id=None, **kw):
+        recs = [r for r in self._store.values() if user_id is None or r["user_id"] == user_id]
+        return {"results": recs}
+
+    def add(self, text, *, user_id=None, metadata=None, infer=False, **kw):
+        self._counter += 1
+        mid = f"fake-{self._counter}"
+        self._store[mid] = {"id": mid, "memory": text, "metadata": dict(metadata or {}), "user_id": user_id}
+        return {"results": [{"id": mid, "event": "ADD"}]}
+
+    def delete(self, memory_id):
+        self._store.pop(memory_id, None)
+
+    def update(self, memory_id, data, metadata=None):
+        rec = self._store.get(memory_id)
+        if rec is None:
+            raise KeyError(memory_id)
+        rec["memory"] = data
+        if metadata is not None:
+            rec["metadata"] = dict(metadata)
+        return {"id": memory_id}
+
+
+@pytest.fixture
+def fake_memory():
+    return FakeMemory()
+
+
+@pytest.fixture
+def proxy(tmp_path, fake_memory):
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "vector_store": {"provider": "qdrant", "config": {"host": "x", "port": 6333}},
+        "embedder": {"provider": "openai", "config": {"model": "text-embedding-3-small"}},
+    }))
+    settings = ProxySettings(
+        config_path=str(cfg),
+        user_id="my_lord",
+        claude_token="claude-secret",
+        openai_token="openai-secret",
+        openai_allow_write=True,
+        blob_dir=str(tmp_path / "blobs"),
+        blob_signing_key="test-signing-key",
+    )
+    return Mem0ChatProxy(settings, memory=fake_memory)

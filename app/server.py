@@ -16,8 +16,6 @@ from typing import Any
 from urllib.parse import parse_qs
 
 import httpx
-import uvicorn
-from mem0 import Memory
 
 from ingest import load_config
 from oauth import OAuthProvider, RegistrationDisabledError
@@ -130,41 +128,45 @@ class EndpointProfile:
 
 @dataclass
 class ProxySettings:
-    config_path: str
-    host: str
-    port: int
-    user_id: str
-    memory_limit: int
-    memory_threshold: float | None
-    memory_max_chars: int
-    request_timeout: float
-    writeback: bool
-    upstream_base_url: str | None
-    embedder_base_url: str | None
-    system_instruction: str
-    claude_mcp_path: str
-    openai_mcp_path: str
-    claude_token: str | None
-    openai_token: str | None
-    openai_allow_noauth: bool
-    openai_allow_write: bool
-    mcp_allowed_origins: tuple[str, ...]
-    dataset_path: str | None
-    oauth_client_id: str | None
-    oauth_allow_registration: bool
-    memory_concurrent_reads: bool | None
-    oauth_verbatim_token: bool
-    blob_dir: str
-    blob_signing_key: str | None
-    blob_max_bytes: int
-    blob_url_ttl: int
+    config_path: str = "config.json"
+    host: str = "127.0.0.1"
+    port: int = 8787
+    user_id: str = "default"
+    memory_limit: int = 5
+    memory_threshold: float | None = None
+    memory_max_chars: int = 500
+    request_timeout: float = 600.0
+    writeback: bool = False
+    upstream_base_url: str | None = None
+    embedder_base_url: str | None = None
+    system_instruction: str = ""
+    claude_mcp_path: str = "/claude/mcp"
+    openai_mcp_path: str = "/openai/mcp"
+    claude_token: str | None = None
+    openai_token: str | None = None
+    openai_allow_noauth: bool = False
+    openai_allow_write: bool = False
+    mcp_allowed_origins: tuple[str, ...] = ()
+    dataset_path: str | None = None
+    oauth_client_id: str | None = None
+    oauth_allow_registration: bool = True
+    memory_concurrent_reads: bool | None = None
+    oauth_verbatim_token: bool = False
+    blob_dir: str = "/data/blobs"
+    blob_signing_key: str | None = None
+    blob_max_bytes: int = 31457280
+    blob_url_ttl: int = 3600
 
 
 class Mem0ChatProxy:
-    def __init__(self, settings: ProxySettings):
+    def __init__(self, settings: ProxySettings, *, memory: Any = None) -> None:
         self.settings = settings
         self.config = load_config(settings.config_path)
-        self.memory = Memory.from_config(self.config)
+        if memory is not None:
+            self.memory = memory
+        else:
+            from mem0 import Memory
+            self.memory = Memory.from_config(self.config)
         timeout = httpx.Timeout(connect=10.0, read=settings.request_timeout, write=30.0, pool=30.0)
         self.client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         # Readers-writer lock. Reads run concurrently only when the backing store
@@ -2479,6 +2481,7 @@ def main() -> None:
             settings.host,
         )
     app = Mem0ChatProxy(settings)
+    import uvicorn
     uvicorn.run(app, host=settings.host, port=settings.port, log_level=args.log_level.lower())
 
 
