@@ -62,6 +62,7 @@ MCP_SERVER_VERSION = "0.2.0"
 MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
+LIVE_LEXICAL_SCAN_LIMIT = 5000
 
 SERVER_TITLE = "Reliquary"
 SERVER_WEBSITE_URL = "https://github.com/c0ze/reliquary"
@@ -2131,8 +2132,9 @@ class Mem0ChatProxy:
         if get_all is None:
             return []
         try:
+            kwargs = self._get_all_kwargs(get_all, user_id=user_id, top_k=LIVE_LEXICAL_SCAN_LIMIT)
             async with self._read_lock():
-                result = await asyncio.to_thread(get_all, user_id=user_id)
+                result = await asyncio.to_thread(get_all, **kwargs)
         except Exception:
             LOG.debug("Live lexical fallback failed for user_id=%s", user_id, exc_info=True)
             return []
@@ -2169,6 +2171,27 @@ class Mem0ChatProxy:
         if isinstance(result, list):
             return result
         return []
+
+    @staticmethod
+    def _get_all_kwargs(get_all: Any, *, user_id: str, top_k: int) -> dict[str, Any]:
+        """Build kwargs that work across Mem0 1.x and 2.x get_all signatures."""
+        kwargs: dict[str, Any] = {}
+        try:
+            parameters = inspect.signature(get_all).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        has_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+        if "filters" in parameters or has_var_kwargs:
+            kwargs["filters"] = {"user_id": user_id}
+        if "user_id" in parameters:
+            kwargs["user_id"] = user_id
+        elif not kwargs:
+            kwargs["user_id"] = user_id
+        if "top_k" in parameters or has_var_kwargs:
+            kwargs["top_k"] = top_k
+        elif "limit" in parameters:
+            kwargs["limit"] = top_k
+        return kwargs
 
     @staticmethod
     def _memory_text(record: dict[str, Any]) -> str:

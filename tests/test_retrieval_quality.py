@@ -200,3 +200,39 @@ def test_search_memories_lexical_fallback_honors_filters(proxy, fake_memory, mon
     )
 
     assert [hit["id"] for hit in result] == ["infra-note"]
+
+
+def test_search_memories_lexical_fallback_scans_beyond_get_all_default(proxy, monkeypatch):
+    hidden_record = {
+        "id": "older-image",
+        "memory": "ARDA-OLDER-IMAGE-TOKEN older image caption",
+        "metadata": {"source_group": "user-write", "kind": "image"},
+        "user_id": "my_lord",
+    }
+    captured = {}
+
+    def fake_search(query, **kwargs):
+        return {"results": []}
+
+    def fake_get_all(**kwargs):
+        captured.update(kwargs)
+        if kwargs.get("top_k", 20) <= 20:
+            return {"results": []}
+        return {"results": [hidden_record]}
+
+    monkeypatch.setattr(proxy.memory, "search", fake_search)
+    monkeypatch.setattr(proxy.memory, "get_all", fake_get_all)
+
+    result = run(
+        proxy.search_memories(
+            "ARDA-OLDER-IMAGE-TOKEN",
+            user_id="my_lord",
+            limit=1,
+            threshold=None,
+            filters=None,
+        )
+    )
+
+    assert [hit["id"] for hit in result] == ["older-image"]
+    assert captured["filters"] == {"user_id": "my_lord"}
+    assert captured["top_k"] > 20
