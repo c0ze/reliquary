@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urljoin
 
 import httpx
 
@@ -1608,7 +1608,9 @@ class Mem0ChatProxy:
                         if not location:
                             return self.mcp_tool_result(text="Redirect without a Location header.",
                                 structured={"error": "fetch_failed"}, is_error=True)
-                        current = location
+                        # Resolve relative redirects (RFC 7231) against the current URL;
+                        # the resolved absolute URL is re-validated by the loop's SSRF check.
+                        current = urljoin(current, location)
                         continue
                     if resp.status_code != 200:
                         return self.mcp_tool_result(
