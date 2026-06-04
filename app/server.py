@@ -629,7 +629,11 @@ class Mem0ChatProxy:
                     request_id,
                     {
                         "protocolVersion": MCP_PROTOCOL_VERSION,
-                        "capabilities": {"tools": {"listChanged": False}},
+                        "capabilities": {
+                            "tools": {"listChanged": False},
+                            "resources": {"listChanged": False},
+                            "prompts": {"listChanged": False},
+                        },
                         "serverInfo": {
                             "name": f"{MCP_SERVER_NAME}-{profile.name}",
                             "title": SERVER_TITLE,
@@ -670,6 +674,51 @@ class Mem0ChatProxy:
                 send,
                 200,
                 self.mcp_success(request_id, {"tools": self.mcp_tools_for(profile, can_write=can_write)}),
+                extra_headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
+            )
+            return
+
+        if request_method == "resources/list":
+            await self.send_json(
+                send,
+                200,
+                self.mcp_success(request_id, {"resources": self.mcp_resources()}),
+                extra_headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
+            )
+            return
+
+        if request_method == "resources/read":
+            uri = str(params.get("uri") or "")
+            contents = self.read_resource(uri)
+            if contents is None:
+                await self.send_json(send, 200, self.mcp_error(request_id, -32602, f"Unknown resource: {uri}"))
+                return
+            await self.send_json(
+                send,
+                200,
+                self.mcp_success(request_id, contents),
+                extra_headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
+            )
+            return
+
+        if request_method == "prompts/list":
+            await self.send_json(
+                send,
+                200,
+                self.mcp_success(request_id, {"prompts": self.mcp_prompts()}),
+                extra_headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
+            )
+            return
+
+        if request_method == "prompts/get":
+            prompt = self.get_prompt(str(params.get("name") or ""), params.get("arguments"))
+            if prompt is None:
+                await self.send_json(send, 200, self.mcp_error(request_id, -32602, f"Unknown prompt: {params.get('name')}"))
+                return
+            await self.send_json(
+                send,
+                200,
+                self.mcp_success(request_id, prompt),
                 extra_headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
             )
             return
@@ -729,7 +778,7 @@ class Mem0ChatProxy:
     def _tool_category(tool_name: str) -> str:
         writes = {"mem0_add_memory", "add_memory", "mem0_delete", "delete",
                   "mem0_update", "update", "add_image", "delete_image"}
-        reads = {"mem0_search", "search", "mem0_fetch", "fetch", "fetch_image"}
+        reads = {"mem0_search", "search", "mem0_fetch", "fetch", "fetch_image", "list_domains"}
         if tool_name in writes:
             return "write"
         if tool_name in reads:
@@ -754,6 +803,80 @@ class Mem0ChatProxy:
             f"to global search; mentioning a known domain narrows the pool. Available domains: {domains}."
         )
 
+    def mcp_resources(self) -> list[dict[str, Any]]:
+        resources = [{
+            "uri": "mem0://taxonomy",
+            "name": "Corpus taxonomy",
+            "description": "Routeable domains and approximate corpus size.",
+            "mimeType": "application/json",
+        }]
+        if self.catalog:
+            for domain in self.catalog.routeable_domains:
+                resources.append({
+                    "uri": f"mem0://domain/{domain}",
+                    "name": f"Domain: {domain}",
+                    "description": f"Rooms and topics that route to the {domain!r} domain.",
+                    "mimeType": "application/json",
+                })
+        return resources
+
+    def read_resource(self, uri: str) -> dict[str, Any] | None:
+        if uri == "mem0://taxonomy":
+            payload = {
+                "domains": self.catalog.routeable_domains if self.catalog else [],
+                "records": len(self.catalog.records_by_id) if self.catalog else 0,
+            }
+            return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
+        prefix = "mem0://domain/"
+        if uri.startswith(prefix) and self.catalog:
+            domain = uri[len(prefix):]
+            if domain not in self.catalog.routeable_domains:
+                return None
+            rooms = sorted(room for room, domains in self.catalog.domains_by_room.items() if domain in domains)
+            topics = sorted(topic for topic, domains in self.catalog.domains_by_topic.items() if domain in domains)
+            payload = {"domain": domain, "rooms": rooms, "topics": topics}
+            return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
+        return None
+
+    @staticmethod
+    def mcp_prompts() -> list[dict[str, Any]]:
+        return [
+            {
+                "name": "recall",
+                "description": "Search long-term memory and summarise what's known about a topic.",
+                "arguments": [{"name": "query", "description": "What to recall.", "required": True}],
+            },
+            {
+                "name": "summarise_results",
+                "description": "Summarise memory snippets you've already fetched.",
+                "arguments": [{"name": "topic", "description": "Topic to frame the summary.", "required": False}],
+            },
+        ]
+
+    def get_prompt(self, name: str, arguments: dict[str, Any] | None) -> dict[str, Any] | None:
+        args = arguments if isinstance(arguments, dict) else {}
+        if name == "recall":
+            query = str(args.get("query") or "").strip()
+            text = (
+                f"Search my long-term memory for everything relevant to: {query}\n"
+                "Then give a concise, organised summary, citing the memory ids you used."
+            )
+            return {
+                "description": "Recall + summarise",
+                "messages": [{"role": "user", "content": {"type": "text", "text": text}}],
+            }
+        if name == "summarise_results":
+            topic = str(args.get("topic") or "the retrieved memories").strip()
+            text = (
+                f"Summarise the following retrieved memories about {topic}. "
+                "Group related points and call out any contradictions."
+            )
+            return {
+                "description": "Summarise retrieved memories",
+                "messages": [{"role": "user", "content": {"type": "text", "text": text}}],
+            }
+        return None
+
     def mcp_tools_for(self, profile: EndpointProfile, *, can_write: bool = False) -> list[dict[str, Any]]:
         read_only = {"readOnlyHint": True, "openWorldHint": False}
         routing_hint = self._routing_hint()
@@ -771,10 +894,21 @@ class Mem0ChatProxy:
                         "properties": {
                             "query": {"type": "string", "description": "Natural-language search query."},
                             "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+                            "cursor": {
+                                "type": "string",
+                                "description": "Opaque pagination cursor from a previous response's nextCursor.",
+                            },
                         },
                         "required": ["query"],
                         "additionalProperties": False,
                     },
+                },
+                {
+                    "name": "list_domains",
+                    "title": "List Domains",
+                    "description": "List the routeable retrieval domains available for filtering search.",
+                    "annotations": {"readOnlyHint": True, "openWorldHint": False},
+                    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
                 },
                 {
                     "name": "fetch",
@@ -919,6 +1053,10 @@ class Mem0ChatProxy:
                     "properties": {
                         "query": {"type": "string", "description": "Natural-language search query."},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+                        "cursor": {
+                            "type": "string",
+                            "description": "Opaque pagination cursor from a previous response's nextCursor.",
+                        },
                         "threshold": {"type": "number", "description": "Optional minimum similarity threshold."},
                         "user_id": {"type": "string", "description": "Optional Mem0 user_id override."},
                     },
@@ -937,6 +1075,13 @@ class Mem0ChatProxy:
                     "required": ["id"],
                     "additionalProperties": False,
                 },
+            },
+            {
+                "name": "list_domains",
+                "title": "List Domains",
+                "description": "List the routeable retrieval domains available for filtering search.",
+                "annotations": {"readOnlyHint": True, "openWorldHint": False},
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             },
             {
                 "name": "fetch_image",
@@ -1070,6 +1215,12 @@ class Mem0ChatProxy:
                         body_char_cap=OPENAI_SNIPPET_CHAR_CAP,
                         lean_results=True,
                     )
+                if tool_name == "list_domains":
+                    domains = self.catalog.routeable_domains if self.catalog else []
+                    return self.mcp_tool_result(
+                        text=f"{len(domains)} routeable domain(s): {', '.join(domains) or '(none)'}",
+                        structured={"domains": domains},
+                    )
                 if tool_name == "fetch":
                     return await self.handle_fetch_tool(arguments)
                 if tool_name == "fetch_image":
@@ -1136,6 +1287,12 @@ class Mem0ChatProxy:
                 return self.mcp_tool_result(
                     text=f"Mem0 is available. Approximate memory count: {status['approx_memory_count']}.",
                     structured=status,
+                )
+            if tool_name == "list_domains":
+                domains = self.catalog.routeable_domains if self.catalog else []
+                return self.mcp_tool_result(
+                    text=f"{len(domains)} routeable domain(s): {', '.join(domains) or '(none)'}",
+                    structured={"domains": domains},
                 )
             if tool_name == "mem0_search":
                 return await self.handle_search_tool(arguments)
@@ -1218,6 +1375,10 @@ class Mem0ChatProxy:
         limit = self._coerce_int(
             arguments.get("limit"), default=self.settings.memory_limit, minimum=1, maximum=20
         )
+        try:
+            offset = max(0, int(arguments.get("cursor") or 0))
+        except (TypeError, ValueError):
+            offset = 0
         threshold = (
             coerce_threshold(arguments.get("threshold", self.settings.memory_threshold))
             if allow_threshold
@@ -1227,10 +1388,11 @@ class Mem0ChatProxy:
         routes = self.catalog.build_routes(query) if self.catalog else [_GlobalRoute()]
         results: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
+        result_cap = offset + limit + 1
 
         for route in routes:
             hits = await self.search_memories(
-                query, user_id=user_id, limit=limit, threshold=threshold, filters=route.filters
+                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters
             )
             for hit in hits:
                 enriched = self._enrich_hit(hit, route=route.description)
@@ -1240,11 +1402,13 @@ class Mem0ChatProxy:
                     continue
                 seen_ids.add(key)
                 results.append(enriched)
-                if len(results) >= limit:
+                if len(results) >= result_cap:
                     break
-            if len(results) >= limit:
+            if len(results) >= result_cap:
                 break
 
+        next_cursor = str(offset + limit) if len(results) > offset + limit else None
+        results = results[offset:offset + limit]
         lines = [f"Search for {query!r} returned {len(results)} result(s)."]
         structured_results: list[dict[str, Any]] = []
         for index, item in enumerate(results, start=1):
@@ -1293,7 +1457,7 @@ class Mem0ChatProxy:
         if lean_results:
             # Minimal deep-research shape: no routing taxonomy or user id leaked
             # to the OpenAI-facing endpoint.
-            structured = {"query": query, "results": structured_results}
+            structured = {"query": query, "results": structured_results, "nextCursor": next_cursor}
         else:
             structured = {
                 "query": query,
@@ -1301,6 +1465,7 @@ class Mem0ChatProxy:
                 "routes": [route.description for route in routes],
                 "available_domains": self.catalog.routeable_domains if self.catalog else [],
                 "results": structured_results,
+                "nextCursor": next_cursor,
             }
         return self.mcp_tool_result(text="\n".join(lines), structured=structured)
 

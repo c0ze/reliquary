@@ -207,7 +207,7 @@ def test_tool_category_writes():
 
 def test_tool_category_reads():
     from server import Mem0ChatProxy
-    for tool in ("mem0_search", "search", "mem0_fetch", "fetch", "fetch_image"):
+    for tool in ("mem0_search", "search", "mem0_fetch", "fetch", "fetch_image", "list_domains"):
         assert Mem0ChatProxy._tool_category(tool) == "read", f"expected read for {tool}"
 
 
