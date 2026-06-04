@@ -23,6 +23,7 @@ from ingest import load_config
 from oauth import OAuthProvider, RegistrationDisabledError
 from catalog import CorpusCatalog
 from runtime import AsyncRWLock, MCPSessionStore, reads_can_be_concurrent
+from blobs import BlobStore
 from helpers import (
     OPENAI_SNIPPET_CHAR_CAP,
     SEARCH_PREVIEW_CHAR_CAP,
@@ -147,6 +148,10 @@ class ProxySettings:
     oauth_allow_registration: bool
     memory_concurrent_reads: bool | None
     oauth_verbatim_token: bool
+    blob_dir: str
+    blob_signing_key: str | None
+    blob_max_bytes: int
+    blob_url_ttl: int
 
 
 class Mem0ChatProxy:
@@ -208,6 +213,17 @@ class Mem0ChatProxy:
             allow_registration=settings.oauth_allow_registration,
             issue_verbatim_token=settings.oauth_verbatim_token,
         )
+
+        self.blobs = BlobStore(
+            blob_dir=settings.blob_dir,
+            signing_key=(settings.blob_signing_key or secrets.token_hex(32)).encode("utf-8"),
+            max_bytes=settings.blob_max_bytes,
+        )
+        if not settings.blob_signing_key:
+            LOG.warning(
+                "MEM0_BLOB_SIGNING_KEY is unset; using a random per-process key. "
+                "Signed blob URLs will invalidate on restart."
+            )
 
     def _detect_search_api(self) -> tuple[bool, bool, str]:
         """Inspect ``memory.search`` once to adapt to the installed mem0 version.
@@ -1818,6 +1834,10 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         oauth_allow_registration=args.oauth_allow_registration,
         memory_concurrent_reads=args.memory_concurrent_reads,
         oauth_verbatim_token=args.oauth_verbatim_token,
+        blob_dir=args.blob_dir,
+        blob_signing_key=normalize_token(args.blob_signing_key),
+        blob_max_bytes=args.blob_max_bytes,
+        blob_url_ttl=args.blob_url_ttl,
     )
 
 
@@ -1891,6 +1911,28 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=["http://127.0.0.1", "http://localhost", "http://127.0.0.1:3000", "http://localhost:3000"],
         help="Allowed Origin header for the MCP endpoints. Repeat to allow multiple origins.",
+    )
+    parser.add_argument(
+        "--blob-dir",
+        default=os.getenv("MEM0_BLOB_DIR", "/data/blobs"),
+        help="Directory for stored binary blobs (images, etc.). Bind-mount this for host access.",
+    )
+    parser.add_argument(
+        "--blob-signing-key",
+        default=os.getenv("MEM0_BLOB_SIGNING_KEY"),
+        help="HMAC key for signed blob URLs. Unset = random per-process key (URLs break on restart).",
+    )
+    parser.add_argument(
+        "--blob-max-bytes",
+        type=int,
+        default=int(os.getenv("MEM0_BLOB_MAX_BYTES", str(30 * 1024 * 1024))),
+        help="Max blob size in bytes (0 disables the cap). Default 30 MB.",
+    )
+    parser.add_argument(
+        "--blob-url-ttl",
+        type=int,
+        default=int(os.getenv("MEM0_BLOB_URL_TTL", "3600")),
+        help="Lifetime in seconds of signed blob URLs. Default 3600.",
     )
     parser.add_argument("--log-level", default="info", help="Logging level, for example info or debug.")
     return parser.parse_args()
