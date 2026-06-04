@@ -5,7 +5,7 @@ import hashlib
 import html
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
@@ -59,6 +59,7 @@ class OAuthProvider:
         allow_registration: bool = True,
         issue_verbatim_token: bool = False,
         access_token_ttl: float = ACCESS_TOKEN_TTL,
+        token_store=None,
     ):
         self.master_token = master_token
         self.mcp_resource_path = mcp_resource_path
@@ -67,7 +68,10 @@ class OAuthProvider:
         self.issue_verbatim_token = issue_verbatim_token
         self.access_token_ttl = access_token_ttl
         self._codes: dict[str, AuthorizationCode] = {}
+        self._token_store = token_store
         self._access_tokens: dict[str, AccessToken] = {}
+        if self._token_store is not None:
+            self._load_access_tokens()
 
     def base_url(self, headers: dict[str, str]) -> str:
         host = headers.get("host") or "localhost"
@@ -258,6 +262,7 @@ class OAuthProvider:
             expires_at=time.time() + self.access_token_ttl,
             resource=(resource or "").strip() or None,
         )
+        self._persist_access_tokens()
         return token
 
     def verify_access_token(self, candidate: str | None, *, resource: str | None = None) -> bool:
@@ -274,6 +279,7 @@ class OAuthProvider:
             return False
         if entry.expires_at < time.time():  # guards the prune/check race window
             self._access_tokens.pop(key, None)
+            self._persist_access_tokens()
             return False
         # A token bound to a resource is only valid for that resource; the caller
         # must present a matching one (tokens issued without a resource indicator
@@ -284,7 +290,10 @@ class OAuthProvider:
         return True
 
     def revoke_access_token(self, token: str | None) -> bool:
-        return self._access_tokens.pop((token or "").strip(), None) is not None
+        removed = self._access_tokens.pop((token or "").strip(), None) is not None
+        if removed:
+            self._persist_access_tokens()
+        return removed
 
     def _prune(self) -> None:
         now = time.time()
@@ -297,6 +306,29 @@ class OAuthProvider:
         expired = [token for token, entry in self._access_tokens.items() if entry.expires_at < now]
         for token in expired:
             self._access_tokens.pop(token, None)
+        # verify_access_token() prunes on every check; only touch disk when
+        # something actually expired, so the common path stays write-free.
+        if expired:
+            self._persist_access_tokens()
+
+    def _load_access_tokens(self) -> None:
+        now = time.time()
+        for token, entry in (self._token_store.load() if self._token_store else {}).items():
+            try:
+                at = AccessToken(
+                    client_id=entry["client_id"],
+                    scope=entry["scope"],
+                    expires_at=float(entry["expires_at"]),
+                    resource=entry.get("resource"),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if at.expires_at >= now:
+                self._access_tokens[token] = at
+
+    def _persist_access_tokens(self) -> None:
+        if self._token_store is not None:
+            self._token_store.save({token: asdict(at) for token, at in self._access_tokens.items()})
 
     @staticmethod
     def _verify_pkce(verifier: str, challenge: str, method: str) -> bool:
