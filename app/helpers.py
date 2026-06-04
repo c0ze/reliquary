@@ -27,6 +27,7 @@ OPENAI_SNIPPET_CHAR_CAP = 500
 # (additionalProperties:false is advisory; MCP servers must enforce it).
 OPENAI_ADD_MEMORY_FIELDS = ("text", "title", "topic", "source", "infer")
 OPENAI_ADD_IMAGE_FIELDS = ("caption", "image_base64", "mimetype", "title")
+OPENAI_UPDATE_FIELDS = ("id", "text")
 
 
 def lean_add_memory_args(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -37,6 +38,11 @@ def lean_add_memory_args(arguments: dict[str, Any]) -> dict[str, Any]:
 def lean_add_image_args(arguments: dict[str, Any]) -> dict[str, Any]:
     """Restrict OpenAI add_image arguments to the published lean schema."""
     return {key: value for key, value in arguments.items() if key in OPENAI_ADD_IMAGE_FIELDS}
+
+
+def lean_update_args(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Restrict OpenAI update arguments to the published lean schema."""
+    return {key: value for key, value in arguments.items() if key in OPENAI_UPDATE_FIELDS}
 
 
 def json_dumps(data: Any) -> bytes:

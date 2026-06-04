@@ -38,6 +38,7 @@ from helpers import (
     latest_user_text,
     lean_add_image_args,
     lean_add_memory_args,
+    lean_update_args,
     normalize_base_url,
     normalize_token,
     parse_form,
@@ -761,6 +762,24 @@ class Mem0ChatProxy:
                 )
                 tools.append(
                     {
+                        "name": "update",
+                        "title": "Update Memory",
+                        "description": "Update the text of a memory you previously stored via add_memory, by id. "
+                        "Only memories written through this server can be updated.",
+                        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "Memory id from search or add_memory."},
+                                "text": {"type": "string", "description": "The new memory text."},
+                            },
+                            "required": ["id", "text"],
+                            "additionalProperties": False,
+                        },
+                    }
+                )
+                tools.append(
+                    {
                         "name": "add_image",
                         "title": "Add Image",
                         "description": "Store a binary file (usually an image) plus a searchable caption.",
@@ -873,6 +892,25 @@ class Mem0ChatProxy:
                 },
             },
             {
+                "name": "mem0_update",
+                "title": "Mem0 Update Memory",
+                "description": "Update the text (and optionally merge metadata) of a memory you previously "
+                "stored via mem0_add_memory, by id. Only user-written memories can be updated; imported "
+                "corpus records are protected.",
+                "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Memory id from mem0_search or mem0_add_memory."},
+                        "text": {"type": "string", "description": "The new memory text."},
+                        "metadata": {"type": "object", "description": "Optional metadata fields to merge into the record."},
+                        "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
+                    },
+                    "required": ["id", "text"],
+                    "additionalProperties": False,
+                },
+            },
+            {
                 "name": "add_image",
                 "title": "Add Image",
                 "description": "Store a binary file (usually an image) and a searchable caption. "
@@ -962,6 +1000,14 @@ class Mem0ChatProxy:
                             is_error=True,
                         )
                     return await self.handle_delete_tool(arguments, allow_user_id=False)
+                if tool_name == "update":
+                    if not profile.allow_write:
+                        return self.mcp_tool_result(
+                            text="update is not available on this endpoint.",
+                            structured={"error": "read_only_endpoint"},
+                            is_error=True,
+                        )
+                    return await self.handle_update_tool(lean_update_args(arguments), allow_user_id=False)
                 if tool_name == "add_image":
                     if not profile.allow_write:
                         return self.mcp_tool_result(
@@ -1021,6 +1067,14 @@ class Mem0ChatProxy:
                         is_error=True,
                     )
                 return await self.handle_delete_tool(arguments, allow_user_id=True)
+            if tool_name == "mem0_update":
+                if not profile.allow_write:
+                    return self.mcp_tool_result(
+                        text=f"Tool {tool_name} is not available on the {profile.name} endpoint.",
+                        structured={"error": "read_only_endpoint"},
+                        is_error=True,
+                    )
+                return await self.handle_update_tool(arguments, allow_user_id=True)
             if tool_name == "add_image":
                 if not profile.allow_write:
                     return self.mcp_tool_result(
@@ -1457,6 +1511,74 @@ class Mem0ChatProxy:
             structured={"deleted": True, "id": record_id, "title": existing.get("title")},
         )
 
+    async def handle_update_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
+        record_id = str(arguments.get("id") or "").strip()
+        if not record_id:
+            return self.mcp_tool_result(
+                text="A non-empty `id` is required.",
+                structured={"error": "missing_id"},
+                is_error=True,
+            )
+        new_text = str(arguments.get("text") or "").strip()
+        if not new_text:
+            return self.mcp_tool_result(
+                text="A non-empty `text` is required.",
+                structured={"error": "missing_text"},
+                is_error=True,
+            )
+        provided_metadata = arguments.get("metadata")
+        if provided_metadata is not None and not isinstance(provided_metadata, dict):
+            return self.mcp_tool_result(
+                text="`metadata` must be an object.",
+                structured={"error": "invalid_metadata"},
+                is_error=True,
+            )
+        effective_user_id = (
+            str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
+        )
+        existing = await self.fetch_live_memory(record_id)
+        if existing is None:
+            return self.mcp_tool_result(
+                text=f"No updatable memory found for id={record_id}. "
+                "Only memories created via add_memory can be updated; imported corpus records cannot.",
+                structured={"error": "not_found", "id": record_id},
+                is_error=True,
+            )
+        if existing.get("user_id") != effective_user_id:
+            return self.mcp_tool_result(
+                text=f"No updatable memory found for id={record_id} under user_id={effective_user_id}.",
+                structured={"error": "not_found", "id": record_id},
+                is_error=True,
+            )
+        if (existing.get("metadata") or {}).get("source_group") != "user-write":
+            return self.mcp_tool_result(
+                text=f"Refusing to update id={record_id}: it is not a user-written memory "
+                "(imported corpus records are protected).",
+                structured={"error": "protected_record", "id": record_id},
+                is_error=True,
+            )
+        # Preserve existing metadata and merge any caller-provided fields, but
+        # never let a caller change system-managed keys. Letting them rewrite
+        # kind/blob_ref would, e.g., detach an image caption from its blob so
+        # delete_image no longer recognizes ownership (orphaned blobs). These are
+        # re-stamped from the original record (or dropped if the record never had
+        # them, so a plain note can't be forged into an image via update).
+        existing_metadata = existing.get("metadata") or {}
+        metadata = dict(existing_metadata)
+        if isinstance(provided_metadata, dict):
+            metadata.update(provided_metadata)
+        for key in ("source_group", "kind", "blob_ref", "blob_mime", "blob_size"):
+            if key in existing_metadata:
+                metadata[key] = existing_metadata[key]
+            else:
+                metadata.pop(key, None)
+        metadata["source_group"] = "user-write"
+        await self.update_memory(record_id, new_text, metadata=metadata)
+        return self.mcp_tool_result(
+            text=f"Updated memory id={record_id}: {trim_text(new_text, 160)}",
+            structured={"updated": True, "id": record_id, "metadata": metadata},
+        )
+
     def _enrich_hit(self, hit: dict[str, Any], *, route: str) -> dict[str, Any]:
         metadata = dict(hit.get("metadata") or {})
         record_id = str(metadata.get("import_record_id") or hit.get("id") or metadata.get("source_ref") or "")
@@ -1690,6 +1812,11 @@ class Mem0ChatProxy:
     async def delete_memory(self, record_id: str) -> None:
         async with self.memory_lock.write():
             await asyncio.to_thread(self.memory.delete, record_id)
+        self._count_cache = None
+
+    async def update_memory(self, record_id: str, data: str, *, metadata: dict[str, Any] | None = None) -> None:
+        async with self.memory_lock.write():
+            await asyncio.to_thread(self.memory.update, record_id, data, metadata)
         self._count_cache = None
 
     def is_allowed_mcp_origin(self, headers: dict[str, str]) -> bool:
