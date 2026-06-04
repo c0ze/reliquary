@@ -52,6 +52,7 @@ from helpers import (
     safe_mcp_headers,
     trim_text,
 )
+from retrieval_quality import apply_retrieval_quality, retrieval_candidate_limit
 
 
 LOG = logging.getLogger("reliquary")
@@ -2048,7 +2049,8 @@ class Mem0ChatProxy:
         threshold: float | None,
         filters: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
-        kwargs: dict[str, Any] = {self._search_limit_param: limit}
+        candidate_limit = retrieval_candidate_limit(limit)
+        kwargs: dict[str, Any] = {self._search_limit_param: candidate_limit}
         if threshold is not None:
             kwargs["threshold"] = threshold
         combined_filters = dict(filters) if filters else {}
@@ -2072,7 +2074,9 @@ class Mem0ChatProxy:
         if not isinstance(result, dict):
             return []
         hits = result.get("results")
-        return hits if isinstance(hits, list) else []
+        if not isinstance(hits, list):
+            return []
+        return apply_retrieval_quality(query, hits, limit=limit)
 
     async def add_memory(
         self,
