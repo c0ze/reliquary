@@ -1557,11 +1557,21 @@ class Mem0ChatProxy:
                 structured={"error": "protected_record", "id": record_id},
                 is_error=True,
             )
-        # Preserve existing metadata, merge any caller-provided fields, and keep
-        # the user-write marker so the record stays owned/editable/deletable.
-        metadata = dict(existing.get("metadata") or {})
+        # Preserve existing metadata and merge any caller-provided fields, but
+        # never let a caller change system-managed keys. Letting them rewrite
+        # kind/blob_ref would, e.g., detach an image caption from its blob so
+        # delete_image no longer recognizes ownership (orphaned blobs). These are
+        # re-stamped from the original record (or dropped if the record never had
+        # them, so a plain note can't be forged into an image via update).
+        existing_metadata = existing.get("metadata") or {}
+        metadata = dict(existing_metadata)
         if isinstance(provided_metadata, dict):
             metadata.update(provided_metadata)
+        for key in ("source_group", "kind", "blob_ref", "blob_mime", "blob_size"):
+            if key in existing_metadata:
+                metadata[key] = existing_metadata[key]
+            else:
+                metadata.pop(key, None)
         metadata["source_group"] = "user-write"
         await self.update_memory(record_id, new_text, metadata=metadata)
         return self.mcp_tool_result(
