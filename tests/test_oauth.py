@@ -14,7 +14,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
+import json
+import tempfile
+import os
+
 from oauth import OAuthProvider  # noqa: E402
+from persistence import JsonFileStore  # noqa: E402
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -168,6 +173,57 @@ def test_metadata_advertises_revocation_endpoint():
     provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
     meta = provider.authorization_server_metadata({"host": "mem0.example", "x-forwarded-proto": "https"})
     assert meta["revocation_endpoint"] == "https://mem0.example/oauth/revoke"
+
+
+def test_token_survives_restart(tmp_path):
+    """A token issued by one OAuthProvider instance is valid after a fresh instance loads the same store."""
+    store_path = str(tmp_path / "tokens.json")
+    store = JsonFileStore(store_path)
+
+    provider1 = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", token_store=store)
+    response, error = _exchange(provider1)
+    assert error is None
+    token = response["access_token"]
+    assert provider1.verify_access_token(token) is True
+
+    # Simulate a restart: brand-new instance backed by the same file
+    provider2 = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", token_store=store)
+    assert provider2.verify_access_token(token) is True
+
+
+def test_revoke_removes_from_persisted_store(tmp_path):
+    store_path = str(tmp_path / "tokens.json")
+    store = JsonFileStore(store_path)
+
+    provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", token_store=store)
+    response, _ = _exchange(provider)
+    token = response["access_token"]
+    assert provider.verify_access_token(token) is True
+
+    provider.revoke_access_token(token)
+
+    # Reload from file: token must be absent
+    provider2 = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", token_store=store)
+    assert provider2.verify_access_token(token) is False
+
+
+def test_expired_token_dropped_on_load(tmp_path):
+    store_path = str(tmp_path / "tokens.json")
+    # Write an already-expired token directly into the JSON file
+    expired_data = {
+        "stale-token-xyz": {
+            "client_id": "c1",
+            "scope": "mcp",
+            "expires_at": 1.0,  # epoch second in the past
+            "resource": None,
+        }
+    }
+    with open(store_path, "w") as fh:
+        json.dump(expired_data, fh)
+
+    store = JsonFileStore(store_path)
+    provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", token_store=store)
+    assert provider.verify_access_token("stale-token-xyz") is False
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from runtime import AsyncRWLock, MCPSessionStore, reads_can_be_concurrent  # noqa: E402
+from persistence import JsonFileStore  # noqa: E402
 
 
 def run(coro):
@@ -184,6 +185,22 @@ def test_remove():
     store.add("s1", "claude")
     store.remove("s1")
     assert store.touch("s1") is None
+
+
+def test_sessions_survive_restart(tmp_path):
+    """Sessions added to a store-backed MCPSessionStore are present in a fresh instance."""
+    store_path = str(tmp_path / "sessions.json")
+    file_store = JsonFileStore(store_path)
+
+    now = [0.0]
+    s1 = MCPSessionStore(max_size=4, ttl=1000, clock=lambda: now[0], session_store=file_store)
+    s1.add("sess-abc", "claude")
+    s1.add("sess-def", "openai")
+
+    # Simulate restart: new instance backed by same file, fresh clock
+    s2 = MCPSessionStore(max_size=4, ttl=1000, clock=lambda: now[0], session_store=file_store)
+    assert s2.touch("sess-abc") == "claude"
+    assert s2.touch("sess-def") == "openai"
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ import httpx
 from ingest import load_config
 from oauth import OAuthProvider, RegistrationDisabledError
 from catalog import CorpusCatalog
+from persistence import JsonFileStore
 from runtime import AsyncRWLock, MCPSessionStore, reads_can_be_concurrent
 from blobs import BlobStore, BlobTooLarge
 from helpers import (
@@ -156,6 +157,7 @@ class ProxySettings:
     blob_signing_key: str | None = None
     blob_max_bytes: int = 31457280
     blob_url_ttl: int = 3600
+    state_dir: str | None = None
 
 
 class Mem0ChatProxy:
@@ -188,7 +190,12 @@ class Mem0ChatProxy:
             self._search_limit_param,
         ) = self._detect_search_api()
         self._count_cache: tuple[float, int | None] | None = None
-        self.mcp_sessions = MCPSessionStore(max_size=MCP_MAX_SESSIONS, ttl=MCP_SESSION_TTL)
+        token_store = None
+        session_store = None
+        if settings.state_dir:
+            token_store = JsonFileStore(os.path.join(settings.state_dir, "oauth_tokens.json"))
+            session_store = JsonFileStore(os.path.join(settings.state_dir, "mcp_sessions.json"))
+        self.mcp_sessions = MCPSessionStore(max_size=MCP_MAX_SESSIONS, ttl=MCP_SESSION_TTL, session_store=session_store)
 
         self.endpoint_profiles = {
             settings.claude_mcp_path: EndpointProfile(
@@ -220,6 +227,7 @@ class Mem0ChatProxy:
             fixed_client_id=settings.oauth_client_id,
             allow_registration=settings.oauth_allow_registration,
             issue_verbatim_token=settings.oauth_verbatim_token,
+            token_store=token_store,
         )
 
         self.blobs = BlobStore(
@@ -2352,6 +2360,7 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         blob_signing_key=normalize_token(args.blob_signing_key),
         blob_max_bytes=args.blob_max_bytes,
         blob_url_ttl=args.blob_url_ttl,
+        state_dir=args.state_dir,
     )
 
 
@@ -2447,6 +2456,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("MEM0_BLOB_URL_TTL", "3600")),
         help="Lifetime in seconds of signed blob URLs. Default 3600.",
+    )
+    parser.add_argument(
+        "--state-dir",
+        default=os.getenv("MEM0_STATE_DIR"),
+        help="Directory to persist OAuth tokens + MCP sessions across restarts. "
+        "Unset = in-memory only (tokens/sessions reset on restart).",
     )
     parser.add_argument("--log-level", default="info", help="Logging level, for example info or debug.")
     return parser.parse_args()

@@ -96,7 +96,7 @@ class MCPSessionStore:
     Single-event-loop access only; no internal locking needed.
     """
 
-    def __init__(self, *, max_size: int, ttl: float, clock=time.monotonic) -> None:
+    def __init__(self, *, max_size: int, ttl: float, clock=time.monotonic, session_store=None) -> None:
         if max_size < 1:
             raise ValueError("max_size must be >= 1")
         self.max_size = max_size
@@ -104,6 +104,11 @@ class MCPSessionStore:
         self._clock = clock
         # session_id -> [profile_name, last_seen]; insertion/access order == LRU order
         self._sessions: "dict[str, list]" = {}
+        self._session_store = session_store
+        if self._session_store is not None:
+            for sid, profile_name in self._session_store.load().items():
+                if isinstance(sid, str) and isinstance(profile_name, str):
+                    self._sessions[sid] = [profile_name, self._clock()]
 
     def add(self, session_id: str, profile_name: str) -> None:
         self._evict_expired()
@@ -113,6 +118,7 @@ class MCPSessionStore:
             # drop least-recently-used (first inserted/touched)
             oldest = next(iter(self._sessions))
             self._sessions.pop(oldest, None)
+        self._persist()
 
     def touch(self, session_id: str) -> str | None:
         """Return the session's profile if live, refreshing recency; else None."""
@@ -130,6 +136,7 @@ class MCPSessionStore:
 
     def remove(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
+        self._persist()
 
     def __len__(self) -> int:
         self._evict_expired()
@@ -145,3 +152,9 @@ class MCPSessionStore:
         expired = [sid for sid, entry in self._sessions.items() if self._is_expired(entry)]
         for sid in expired:
             self._sessions.pop(sid, None)
+        if expired:
+            self._persist()
+
+    def _persist(self) -> None:
+        if self._session_store is not None:
+            self._session_store.save({sid: entry[0] for sid, entry in self._sessions.items()})
