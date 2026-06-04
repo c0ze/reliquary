@@ -18,7 +18,7 @@ from urllib.parse import parse_qs
 import httpx
 
 from ingest import load_config
-from oauth import OAuthProvider, RegistrationDisabledError
+from oauth import OAuthProvider, RegistrationDisabledError, scope_is_write
 from catalog import CorpusCatalog
 from persistence import JsonFileStore
 from runtime import AsyncRWLock, MCPSessionStore, reads_can_be_concurrent
@@ -158,6 +158,7 @@ class ProxySettings:
     blob_max_bytes: int = 31457280
     blob_url_ttl: int = 3600
     state_dir: str | None = None
+    static_tokens: tuple[tuple[str, str, str], ...] = ()
 
 
 class Mem0ChatProxy:
@@ -229,6 +230,10 @@ class Mem0ChatProxy:
             issue_verbatim_token=settings.oauth_verbatim_token,
             token_store=token_store,
         )
+        # Static token lookup: maps token value -> scope ('read' or 'write').
+        self._static_tokens: dict[str, str] = {
+            token: scope for (_label, scope, token) in settings.static_tokens
+        }
 
         self.blobs = BlobStore(
             blob_dir=settings.blob_dir,
@@ -515,7 +520,8 @@ class Mem0ChatProxy:
             await self.send_json(send, 403, {"error": "MCP request origin is not allowed"})
             return
 
-        if not self.is_allowed_token(profile, headers):
+        granted_scope = self.resolve_scope(profile, headers)
+        if granted_scope is None:
             if profile.name == "openai":
                 LOG.debug(
                     "OpenAI MCP auth rejected method=%s path=%s headers=%s",
@@ -533,6 +539,7 @@ class Mem0ChatProxy:
                 extra_headers={"www-authenticate": www_auth},
             )
             return
+        can_write = granted_scope == "write" and profile.allow_write
 
         if method == "GET":
             await self.send_empty(send, 405, extra_headers={"allow": "POST, DELETE"})
@@ -635,7 +642,7 @@ class Mem0ChatProxy:
             await self.send_json(
                 send,
                 200,
-                self.mcp_success(request_id, {"tools": self.mcp_tools_for(profile)}),
+                self.mcp_success(request_id, {"tools": self.mcp_tools_for(profile, can_write=can_write)}),
                 extra_headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
             )
             return
@@ -651,7 +658,7 @@ class Mem0ChatProxy:
             if not isinstance(tool_arguments, dict):
                 await self.send_json(send, 400, self.mcp_error(request_id, -32602, "tools/call `arguments` must be an object"))
                 return
-            result = await self.call_mcp_tool(profile, tool_name, tool_arguments)
+            result = await self.call_mcp_tool(profile, tool_name, tool_arguments, can_write=can_write)
             await self.send_json(
                 send,
                 200,
@@ -676,7 +683,7 @@ class Mem0ChatProxy:
             f"to global search; mentioning a known domain narrows the pool. Available domains: {domains}."
         )
 
-    def mcp_tools_for(self, profile: EndpointProfile) -> list[dict[str, Any]]:
+    def mcp_tools_for(self, profile: EndpointProfile, *, can_write: bool = False) -> list[dict[str, Any]]:
         read_only = {"readOnlyHint": True, "openWorldHint": False}
         routing_hint = self._routing_hint()
         if profile.name == "openai":
@@ -723,7 +730,7 @@ class Mem0ChatProxy:
                     },
                 },
             ]
-            if profile.allow_write:
+            if can_write:
                 tools.append(
                     {
                         "name": "add_memory",
@@ -823,7 +830,7 @@ class Mem0ChatProxy:
                 )
             return tools
 
-        return [
+        claude_tools = [
             {
                 "name": "mem0_status",
                 "title": "Mem0 Status",
@@ -861,91 +868,6 @@ class Mem0ChatProxy:
                 },
             },
             {
-                "name": "mem0_add_memory",
-                "title": "Mem0 Add Memory",
-                "description": "Store a new memory in the local Mem0 collection.",
-                "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string", "description": "The text to store."},
-                        "user_id": {"type": "string", "description": "Optional Mem0 user_id override."},
-                        "title": {"type": "string"},
-                        "source": {"type": "string"},
-                        "source_ref": {"type": "string"},
-                        "kind": {"type": "string"},
-                        "domain": {"type": "string"},
-                        "hall": {"type": "string"},
-                        "room": {"type": "string"},
-                        "topic": {"type": "string"},
-                        "infer": {"type": "boolean", "default": False},
-                        "metadata": {"type": "object"},
-                    },
-                    "required": ["text"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "name": "mem0_delete",
-                "title": "Mem0 Delete Memory",
-                "description": "Delete a memory previously stored via mem0_add_memory, by id. "
-                "Only user-written memories can be deleted; imported corpus records are protected.",
-                "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "Memory id from mem0_search or mem0_add_memory."},
-                        "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
-                    },
-                    "required": ["id"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "name": "mem0_update",
-                "title": "Mem0 Update Memory",
-                "description": "Update the text (and optionally merge metadata) of a memory you previously "
-                "stored via mem0_add_memory, by id. Only user-written memories can be updated; imported "
-                "corpus records are protected.",
-                "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "Memory id from mem0_search or mem0_add_memory."},
-                        "text": {"type": "string", "description": "The new memory text."},
-                        "metadata": {"type": "object", "description": "Optional metadata fields to merge into the record."},
-                        "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
-                    },
-                    "required": ["id", "text"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "name": "add_image",
-                "title": "Add Image",
-                "description": "Store a binary file (usually an image) and a searchable caption. "
-                "Returns blob_id, memory_id and a signed url. Find it later via mem0_search on the "
-                "caption, or fetch_image with the blob_id.",
-                "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "caption": {"type": "string", "description": "Searchable text describing the image."},
-                        "image_base64": {"type": "string", "description": "Base64-encoded file bytes."},
-                        "mimetype": {"type": "string", "description": "Optional fallback mimetype if bytes can't be sniffed."},
-                        "user_id": {"type": "string"},
-                        "title": {"type": "string"},
-                        "domain": {"type": "string"},
-                        "hall": {"type": "string"},
-                        "room": {"type": "string"},
-                        "topic": {"type": "string"},
-                        "metadata": {"type": "object"},
-                    },
-                    "required": ["caption", "image_base64"],
-                    "additionalProperties": False,
-                },
-            },
-            {
                 "name": "fetch_image",
                 "title": "Fetch Image",
                 "description": "Fetch a stored binary file by blob_id. Returns the image inline plus a "
@@ -958,25 +880,114 @@ class Mem0ChatProxy:
                     "additionalProperties": False,
                 },
             },
-            {
-                "name": "delete_image",
-                "title": "Delete Image",
-                "description": "Delete an image you stored via add_image, by its memory_id. Removes the "
-                "caption memory and unlinks the blob when no other memory references it.",
-                "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "memory_id": {"type": "string", "description": "memory_id returned by add_image."},
-                        "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
-                    },
-                    "required": ["memory_id"],
-                    "additionalProperties": False,
-                },
-            },
         ]
+        if can_write:
+            claude_tools.extend([
+                {
+                    "name": "mem0_add_memory",
+                    "title": "Mem0 Add Memory",
+                    "description": "Store a new memory in the local Mem0 collection.",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": "The text to store."},
+                            "user_id": {"type": "string", "description": "Optional Mem0 user_id override."},
+                            "title": {"type": "string"},
+                            "source": {"type": "string"},
+                            "source_ref": {"type": "string"},
+                            "kind": {"type": "string"},
+                            "domain": {"type": "string"},
+                            "hall": {"type": "string"},
+                            "room": {"type": "string"},
+                            "topic": {"type": "string"},
+                            "infer": {"type": "boolean", "default": False},
+                            "metadata": {"type": "object"},
+                        },
+                        "required": ["text"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "mem0_delete",
+                    "title": "Mem0 Delete Memory",
+                    "description": "Delete a memory previously stored via mem0_add_memory, by id. "
+                    "Only user-written memories can be deleted; imported corpus records are protected.",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "Memory id from mem0_search or mem0_add_memory."},
+                            "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
+                        },
+                        "required": ["id"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "mem0_update",
+                    "title": "Mem0 Update Memory",
+                    "description": "Update the text (and optionally merge metadata) of a memory you previously "
+                    "stored via mem0_add_memory, by id. Only user-written memories can be updated; imported "
+                    "corpus records are protected.",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "Memory id from mem0_search or mem0_add_memory."},
+                            "text": {"type": "string", "description": "The new memory text."},
+                            "metadata": {"type": "object", "description": "Optional metadata fields to merge into the record."},
+                            "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
+                        },
+                        "required": ["id", "text"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "add_image",
+                    "title": "Add Image",
+                    "description": "Store a binary file (usually an image) and a searchable caption. "
+                    "Returns blob_id, memory_id and a signed url. Find it later via mem0_search on the "
+                    "caption, or fetch_image with the blob_id.",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "caption": {"type": "string", "description": "Searchable text describing the image."},
+                            "image_base64": {"type": "string", "description": "Base64-encoded file bytes."},
+                            "mimetype": {"type": "string", "description": "Optional fallback mimetype if bytes can't be sniffed."},
+                            "user_id": {"type": "string"},
+                            "title": {"type": "string"},
+                            "domain": {"type": "string"},
+                            "hall": {"type": "string"},
+                            "room": {"type": "string"},
+                            "topic": {"type": "string"},
+                            "metadata": {"type": "object"},
+                        },
+                        "required": ["caption", "image_base64"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "delete_image",
+                    "title": "Delete Image",
+                    "description": "Delete an image you stored via add_image, by its memory_id. Removes the "
+                    "caption memory and unlinks the blob when no other memory references it.",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": {"type": "string", "description": "memory_id returned by add_image."},
+                            "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
+                        },
+                        "required": ["memory_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            ])
+        return claude_tools
 
-    async def call_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def call_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any], *, can_write: bool = False) -> dict[str, Any]:
         try:
             if profile.name == "openai":
                 if tool_name == "search":
@@ -993,44 +1004,44 @@ class Mem0ChatProxy:
                 if tool_name == "fetch_image":
                     return await self.handle_fetch_image_tool(arguments)
                 if tool_name == "add_memory":
-                    if not profile.allow_write:
+                    if not can_write:
                         return self.mcp_tool_result(
-                            text="Writing is not enabled on this endpoint.",
-                            structured={"error": "read_only_endpoint"},
+                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                            structured={"error": "insufficient_scope"},
                             is_error=True,
                         )
                     # Enforce the lean schema: no caller-supplied user_id / metadata /
                     # routing fields. Writes always land under the default user_id.
                     return await self.handle_add_memory_tool(lean_add_memory_args(arguments))
                 if tool_name == "delete":
-                    if not profile.allow_write:
+                    if not can_write:
                         return self.mcp_tool_result(
-                            text="Writing is not enabled on this endpoint.",
-                            structured={"error": "read_only_endpoint"},
+                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                            structured={"error": "insufficient_scope"},
                             is_error=True,
                         )
                     return await self.handle_delete_tool(arguments, allow_user_id=False)
                 if tool_name == "update":
-                    if not profile.allow_write:
+                    if not can_write:
                         return self.mcp_tool_result(
-                            text="update is not available on this endpoint.",
-                            structured={"error": "read_only_endpoint"},
+                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                            structured={"error": "insufficient_scope"},
                             is_error=True,
                         )
                     return await self.handle_update_tool(lean_update_args(arguments), allow_user_id=False)
                 if tool_name == "add_image":
-                    if not profile.allow_write:
+                    if not can_write:
                         return self.mcp_tool_result(
-                            text="add_image is not available on this endpoint.",
-                            structured={"error": "read_only_endpoint"},
+                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                            structured={"error": "insufficient_scope"},
                             is_error=True,
                         )
                     return await self.handle_add_image_tool(lean_add_image_args(arguments))
                 if tool_name == "delete_image":
-                    if not profile.allow_write:
+                    if not can_write:
                         return self.mcp_tool_result(
-                            text="delete_image is not available on this endpoint.",
-                            structured={"error": "read_only_endpoint"},
+                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                            structured={"error": "insufficient_scope"},
                             is_error=True,
                         )
                     # allow_user_id=False: deletes are always scoped to the default user_id.
@@ -1062,42 +1073,42 @@ class Mem0ChatProxy:
             if tool_name == "fetch_image":
                 return await self.handle_fetch_image_tool(arguments)
             if tool_name == "mem0_add_memory":
-                if not profile.allow_write:
+                if not can_write:
                     return self.mcp_tool_result(
-                        text=f"Tool {tool_name} is not available on the {profile.name} endpoint.",
-                        structured={"error": "read_only_endpoint"},
+                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                        structured={"error": "insufficient_scope"},
                         is_error=True,
                     )
                 return await self.handle_add_memory_tool(arguments)
             if tool_name == "mem0_delete":
-                if not profile.allow_write:
+                if not can_write:
                     return self.mcp_tool_result(
-                        text=f"Tool {tool_name} is not available on the {profile.name} endpoint.",
-                        structured={"error": "read_only_endpoint"},
+                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                        structured={"error": "insufficient_scope"},
                         is_error=True,
                     )
                 return await self.handle_delete_tool(arguments, allow_user_id=True)
             if tool_name == "mem0_update":
-                if not profile.allow_write:
+                if not can_write:
                     return self.mcp_tool_result(
-                        text=f"Tool {tool_name} is not available on the {profile.name} endpoint.",
-                        structured={"error": "read_only_endpoint"},
+                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                        structured={"error": "insufficient_scope"},
                         is_error=True,
                     )
                 return await self.handle_update_tool(arguments, allow_user_id=True)
             if tool_name == "add_image":
-                if not profile.allow_write:
+                if not can_write:
                     return self.mcp_tool_result(
-                        text=f"Tool {tool_name} is not available on the {profile.name} endpoint.",
-                        structured={"error": "read_only_endpoint"},
+                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                        structured={"error": "insufficient_scope"},
                         is_error=True,
                     )
                 return await self.handle_add_image_tool(arguments)
             if tool_name == "delete_image":
-                if not profile.allow_write:
+                if not can_write:
                     return self.mcp_tool_result(
-                        text=f"Tool {tool_name} is not available on the {profile.name} endpoint.",
-                        structured={"error": "read_only_endpoint"},
+                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                        structured={"error": "insufficient_scope"},
                         is_error=True,
                     )
                 return await self.handle_delete_image_tool(arguments, allow_user_id=True)
@@ -1854,23 +1865,31 @@ class Mem0ChatProxy:
             extra_headers={"www-authenticate": 'Bearer realm="reliquary"'},
         )
 
-    def is_allowed_token(self, profile: EndpointProfile, headers: dict[str, str]) -> bool:
+    def resolve_scope(self, profile: EndpointProfile, headers: dict[str, str]) -> str | None:
+        """Return the granted scope ('write'/'read') for this request, or None if
+        unauthorized. Master token => write; a matching static token => its scope;
+        a valid OAuth token => its issued scope; no auth => 'read' iff the endpoint
+        allows no-auth."""
         authorization = headers.get("authorization", "").strip()
         if not authorization:
-            return profile.allow_noauth
+            return "read" if profile.allow_noauth else None
         scheme, _, token = authorization.partition(" ")
         token = token.strip()
         if scheme.lower() != "bearer" or not token:
-            return False
+            return None
         if profile.token and secrets.compare_digest(token, profile.token):
-            return True
-        # Derived, revocable OAuth tokens are accepted on any MCP endpoint that
-        # advertises OAuth discovery, scoped to that endpoint's resource so a
-        # token minted for one MCP resource can't be replayed against another.
+            return "write"
+        for static_token, scope in self._static_tokens.items():
+            if secrets.compare_digest(token, static_token):
+                return scope
         resource = f"{self.oauth.base_url(headers)}{profile.path}"
-        if self.oauth.verify_access_token(token, resource=resource):
-            return True
-        return False
+        oauth_scope = self.oauth.access_token_scope(token, resource=resource)
+        if oauth_scope is not None:
+            return "write" if scope_is_write(oauth_scope) else "read"
+        return None
+
+    def is_allowed_token(self, profile: EndpointProfile, headers: dict[str, str]) -> bool:
+        return self.resolve_scope(profile, headers) is not None
 
     @staticmethod
     def _coerce_int(value: Any, *, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
@@ -2314,6 +2333,30 @@ class _GlobalRoute:
     description: str = "global"
 
 
+def parse_static_tokens(raw: str | None) -> tuple[tuple[str, str, str], ...]:
+    """Parse 'label:scope:token;...' into a tuple of (label, scope, token) triples.
+
+    Scope is normalised: anything that isn't an explicit read scope becomes 'write'
+    so the legacy 'mcp' value and unknown strings all grant write (backward-compat).
+    """
+    entries: list[tuple[str, str, str]] = []
+    for chunk in (raw or "").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(":", 2)
+        if len(parts) != 3:
+            LOG.warning("Ignoring malformed MEM0_STATIC_TOKENS entry (need label:scope:token).")
+            continue
+        label, scope, token = (p.strip() for p in parts)
+        scope = "write" if scope_is_write(scope) else "read"
+        if not label or not token:
+            LOG.warning("Ignoring static token entry with empty label/token.")
+            continue
+        entries.append((label, scope, token))
+    return tuple(entries)
+
+
 def build_settings(args: argparse.Namespace) -> ProxySettings:
     config = load_config(args.config)
     llm_config = (config.get("llm") or {}).get("config") or {}
@@ -2361,6 +2404,7 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         blob_max_bytes=args.blob_max_bytes,
         blob_url_ttl=args.blob_url_ttl,
         state_dir=args.state_dir,
+        static_tokens=parse_static_tokens(args.static_tokens),
     )
 
 
@@ -2462,6 +2506,13 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("MEM0_STATE_DIR"),
         help="Directory to persist OAuth tokens + MCP sessions across restarts. "
         "Unset = in-memory only (tokens/sessions reset on restart).",
+    )
+    parser.add_argument(
+        "--static-tokens",
+        default=os.getenv("MEM0_STATIC_TOKENS"),
+        help="Named static bearer tokens with per-token scope, beyond the master token. "
+        "Format: 'label:scope:token' entries separated by ';'. scope is 'read' or 'write'. "
+        "Example: 'readonly:read:abc123;editor:write:def456'.",
     )
     parser.add_argument("--log-level", default="info", help="Logging level, for example info or debug.")
     return parser.parse_args()

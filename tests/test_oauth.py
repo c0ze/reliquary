@@ -18,7 +18,7 @@ import json
 import tempfile
 import os
 
-from oauth import OAuthProvider  # noqa: E402
+from oauth import OAuthProvider, scope_is_write  # noqa: E402
 from persistence import JsonFileStore  # noqa: E402
 
 
@@ -224,6 +224,57 @@ def test_expired_token_dropped_on_load(tmp_path):
     store = JsonFileStore(store_path)
     provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", token_store=store)
     assert provider.verify_access_token("stale-token-xyz") is False
+
+
+def test_scope_is_write():
+    # Explicit read scope strings → False (not write)
+    assert scope_is_write("read") is False
+    assert scope_is_write("readonly") is False
+    assert scope_is_write("read_only") is False
+    assert scope_is_write("search") is False
+    # Everything else → True (grants write; legacy 'mcp' = write)
+    assert scope_is_write("write") is True
+    assert scope_is_write("mcp") is True
+    assert scope_is_write("") is True
+    assert scope_is_write(None) is True
+    # Case-insensitive
+    assert scope_is_write("READ") is False
+    assert scope_is_write("Read") is False
+
+
+def test_access_token_scope_returns_scope():
+    provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    # Issue a token with scope 'read'
+    token_read = provider.issue_access_token(client_id="c1", scope="read")
+    assert provider.access_token_scope(token_read) == "read"
+    # Issue a token with scope 'write'
+    token_write = provider.issue_access_token(client_id="c1", scope="write")
+    assert provider.access_token_scope(token_write) == "write"
+
+
+def test_access_token_scope_expired_returns_none():
+    provider = OAuthProvider(
+        master_token="MASTER", mcp_resource_path="/claude/mcp", access_token_ttl=-1
+    )
+    token = provider.issue_access_token(client_id="c1", scope="read")
+    assert provider.access_token_scope(token) is None
+
+
+def test_access_token_scope_unknown_returns_none():
+    provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    assert provider.access_token_scope("not-a-real-token") is None
+    assert provider.access_token_scope(None) is None
+
+
+def test_access_token_scope_resource_bound():
+    provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    token = provider.issue_access_token(client_id="c1", scope="read", resource="https://host/claude/mcp")
+    # Correct resource → returns scope
+    assert provider.access_token_scope(token, resource="https://host/claude/mcp") == "read"
+    # Wrong resource → None
+    assert provider.access_token_scope(token, resource="https://host/openai/mcp") is None
+    # No resource supplied → None (bound token)
+    assert provider.access_token_scope(token) is None
 
 
 if __name__ == "__main__":
