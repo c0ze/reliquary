@@ -127,6 +127,8 @@ class MCPSessionStore:
             return None
         if self._is_expired(entry):
             self._sessions.pop(session_id, None)
+            # Structural deletion: persist so the stale id isn't resurrected on restart.
+            self._persist()
             return None
         entry[1] = self._clock()
         # move to most-recent position

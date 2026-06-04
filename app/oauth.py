@@ -306,7 +306,10 @@ class OAuthProvider:
         expired = [token for token, entry in self._access_tokens.items() if entry.expires_at < now]
         for token in expired:
             self._access_tokens.pop(token, None)
-        self._persist_access_tokens()
+        # verify_access_token() prunes on every check; only touch disk when
+        # something actually expired, so the common path stays write-free.
+        if expired:
+            self._persist_access_tokens()
 
     def _load_access_tokens(self) -> None:
         now = time.time()
