@@ -214,3 +214,65 @@ def test_tool_category_other():
     from server import Mem0ChatProxy
     assert Mem0ChatProxy._tool_category("mem0_status") == "other"
     assert Mem0ChatProxy._tool_category("unknown_tool") == "other"
+
+
+# --------------------------------------------------------------------------- #
+# 6. add_image source_url ingest
+# --------------------------------------------------------------------------- #
+
+_PNG_BYTES_URL = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+
+def test_add_image_source_url_happy_path(proxy, monkeypatch):
+    """source_url path: fetch stub returns PNG bytes; result has blob_id + memory_id."""
+    async def fake_fetch(url):
+        return (_PNG_BYTES_URL, "image/png")
+
+    monkeypatch.setattr(proxy, "_fetch_image_from_url", fake_fetch)
+    result = run(proxy.handle_add_image_tool({
+        "caption": "URL-ingested image",
+        "source_url": "https://example.com/cat.png",
+    }))
+    assert not result["isError"], result
+    sc = result["structuredContent"]
+    assert "blob_id" in sc
+    assert "memory_id" in sc
+    assert "url" in sc
+
+    # Caption should be searchable
+    search_result = run(proxy.handle_search_tool({"query": "URL-ingested image"}))
+    assert not search_result["isError"]
+    texts = [r["text"] for r in search_result["structuredContent"]["results"]]
+    assert any("URL-ingested" in t for t in texts)
+
+
+def test_add_image_both_sources_rejected(proxy):
+    """Providing both image_base64 and source_url returns ambiguous_source error."""
+    result = run(proxy.handle_add_image_tool({
+        "caption": "ambiguous",
+        "image_base64": _PNG_B64,
+        "source_url": "https://example.com/x.png",
+    }))
+    assert result["isError"]
+    assert result["structuredContent"]["error"] == "ambiguous_source"
+
+
+def test_add_image_no_source_rejected(proxy):
+    """Providing neither image_base64 nor source_url returns missing_image error."""
+    result = run(proxy.handle_add_image_tool({"caption": "no source"}))
+    assert result["isError"]
+    assert result["structuredContent"]["error"] == "missing_image"
+
+
+def test_add_image_url_ingest_disabled(proxy):
+    """When image_url_ingest is False, source_url returns url_ingest_disabled error."""
+    proxy.settings.image_url_ingest = False
+    try:
+        result = run(proxy.handle_add_image_tool({
+            "caption": "disabled",
+            "source_url": "https://example.com/x.png",
+        }))
+        assert result["isError"]
+        assert result["structuredContent"]["error"] == "url_ingest_disabled"
+    finally:
+        proxy.settings.image_url_ingest = True

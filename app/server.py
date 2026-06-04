@@ -28,6 +28,7 @@ from blobs import BlobStore, BlobTooLarge
 from ratelimit import RateLimiter
 from metrics import Metrics
 from audit import AuditLog
+from urlfetch import validate_public_url
 from helpers import (
     OPENAI_SNIPPET_CHAR_CAP,
     SEARCH_PREVIEW_CHAR_CAP,
@@ -210,6 +211,7 @@ class ProxySettings:
     rate_limit_writes: int = 0
     rate_limit_searches: int = 0
     metrics_public: bool = False
+    image_url_ingest: bool = True
 
 
 class Mem0ChatProxy:
@@ -1047,17 +1049,18 @@ class Mem0ChatProxy:
                     {
                         "name": "add_image",
                         "title": "Add Image",
-                        "description": "Store a binary file (usually an image) plus a searchable caption.",
+                        "description": "Store a binary file (usually an image) plus a searchable caption. Provide image_base64 OR source_url.",
                         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "caption": {"type": "string", "description": "Searchable text describing the image."},
                                 "image_base64": {"type": "string", "description": "Base64-encoded file bytes."},
+                                "source_url": {"type": "string", "description": "Public http(s) URL to fetch the image from, as an alternative to image_base64."},
                                 "mimetype": {"type": "string"},
                                 "title": {"type": "string"},
                             },
-                            "required": ["caption", "image_base64"],
+                            "required": ["caption"],
                             "additionalProperties": False,
                         },
                     }
@@ -1206,6 +1209,7 @@ class Mem0ChatProxy:
                     "name": "add_image",
                     "title": "Add Image",
                     "description": "Store a binary file (usually an image) and a searchable caption. "
+                    "Provide image_base64 OR source_url (not both). "
                     "Returns blob_id, memory_id and a signed url. Find it later via mem0_search on the "
                     "caption, or fetch_image with the blob_id.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
@@ -1214,6 +1218,7 @@ class Mem0ChatProxy:
                         "properties": {
                             "caption": {"type": "string", "description": "Searchable text describing the image."},
                             "image_base64": {"type": "string", "description": "Base64-encoded file bytes."},
+                            "source_url": {"type": "string", "description": "Public http(s) URL to fetch the image from, as an alternative to image_base64."},
                             "mimetype": {"type": "string", "description": "Optional fallback mimetype if bytes can't be sniffed."},
                             "user_id": {"type": "string"},
                             "title": {"type": "string"},
@@ -1223,7 +1228,7 @@ class Mem0ChatProxy:
                             "topic": {"type": "string"},
                             "metadata": {"type": "object"},
                         },
-                        "required": ["caption", "image_base64"],
+                        "required": ["caption"],
                         "additionalProperties": False,
                     },
                 },
@@ -1582,6 +1587,50 @@ class Mem0ChatProxy:
             structured={"ids": new_ids, "user_id": user_id, "infer": infer, "metadata": metadata},
         )
 
+    async def _fetch_image_from_url(self, url: str) -> tuple[bytes, str | None] | dict[str, Any]:
+        """Fetch image bytes from a public URL with SSRF guards, a redirect-hop
+        limit (re-validating each hop), and the configured size cap. Returns
+        (data, content_type) on success, or an mcp_tool_result error dict."""
+        max_bytes = self.settings.blob_max_bytes
+        current = url
+        for _ in range(4):  # initial + up to 3 redirects
+            reason = validate_public_url(current)
+            if reason is not None:
+                return self.mcp_tool_result(
+                    text=f"Refusing to fetch URL: {reason}.",
+                    structured={"error": "unsafe_url", "reason": reason},
+                    is_error=True,
+                )
+            try:
+                async with self.client.stream("GET", current, follow_redirects=False, timeout=20.0) as resp:
+                    if resp.is_redirect:
+                        location = resp.headers.get("location") or ""
+                        if not location:
+                            return self.mcp_tool_result(text="Redirect without a Location header.",
+                                structured={"error": "fetch_failed"}, is_error=True)
+                        current = location
+                        continue
+                    if resp.status_code != 200:
+                        return self.mcp_tool_result(
+                            text=f"Fetch failed with HTTP {resp.status_code}.",
+                            structured={"error": "fetch_failed", "status": resp.status_code}, is_error=True)
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.aiter_bytes():
+                        total += len(chunk)
+                        if max_bytes and total > max_bytes:
+                            return self.mcp_tool_result(
+                                text=f"Remote image exceeds the {max_bytes}-byte limit.",
+                                structured={"error": "too_large", "max_bytes": max_bytes}, is_error=True)
+                        chunks.append(chunk)
+                    return b"".join(chunks), resp.headers.get("content-type")
+            except Exception:
+                LOG.debug("URL image fetch failed for %s", current, exc_info=True)
+                return self.mcp_tool_result(text="Could not fetch the image URL.",
+                    structured={"error": "fetch_failed"}, is_error=True)
+        return self.mcp_tool_result(text="Too many redirects fetching the image URL.",
+            structured={"error": "too_many_redirects"}, is_error=True)
+
     async def handle_add_image_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         caption = str(arguments.get("caption") or "").strip()
         if not caption:
@@ -1590,13 +1639,20 @@ class Mem0ChatProxy:
                 structured={"error": "missing_caption"},
                 is_error=True,
             )
+
         image_b64 = arguments.get("image_base64")
-        if not isinstance(image_b64, str) or not image_b64.strip():
+        source_url = arguments.get("source_url")
+        has_b64 = isinstance(image_b64, str) and bool(image_b64.strip())
+        has_url = isinstance(source_url, str) and bool(source_url.strip())
+        if has_b64 and has_url:
             return self.mcp_tool_result(
-                text="A non-empty `image_base64` is required.",
-                structured={"error": "missing_image"},
-                is_error=True,
-            )
+                text="Provide exactly one of `image_base64` or `source_url`, not both.",
+                structured={"error": "ambiguous_source"}, is_error=True)
+        if not has_b64 and not has_url:
+            return self.mcp_tool_result(
+                text="Either `image_base64` or `source_url` is required.",
+                structured={"error": "missing_image"}, is_error=True)
+
         raw_metadata = arguments.get("metadata") or {}
         if not isinstance(raw_metadata, dict):
             return self.mcp_tool_result(
@@ -1605,22 +1661,34 @@ class Mem0ChatProxy:
                 is_error=True,
             )
         metadata = dict(raw_metadata)
-        try:
-            data = base64.b64decode(image_b64, validate=True)
-        except (ValueError, base64.binascii.Error):
-            return self.mcp_tool_result(
-                text="`image_base64` is not valid base64.",
-                structured={"error": "invalid_image"},
-                is_error=True,
-            )
+
+        fetched_mimetype: str | None = None
+        if has_url:
+            if not self.settings.image_url_ingest:
+                return self.mcp_tool_result(text="URL image ingest is disabled on this server.",
+                    structured={"error": "url_ingest_disabled"}, is_error=True)
+            fetched = await self._fetch_image_from_url(source_url.strip())
+            if not isinstance(fetched, tuple):
+                return fetched  # already an error result
+            data, fetched_mimetype = fetched
+            metadata.setdefault("source_url", source_url.strip())
+        else:
+            try:
+                data = base64.b64decode(image_b64, validate=True)
+            except (ValueError, base64.binascii.Error):
+                return self.mcp_tool_result(
+                    text="`image_base64` is not valid base64.",
+                    structured={"error": "invalid_image"},
+                    is_error=True,
+                )
         if not data:
             return self.mcp_tool_result(
-                text="Decoded image is empty.",
+                text="Image is empty.",
                 structured={"error": "invalid_image"},
                 is_error=True,
             )
         try:
-            info = self.blobs.put(data, mimetype=arguments.get("mimetype"))
+            info = self.blobs.put(data, mimetype=arguments.get("mimetype") or fetched_mimetype)
         except BlobTooLarge as exc:
             return self.mcp_tool_result(
                 text=f"Image is {exc.size} bytes, exceeds the {exc.max_bytes}-byte limit.",
@@ -2856,6 +2924,7 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         rate_limit_writes=args.rate_limit_writes,
         rate_limit_searches=args.rate_limit_searches,
         metrics_public=args.metrics_public,
+        image_url_ingest=args.image_url_ingest,
     )
 
 
@@ -2980,6 +3049,9 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("MEM0_METRICS_PUBLIC", "false").lower() in {"1", "true", "yes"},
         help="Expose GET /metrics without auth (default false: requires the Claude bearer).")
     parser.add_argument("--log-level", default="info", help="Logging level, for example info or debug.")
+    parser.add_argument("--image-url-ingest", action=argparse.BooleanOptionalAction,
+        default=os.getenv("MEM0_IMAGE_URL_INGEST", "true").lower() in {"1", "true", "yes"},
+        help="Allow add_image to fetch images from a source_url server-side (default true).")
     return parser.parse_args()
 
 
