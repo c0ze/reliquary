@@ -55,6 +55,7 @@ services:
     env_file: .env
     volumes:
       - ./config.yaml:/config/config.yaml:ro
+      - ${BLOB_HOST_DIR:-./data/blobs}:/data/blobs
     # Publish to loopback only; put Cloudflare Tunnel / Caddy / Traefik in front
     # for public TLS. Remove the 127.0.0.1 prefix at your own risk.
     ports:

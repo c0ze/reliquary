@@ -63,8 +63,15 @@ Caddy, or Traefik.
 
 | Endpoint | For | Auth | Tools |
 |----------|-----|------|-------|
-| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_delete` |
-| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `search`, `fetch` (lean snippet shape); `add_memory` + `delete` if `MEM0_OPENAI_ALLOW_WRITE=true` |
+| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_delete`, `add_image`, `fetch_image`, `delete_image` |
+| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `search`, `fetch`, `fetch_image` (lean snippet shape); `add_memory` + `delete` + `add_image` if `MEM0_OPENAI_ALLOW_WRITE=true` |
+
+**Binary blobs.** `add_image` stores a file (base64) plus a searchable caption;
+it returns a `blob_id`, a `memory_id`, and a signed `url`. Find images later with
+`mem0_search` on the caption or `fetch_image` by `blob_id`; `delete_image` removes
+the caption memory and ref-counted blob. Files live under `BLOB_HOST_DIR` on the
+host (default `./data/blobs`) so you can browse and back them up. `GET /blobs/{id}`
+serves bytes to anyone holding a valid signed URL or the Claude bearer.
 
 Also: `GET /healthz` (minimal, public), `GET /status` and `GET /mem0/search?q=...`
 (both **require the Claude bearer** — they return config/taxonomy and raw

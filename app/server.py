@@ -23,6 +23,7 @@ from ingest import load_config
 from oauth import OAuthProvider, RegistrationDisabledError
 from catalog import CorpusCatalog
 from runtime import AsyncRWLock, MCPSessionStore, reads_can_be_concurrent
+from blobs import BlobStore, BlobTooLarge
 from helpers import (
     OPENAI_SNIPPET_CHAR_CAP,
     SEARCH_PREVIEW_CHAR_CAP,
@@ -35,6 +36,7 @@ from helpers import (
     format_fetched_document,
     json_dumps,
     latest_user_text,
+    lean_add_image_args,
     lean_add_memory_args,
     normalize_base_url,
     normalize_token,
@@ -65,6 +67,10 @@ SERVER_WEBSITE_URL = "https://github.com/c0ze/reliquary"
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 ICON_SIZES = (16, 32, 64, 128, 256, 512)
 ICON_PATH_RE = re.compile(r"/icon-(?:%s)\.png" % "|".join(str(s) for s in ICON_SIZES))
+BLOB_PATH_RE = re.compile(r"/blobs/([0-9a-f]{64})\Z")
+# Passive raster image types safe to serve inline same-origin. Anything else
+# (SVG, PDF, HTML, unknown) is forced to an octet-stream download by /blobs/{id}.
+_INLINE_SAFE_MIMETYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 _ASSET_CACHE: dict[str, bytes] = {}
 _SERVER_ICONS_CACHE: list[dict[str, Any]] = []
 
@@ -147,6 +153,10 @@ class ProxySettings:
     oauth_allow_registration: bool
     memory_concurrent_reads: bool | None
     oauth_verbatim_token: bool
+    blob_dir: str
+    blob_signing_key: str | None
+    blob_max_bytes: int
+    blob_url_ttl: int
 
 
 class Mem0ChatProxy:
@@ -208,6 +218,17 @@ class Mem0ChatProxy:
             allow_registration=settings.oauth_allow_registration,
             issue_verbatim_token=settings.oauth_verbatim_token,
         )
+
+        self.blobs = BlobStore(
+            blob_dir=settings.blob_dir,
+            signing_key=(settings.blob_signing_key or secrets.token_hex(32)).encode("utf-8"),
+            max_bytes=settings.blob_max_bytes,
+        )
+        if not settings.blob_signing_key:
+            LOG.warning(
+                "MEM0_BLOB_SIGNING_KEY is unset; using a random per-process key. "
+                "Signed blob URLs will invalidate on restart."
+            )
 
     def _detect_search_api(self) -> tuple[bool, bool, str]:
         """Inspect ``memory.search`` once to adapt to the installed mem0 version.
@@ -326,6 +347,11 @@ class Mem0ChatProxy:
                     await self.send_empty(send, 405, extra_headers={"allow": "POST"})
                     return
                 await self.handle_oauth_revoke(receive, send)
+                return
+
+            blob_match = BLOB_PATH_RE.fullmatch(path)
+            if method == "GET" and blob_match:
+                await self.handle_blob_get(blob_match.group(1), scope, send)
                 return
 
             profile = self.endpoint_profiles.get(path)
@@ -673,6 +699,18 @@ class Mem0ChatProxy:
                         "additionalProperties": False,
                     },
                 },
+                {
+                    "name": "fetch_image",
+                    "title": "Fetch Image",
+                    "description": "Fetch a stored binary file by blob_id; returns it inline plus a signed url.",
+                    "annotations": read_only,
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string", "description": "blob_id from search results."}},
+                        "required": ["id"],
+                        "additionalProperties": False,
+                    },
+                },
             ]
             if profile.allow_write:
                 tools.append(
@@ -717,6 +755,39 @@ class Mem0ChatProxy:
                             "type": "object",
                             "properties": {"id": {"type": "string", "description": "Memory id from search or add_memory."}},
                             "required": ["id"],
+                            "additionalProperties": False,
+                        },
+                    }
+                )
+                tools.append(
+                    {
+                        "name": "add_image",
+                        "title": "Add Image",
+                        "description": "Store a binary file (usually an image) plus a searchable caption.",
+                        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "caption": {"type": "string", "description": "Searchable text describing the image."},
+                                "image_base64": {"type": "string", "description": "Base64-encoded file bytes."},
+                                "mimetype": {"type": "string"},
+                                "title": {"type": "string"},
+                            },
+                            "required": ["caption", "image_base64"],
+                            "additionalProperties": False,
+                        },
+                    }
+                )
+                tools.append(
+                    {
+                        "name": "delete_image",
+                        "title": "Delete Image",
+                        "description": "Delete an image you stored via add_image, by its memory_id.",
+                        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"memory_id": {"type": "string", "description": "memory_id returned by add_image."}},
+                            "required": ["memory_id"],
                             "additionalProperties": False,
                         },
                     }
@@ -801,6 +872,60 @@ class Mem0ChatProxy:
                     "additionalProperties": False,
                 },
             },
+            {
+                "name": "add_image",
+                "title": "Add Image",
+                "description": "Store a binary file (usually an image) and a searchable caption. "
+                "Returns blob_id, memory_id and a signed url. Find it later via mem0_search on the "
+                "caption, or fetch_image with the blob_id.",
+                "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "caption": {"type": "string", "description": "Searchable text describing the image."},
+                        "image_base64": {"type": "string", "description": "Base64-encoded file bytes."},
+                        "mimetype": {"type": "string", "description": "Optional fallback mimetype if bytes can't be sniffed."},
+                        "user_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "domain": {"type": "string"},
+                        "hall": {"type": "string"},
+                        "room": {"type": "string"},
+                        "topic": {"type": "string"},
+                        "metadata": {"type": "object"},
+                    },
+                    "required": ["caption", "image_base64"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "fetch_image",
+                "title": "Fetch Image",
+                "description": "Fetch a stored binary file by blob_id. Returns the image inline plus a "
+                "signed url for direct download of large files.",
+                "annotations": {"readOnlyHint": True, "openWorldHint": False},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string", "description": "blob_id from add_image or mem0_search."}},
+                    "required": ["id"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "delete_image",
+                "title": "Delete Image",
+                "description": "Delete an image you stored via add_image, by its memory_id. Removes the "
+                "caption memory and unlinks the blob when no other memory references it.",
+                "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "memory_id returned by add_image."},
+                        "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
+                    },
+                    "required": ["memory_id"],
+                    "additionalProperties": False,
+                },
+            },
         ]
 
     async def call_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -817,6 +942,8 @@ class Mem0ChatProxy:
                     )
                 if tool_name == "fetch":
                     return await self.handle_fetch_tool(arguments)
+                if tool_name == "fetch_image":
+                    return await self.handle_fetch_image_tool(arguments)
                 if tool_name == "add_memory":
                     if not profile.allow_write:
                         return self.mcp_tool_result(
@@ -835,6 +962,23 @@ class Mem0ChatProxy:
                             is_error=True,
                         )
                     return await self.handle_delete_tool(arguments, allow_user_id=False)
+                if tool_name == "add_image":
+                    if not profile.allow_write:
+                        return self.mcp_tool_result(
+                            text="add_image is not available on this endpoint.",
+                            structured={"error": "read_only_endpoint"},
+                            is_error=True,
+                        )
+                    return await self.handle_add_image_tool(lean_add_image_args(arguments))
+                if tool_name == "delete_image":
+                    if not profile.allow_write:
+                        return self.mcp_tool_result(
+                            text="delete_image is not available on this endpoint.",
+                            structured={"error": "read_only_endpoint"},
+                            is_error=True,
+                        )
+                    # allow_user_id=False: deletes are always scoped to the default user_id.
+                    return await self.handle_delete_image_tool(arguments, allow_user_id=False)
                 return self.mcp_tool_result(
                     text=f"Unknown tool: {tool_name}",
                     structured={"error": "unknown_tool"},
@@ -859,6 +1003,8 @@ class Mem0ChatProxy:
                 return await self.handle_search_tool(arguments)
             if tool_name == "mem0_fetch":
                 return await self.handle_fetch_tool(arguments)
+            if tool_name == "fetch_image":
+                return await self.handle_fetch_image_tool(arguments)
             if tool_name == "mem0_add_memory":
                 if not profile.allow_write:
                     return self.mcp_tool_result(
@@ -875,6 +1021,22 @@ class Mem0ChatProxy:
                         is_error=True,
                     )
                 return await self.handle_delete_tool(arguments, allow_user_id=True)
+            if tool_name == "add_image":
+                if not profile.allow_write:
+                    return self.mcp_tool_result(
+                        text=f"Tool {tool_name} is not available on the {profile.name} endpoint.",
+                        structured={"error": "read_only_endpoint"},
+                        is_error=True,
+                    )
+                return await self.handle_add_image_tool(arguments)
+            if tool_name == "delete_image":
+                if not profile.allow_write:
+                    return self.mcp_tool_result(
+                        text=f"Tool {tool_name} is not available on the {profile.name} endpoint.",
+                        structured={"error": "read_only_endpoint"},
+                        is_error=True,
+                    )
+                return await self.handle_delete_image_tool(arguments, allow_user_id=True)
         except Exception as exc:
             LOG.exception("MCP tool failed: %s", tool_name)
             return self.mcp_tool_result(
@@ -1066,6 +1228,175 @@ class Mem0ChatProxy:
             structured={"ids": new_ids, "user_id": user_id, "infer": infer, "metadata": metadata},
         )
 
+    async def handle_add_image_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        caption = str(arguments.get("caption") or "").strip()
+        if not caption:
+            return self.mcp_tool_result(
+                text="A non-empty `caption` is required.",
+                structured={"error": "missing_caption"},
+                is_error=True,
+            )
+        image_b64 = arguments.get("image_base64")
+        if not isinstance(image_b64, str) or not image_b64.strip():
+            return self.mcp_tool_result(
+                text="A non-empty `image_base64` is required.",
+                structured={"error": "missing_image"},
+                is_error=True,
+            )
+        raw_metadata = arguments.get("metadata") or {}
+        if not isinstance(raw_metadata, dict):
+            return self.mcp_tool_result(
+                text="`metadata` must be an object.",
+                structured={"error": "invalid_metadata"},
+                is_error=True,
+            )
+        metadata = dict(raw_metadata)
+        try:
+            data = base64.b64decode(image_b64, validate=True)
+        except (ValueError, base64.binascii.Error):
+            return self.mcp_tool_result(
+                text="`image_base64` is not valid base64.",
+                structured={"error": "invalid_image"},
+                is_error=True,
+            )
+        if not data:
+            return self.mcp_tool_result(
+                text="Decoded image is empty.",
+                structured={"error": "invalid_image"},
+                is_error=True,
+            )
+        try:
+            info = self.blobs.put(data, mimetype=arguments.get("mimetype"))
+        except BlobTooLarge as exc:
+            return self.mcp_tool_result(
+                text=f"Image is {exc.size} bytes, exceeds the {exc.max_bytes}-byte limit.",
+                structured={"error": "too_large", "size": exc.size, "max_bytes": exc.max_bytes},
+                is_error=True,
+            )
+
+        user_id = str(arguments.get("user_id") or self.settings.user_id)
+        metadata.setdefault("source", "mcp")
+        metadata["kind"] = "image"
+        metadata["source_group"] = "user-write"
+        metadata["blob_ref"] = info.id
+        metadata["blob_mime"] = info.mimetype
+        metadata["blob_size"] = info.size
+        for key in ("title", "domain", "hall", "room", "topic"):
+            value = arguments.get(key)
+            if value is not None and str(value).strip():
+                metadata[key] = str(value).strip()
+
+        try:
+            result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)
+        except Exception:
+            # The blob is already on disk; don't leak it if the caption write fails.
+            self.blobs.delete(info.id)
+            raise
+        new_ids = added_memory_ids(result)
+        memory_id = new_ids[0] if new_ids else None
+        if memory_id is None:
+            self.blobs.delete(info.id)
+            return self.mcp_tool_result(
+                text="Stored the blob but failed to create its caption memory; rolled back.",
+                structured={"error": "memory_write_failed", "blob_id": info.id},
+                is_error=True,
+            )
+        url = self._signed_blob_url(info.id)
+        return self.mcp_tool_result(
+            text=f"Stored image (blob_id={info.id}, memory_id={memory_id}): {trim_text(caption, 160)}",
+            structured={
+                "blob_id": info.id,
+                "memory_id": memory_id,
+                "url": url,
+                "mimetype": info.mimetype,
+                "size": info.size,
+                "user_id": user_id,
+            },
+        )
+
+    async def handle_fetch_image_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        blob_id = str(arguments.get("id") or "").strip()
+        if not blob_id:
+            return self.mcp_tool_result(
+                text="A non-empty `id` is required.",
+                structured={"error": "missing_id"},
+                is_error=True,
+            )
+        try:
+            result = self.blobs.get(blob_id)
+        except ValueError:
+            result = None
+        if result is None:
+            return self.mcp_tool_result(
+                text=f"No blob found for id={blob_id}.",
+                structured={"error": "not_found", "id": blob_id},
+                is_error=True,
+            )
+        data, mimetype = result
+        encoded = base64.b64encode(data).decode("ascii")
+        url = self._signed_blob_url(blob_id)
+        return self.mcp_tool_result(
+            text=f"Image {blob_id} ({mimetype}, {len(data)} bytes). Download: {url}",
+            structured={"blob_id": blob_id, "url": url, "mimetype": mimetype, "size": len(data)},
+            image=(encoded, mimetype),
+        )
+
+    async def handle_delete_image_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
+        memory_id = str(arguments.get("memory_id") or "").strip()
+        if not memory_id:
+            return self.mcp_tool_result(
+                text="A non-empty `memory_id` is required.",
+                structured={"error": "missing_id"},
+                is_error=True,
+            )
+        effective_user_id = (
+            str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
+        )
+        existing = await self.fetch_live_memory(memory_id)
+        if existing is None:
+            return self.mcp_tool_result(
+                text=f"No deletable image found for memory_id={memory_id}.",
+                structured={"error": "not_found", "id": memory_id},
+                is_error=True,
+            )
+        if existing.get("user_id") != effective_user_id:
+            return self.mcp_tool_result(
+                text=f"No deletable image found for memory_id={memory_id} under user_id={effective_user_id}.",
+                structured={"error": "not_found", "id": memory_id},
+                is_error=True,
+            )
+        metadata = existing.get("metadata") or {}
+        if metadata.get("source_group") != "user-write":
+            return self.mcp_tool_result(
+                text=f"Refusing to delete memory_id={memory_id}: not a user-written memory.",
+                structured={"error": "protected_record", "id": memory_id},
+                is_error=True,
+            )
+        # Require both the image kind and a blob_ref. This is the marker add_image
+        # stamps; it guards against decref'ing a live blob via a plain note that
+        # merely carries a (forged) blob_ref in caller-supplied metadata. Note: a
+        # caller forging BOTH kind="image" and blob_ref via mem0_add_memory can
+        # still target a blob — acceptable in this single-user store, but see the
+        # follow-up on an authoritative memory<->blob registration.
+        blob_ref = metadata.get("blob_ref")
+        if metadata.get("kind") != "image" or not blob_ref:
+            return self.mcp_tool_result(
+                text=f"memory_id={memory_id} is not an image (no image blob_ref).",
+                structured={"error": "not_an_image", "id": memory_id},
+                is_error=True,
+            )
+        await self.delete_memory(memory_id)
+        unlinked = self.blobs.delete(str(blob_ref))
+        return self.mcp_tool_result(
+            text=f"Deleted image memory_id={memory_id} (blob_id={blob_ref}, blob_unlinked={bool(unlinked)}).",
+            structured={
+                "deleted": True,
+                "memory_id": memory_id,
+                "blob_id": blob_ref,
+                "blob_unlinked": bool(unlinked),
+            },
+        )
+
     async def handle_delete_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
         record_id = str(arguments.get("id") or "").strip()
         if not record_id:
@@ -1130,6 +1461,9 @@ class Mem0ChatProxy:
         }
 
     def _document_url(self, record_id: str, metadata: dict[str, Any]) -> str:
+        blob_ref = metadata.get("blob_ref")
+        if isinstance(blob_ref, str) and blob_ref:
+            return self._signed_blob_url(blob_ref)
         source_url = metadata.get("source_url")
         if isinstance(source_url, str) and source_url.startswith(("http://", "https://")):
             return source_url
@@ -1350,6 +1684,10 @@ class Mem0ChatProxy:
             return True
         return origin in set(self.settings.mcp_allowed_origins)
 
+    def _signed_blob_url(self, blob_id: str) -> str:
+        exp, sig = self.blobs.sign(blob_id, self.settings.blob_url_ttl)
+        return f"/blobs/{blob_id}?exp={exp}&sig={sig}"
+
     def _require_claude_auth(self, headers: dict[str, str]) -> bool:
         """True only when the request carries the Claude endpoint's bearer (or a
         valid derived OAuth token for it). Used to gate the privileged HTTP
@@ -1406,9 +1744,19 @@ class Mem0ChatProxy:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
     @staticmethod
-    def mcp_tool_result(*, text: str, structured: dict[str, Any], is_error: bool = False) -> dict[str, Any]:
+    def mcp_tool_result(
+        *,
+        text: str,
+        structured: dict[str, Any],
+        is_error: bool = False,
+        image: tuple[str, str] | None = None,
+    ) -> dict[str, Any]:
+        content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        if image is not None:
+            data, mimetype = image
+            content.append({"type": "image", "data": data, "mimeType": mimetype})
         return {
-            "content": [{"type": "text", "text": text}],
+            "content": content,
             "structuredContent": structured,
             "isError": is_error,
         }
@@ -1739,6 +2087,45 @@ class Mem0ChatProxy:
         await send({"type": "http.response.start", "status": 200, "headers": headers})
         await send({"type": "http.response.body", "body": data, "more_body": False})
 
+    async def handle_blob_get(self, blob_id: str, scope: dict[str, Any], send) -> None:
+        # Authorize via a valid signed query OR the Claude bearer.
+        query = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"))
+        exp_raw = query.get("exp", [""])[0]
+        sig = query.get("sig", [""])[0]
+        authorized = False
+        try:
+            authorized = bool(sig) and self.blobs.verify(blob_id, int(exp_raw), sig)
+        except (TypeError, ValueError):
+            authorized = False
+        if not authorized and not self._require_claude_auth(decode_headers(scope)):
+            await self.send_json(send, 403, {"error": "Invalid or expired blob signature"})
+            return
+        result = self.blobs.get(blob_id)
+        if result is None:
+            await self.send_json(send, 404, {"error": f"No blob for id={blob_id}"})
+            return
+        data, mimetype = result
+        # The stored mimetype is partly caller-influenced (add_image fallback), and
+        # this route is same-origin with the app. Only serve a small allowlist of
+        # passive raster images inline; everything else (SVG, PDF, HTML, unknown) is
+        # forced to a non-rendering download. nosniff is always set.
+        if mimetype in _INLINE_SAFE_MIMETYPES:
+            content_type = mimetype
+            disposition = None
+        else:
+            content_type = "application/octet-stream"
+            disposition = "attachment"
+        headers = [
+            (b"content-type", content_type.encode("latin-1", "replace")),
+            (b"cache-control", b"private, max-age=86400"),
+            (b"content-length", str(len(data)).encode("latin-1")),
+            (b"x-content-type-options", b"nosniff"),
+        ]
+        if disposition:
+            headers.append((b"content-disposition", disposition.encode("latin-1")))
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": data, "more_body": False})
+
     @staticmethod
     async def send_json(send, status: int, data: Any, extra_headers: dict[str, str] | None = None) -> None:
         headers = response_headers_from_httpx(
@@ -1818,6 +2205,10 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         oauth_allow_registration=args.oauth_allow_registration,
         memory_concurrent_reads=args.memory_concurrent_reads,
         oauth_verbatim_token=args.oauth_verbatim_token,
+        blob_dir=args.blob_dir,
+        blob_signing_key=normalize_token(args.blob_signing_key),
+        blob_max_bytes=args.blob_max_bytes,
+        blob_url_ttl=args.blob_url_ttl,
     )
 
 
@@ -1891,6 +2282,28 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=["http://127.0.0.1", "http://localhost", "http://127.0.0.1:3000", "http://localhost:3000"],
         help="Allowed Origin header for the MCP endpoints. Repeat to allow multiple origins.",
+    )
+    parser.add_argument(
+        "--blob-dir",
+        default=os.getenv("MEM0_BLOB_DIR", "/data/blobs"),
+        help="Directory for stored binary blobs (images, etc.). Bind-mount this for host access.",
+    )
+    parser.add_argument(
+        "--blob-signing-key",
+        default=os.getenv("MEM0_BLOB_SIGNING_KEY"),
+        help="HMAC key for signed blob URLs. Unset = random per-process key (URLs break on restart).",
+    )
+    parser.add_argument(
+        "--blob-max-bytes",
+        type=int,
+        default=int(os.getenv("MEM0_BLOB_MAX_BYTES", str(30 * 1024 * 1024))),
+        help="Max blob size in bytes (0 disables the cap). Default 30 MB.",
+    )
+    parser.add_argument(
+        "--blob-url-ttl",
+        type=int,
+        default=int(os.getenv("MEM0_BLOB_URL_TTL", "3600")),
+        help="Lifetime in seconds of signed blob URLs. Default 3600.",
     )
     parser.add_argument("--log-level", default="info", help="Logging level, for example info or debug.")
     return parser.parse_args()

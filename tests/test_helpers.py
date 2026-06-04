@@ -17,6 +17,7 @@ from helpers import (  # noqa: E402
     format_fetched_document,
     json_dumps,
     latest_user_text,
+    lean_add_image_args,
     lean_add_memory_args,
     normalize_base_url,
     normalize_token,
@@ -118,6 +119,18 @@ def test_lean_add_memory_args_strips_smuggled_fields():
     cleaned = lean_add_memory_args(raw)
     assert cleaned == {"text": "hi", "title": "t", "topic": "x", "source": "s", "infer": True}
     assert "user_id" not in cleaned and "metadata" not in cleaned and "domain" not in cleaned
+
+
+def test_lean_add_image_args_strips_smuggled_fields():
+    raw = {
+        "caption": "a cat", "image_base64": "AAAA", "mimetype": "image/png", "title": "t",
+        # these must NOT pass through on the OpenAI path:
+        "user_id": "someone_else", "metadata": {"evil": 1},
+        "domain": "d", "hall": "h", "room": "r",
+    }
+    cleaned = lean_add_image_args(raw)
+    assert cleaned == {"caption": "a cat", "image_base64": "AAAA", "mimetype": "image/png", "title": "t"}
+    assert "user_id" not in cleaned and "metadata" not in cleaned
 
 
 def test_preview_body_caps_and_flags():
