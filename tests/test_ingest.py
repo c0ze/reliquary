@@ -55,11 +55,12 @@ def test_record_content_hash_ignores_import_bookkeeping():
 
 
 def test_import_metadata_handles_none_metadata_defensively():
-    metadata = import_metadata({"id": "missing-meta", "text": "Text", "metadata": None})
+    item = {"id": "missing-meta", "text": "Text", "metadata": None}
+    metadata = import_metadata(item)
 
     assert metadata["import_record_id"] == "missing-meta"
     assert metadata["source_group"] == "imported"
-    assert metadata["import_content_hash"]
+    assert metadata["import_content_hash"] == record_content_hash(item)
 
 
 def test_incremental_ingest_skips_unchanged_updates_changed_and_adds_new():
