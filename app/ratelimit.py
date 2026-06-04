@@ -12,7 +12,8 @@ class RateLimiter:
         self.window = window
         self._clock = clock
         self._lock = threading.Lock()
-        self._buckets: dict[str, list[float]] = {}  # key -> [window_start, count]
+        # key -> [window_start: float, count: int]
+        self._buckets: dict[str, list[float | int]] = {}
 
     def allow(self, key: str) -> bool:
         """True if the call is within the per-key window budget. limit<=0 disables."""
