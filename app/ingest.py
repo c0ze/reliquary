@@ -26,7 +26,7 @@ def record_content_hash(item: dict[str, Any]) -> str:
 
 
 def import_metadata(item: dict[str, Any]) -> dict[str, Any]:
-    metadata = dict(item["metadata"])
+    metadata = dict(item.get("metadata") or {})
     metadata["import_record_id"] = item["id"]
     metadata["import_content_hash"] = record_content_hash(item)
     metadata["source_group"] = "imported"

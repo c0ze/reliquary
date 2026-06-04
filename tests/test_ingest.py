@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
-from ingest import ingest_records, record_content_hash  # noqa: E402
+from ingest import import_metadata, ingest_records, record_content_hash  # noqa: E402
 
 
 class RecordingMemory:
@@ -52,6 +52,14 @@ def test_record_content_hash_ignores_import_bookkeeping():
     }
 
     assert record_content_hash(base) == record_content_hash(with_bookkeeping)
+
+
+def test_import_metadata_handles_none_metadata_defensively():
+    metadata = import_metadata({"id": "missing-meta", "text": "Text", "metadata": None})
+
+    assert metadata["import_record_id"] == "missing-meta"
+    assert metadata["source_group"] == "imported"
+    assert metadata["import_content_hash"]
 
 
 def test_incremental_ingest_skips_unchanged_updates_changed_and_adds_new():

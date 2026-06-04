@@ -2261,13 +2261,17 @@ class Mem0ChatProxy:
                 metadata=metadata,
             )
         if self.settings.writeback_path:
-            append_source_writeback(
-                Path(self.settings.writeback_path),
-                user_id=user_id,
-                user_text=user_text,
-                assistant_text=assistant_text,
-                model=model,
-            )
+            try:
+                await asyncio.to_thread(
+                    append_source_writeback,
+                    Path(self.settings.writeback_path),
+                    user_id=user_id,
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    model=model,
+                )
+            except OSError:
+                LOG.exception("Failed to append source writeback to %s", self.settings.writeback_path)
         self._count_cache = None
 
     async def stream_upstream_request(
