@@ -26,7 +26,7 @@ OPENAI_SNIPPET_CHAR_CAP = 500
 # so a caller can't smuggle user_id / metadata / routing fields past the schema
 # (additionalProperties:false is advisory; MCP servers must enforce it).
 OPENAI_ADD_MEMORY_FIELDS = ("text", "title", "topic", "source", "infer")
-OPENAI_ADD_IMAGE_FIELDS = ("caption", "image_base64", "mimetype", "title")
+OPENAI_ADD_IMAGE_FIELDS = ("caption", "image_base64", "source_url", "mimetype", "title")
 OPENAI_UPDATE_FIELDS = ("id", "text")
 
 
