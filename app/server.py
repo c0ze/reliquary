@@ -1422,9 +1422,19 @@ class Mem0ChatProxy:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
     @staticmethod
-    def mcp_tool_result(*, text: str, structured: dict[str, Any], is_error: bool = False) -> dict[str, Any]:
+    def mcp_tool_result(
+        *,
+        text: str,
+        structured: dict[str, Any],
+        is_error: bool = False,
+        image: tuple[str, str] | None = None,
+    ) -> dict[str, Any]:
+        content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        if image is not None:
+            data, mimetype = image
+            content.append({"type": "image", "data": data, "mimeType": mimetype})
         return {
-            "content": [{"type": "text", "text": text}],
+            "content": content,
             "structuredContent": structured,
             "isError": is_error,
         }
