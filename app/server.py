@@ -66,6 +66,7 @@ SERVER_WEBSITE_URL = "https://github.com/c0ze/reliquary"
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 ICON_SIZES = (16, 32, 64, 128, 256, 512)
 ICON_PATH_RE = re.compile(r"/icon-(?:%s)\.png" % "|".join(str(s) for s in ICON_SIZES))
+BLOB_PATH_RE = re.compile(r"/blobs/([0-9a-f]{64})\Z")
 _ASSET_CACHE: dict[str, bytes] = {}
 _SERVER_ICONS_CACHE: list[dict[str, Any]] = []
 
@@ -342,6 +343,11 @@ class Mem0ChatProxy:
                     await self.send_empty(send, 405, extra_headers={"allow": "POST"})
                     return
                 await self.handle_oauth_revoke(receive, send)
+                return
+
+            blob_match = BLOB_PATH_RE.fullmatch(path)
+            if method == "GET" and blob_match:
+                await self.handle_blob_get(blob_match.group(1), scope, send)
                 return
 
             profile = self.endpoint_profiles.get(path)
@@ -1366,6 +1372,10 @@ class Mem0ChatProxy:
             return True
         return origin in set(self.settings.mcp_allowed_origins)
 
+    def _signed_blob_url(self, blob_id: str) -> str:
+        exp, sig = self.blobs.sign(blob_id, self.settings.blob_url_ttl)
+        return f"/blobs/{blob_id}?exp={exp}&sig={sig}"
+
     def _require_claude_auth(self, headers: dict[str, str]) -> bool:
         """True only when the request carries the Claude endpoint's bearer (or a
         valid derived OAuth token for it). Used to gate the privileged HTTP
@@ -1760,6 +1770,32 @@ class Mem0ChatProxy:
         headers = [
             (b"content-type", content_type.encode("latin-1")),
             (b"cache-control", b"public, max-age=86400, immutable"),
+            (b"content-length", str(len(data)).encode("latin-1")),
+        ]
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": data, "more_body": False})
+
+    async def handle_blob_get(self, blob_id: str, scope: dict[str, Any], send) -> None:
+        # Authorize via a valid signed query OR the Claude bearer.
+        query = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"))
+        exp_raw = query.get("exp", [""])[0]
+        sig = query.get("sig", [""])[0]
+        authorized = False
+        try:
+            authorized = bool(sig) and self.blobs.verify(blob_id, int(exp_raw), sig)
+        except (TypeError, ValueError):
+            authorized = False
+        if not authorized and not self._require_claude_auth(decode_headers(scope)):
+            await self.send_json(send, 403, {"error": "Invalid or expired blob signature"})
+            return
+        result = self.blobs.get(blob_id)
+        if result is None:
+            await self.send_json(send, 404, {"error": f"No blob for id={blob_id}"})
+            return
+        data, mimetype = result
+        headers = [
+            (b"content-type", mimetype.encode("latin-1", "replace")),
+            (b"cache-control", b"private, max-age=86400"),
             (b"content-length", str(len(data)).encode("latin-1")),
         ]
         await send({"type": "http.response.start", "status": 200, "headers": headers})
