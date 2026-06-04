@@ -892,6 +892,22 @@ class Mem0ChatProxy:
                     "additionalProperties": False,
                 },
             },
+            {
+                "name": "delete_image",
+                "title": "Delete Image",
+                "description": "Delete an image you stored via add_image, by its memory_id. Removes the "
+                "caption memory and unlinks the blob when no other memory references it.",
+                "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "memory_id returned by add_image."},
+                        "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
+                    },
+                    "required": ["memory_id"],
+                    "additionalProperties": False,
+                },
+            },
         ]
 
     async def call_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -986,6 +1002,14 @@ class Mem0ChatProxy:
                         is_error=True,
                     )
                 return await self.handle_add_image_tool(arguments)
+            if tool_name == "delete_image":
+                if not profile.allow_write:
+                    return self.mcp_tool_result(
+                        text=f"Tool {tool_name} is not available on the {profile.name} endpoint.",
+                        structured={"error": "read_only_endpoint"},
+                        is_error=True,
+                    )
+                return await self.handle_delete_image_tool(arguments, allow_user_id=True)
         except Exception as exc:
             LOG.exception("MCP tool failed: %s", tool_name)
             return self.mcp_tool_result(
@@ -1275,6 +1299,56 @@ class Mem0ChatProxy:
             text=f"Image {blob_id} ({mimetype}, {len(data)} bytes). Download: {url}",
             structured={"blob_id": blob_id, "url": url, "mimetype": mimetype, "size": len(data)},
             image=(encoded, mimetype),
+        )
+
+    async def handle_delete_image_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
+        memory_id = str(arguments.get("memory_id") or "").strip()
+        if not memory_id:
+            return self.mcp_tool_result(
+                text="A non-empty `memory_id` is required.",
+                structured={"error": "missing_id"},
+                is_error=True,
+            )
+        effective_user_id = (
+            str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
+        )
+        existing = await self.fetch_live_memory(memory_id)
+        if existing is None:
+            return self.mcp_tool_result(
+                text=f"No deletable image found for memory_id={memory_id}.",
+                structured={"error": "not_found", "id": memory_id},
+                is_error=True,
+            )
+        if existing.get("user_id") != effective_user_id:
+            return self.mcp_tool_result(
+                text=f"No deletable image found for memory_id={memory_id} under user_id={effective_user_id}.",
+                structured={"error": "not_found", "id": memory_id},
+                is_error=True,
+            )
+        metadata = existing.get("metadata") or {}
+        if metadata.get("source_group") != "user-write":
+            return self.mcp_tool_result(
+                text=f"Refusing to delete memory_id={memory_id}: not a user-written memory.",
+                structured={"error": "protected_record", "id": memory_id},
+                is_error=True,
+            )
+        blob_ref = metadata.get("blob_ref")
+        if not blob_ref:
+            return self.mcp_tool_result(
+                text=f"memory_id={memory_id} is not an image (no blob_ref).",
+                structured={"error": "not_an_image", "id": memory_id},
+                is_error=True,
+            )
+        await self.delete_memory(memory_id)
+        unlinked = self.blobs.delete(str(blob_ref))
+        return self.mcp_tool_result(
+            text=f"Deleted image memory_id={memory_id} (blob_id={blob_ref}, blob_unlinked={bool(unlinked)}).",
+            structured={
+                "deleted": True,
+                "memory_id": memory_id,
+                "blob_id": blob_ref,
+                "blob_unlinked": bool(unlinked),
+            },
         )
 
     async def handle_delete_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
