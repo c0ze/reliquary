@@ -36,6 +36,7 @@ from helpers import (
     format_fetched_document,
     json_dumps,
     latest_user_text,
+    lean_add_image_args,
     lean_add_memory_args,
     normalize_base_url,
     normalize_token,
@@ -951,7 +952,7 @@ class Mem0ChatProxy:
                             structured={"error": "read_only_endpoint"},
                             is_error=True,
                         )
-                    return await self.handle_add_image_tool(arguments)
+                    return await self.handle_add_image_tool(lean_add_image_args(arguments))
                 return self.mcp_tool_result(
                     text=f"Unknown tool: {tool_name}",
                     structured={"error": "unknown_tool"},
@@ -1216,6 +1217,14 @@ class Mem0ChatProxy:
                 structured={"error": "missing_image"},
                 is_error=True,
             )
+        raw_metadata = arguments.get("metadata") or {}
+        if not isinstance(raw_metadata, dict):
+            return self.mcp_tool_result(
+                text="`metadata` must be an object.",
+                structured={"error": "invalid_metadata"},
+                is_error=True,
+            )
+        metadata = dict(raw_metadata)
         try:
             data = base64.b64decode(image_b64, validate=True)
         except (ValueError, base64.binascii.Error):
@@ -1240,13 +1249,6 @@ class Mem0ChatProxy:
             )
 
         user_id = str(arguments.get("user_id") or self.settings.user_id)
-        metadata = arguments.get("metadata") or {}
-        if not isinstance(metadata, dict):
-            return self.mcp_tool_result(
-                text="`metadata` must be an object.",
-                structured={"error": "invalid_metadata"},
-                is_error=True,
-            )
         metadata.setdefault("source", "mcp")
         metadata["kind"] = "image"
         metadata["source_group"] = "user-write"
@@ -1261,6 +1263,13 @@ class Mem0ChatProxy:
         result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)
         new_ids = added_memory_ids(result)
         memory_id = new_ids[0] if new_ids else None
+        if memory_id is None:
+            self.blobs.delete(info.id)
+            return self.mcp_tool_result(
+                text="Stored the blob but failed to create its caption memory; rolled back.",
+                structured={"error": "memory_write_failed", "blob_id": info.id},
+                is_error=True,
+            )
         url = self._signed_blob_url(info.id)
         return self.mcp_tool_result(
             text=f"Stored image (blob_id={info.id}, memory_id={memory_id}): {trim_text(caption, 160)}",
