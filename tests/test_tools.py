@@ -176,7 +176,6 @@ def test_update_cannot_forge_blob_ref(proxy):
     assert not update_result["isError"]
 
     # The stored record must still have the original blob_ref and kind == "image"
-    from tests.conftest import FakeMemory  # noqa: F401  (already imported via fixture)
     rec = proxy.memory.get(memory_id)
     assert rec is not None
     metadata = rec["metadata"]

@@ -132,3 +132,71 @@ def test_search_memories_overfetches_before_quality_limit(proxy, monkeypatch):
 
     assert captured_limits[0] > 2
     assert [hit["id"] for hit in result] == ["dup-new", "distinct"]
+
+
+def test_search_memories_lexical_fallback_finds_user_write(proxy, fake_memory, monkeypatch):
+    fake_memory._store["image-1"] = {
+        "id": "image-1",
+        "memory": "ARDA-CODEX-IMAGE-TEMP exact handoff image caption",
+        "metadata": {"source_group": "user-write", "kind": "image"},
+        "user_id": "my_lord",
+    }
+
+    def fake_search(query, **kwargs):
+        return {
+            "results": [
+                {
+                    "id": "unrelated",
+                    "memory": "An unrelated high vector score result.",
+                    "metadata": {},
+                    "user_id": "my_lord",
+                    "score": 0.99,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(proxy.memory, "search", fake_search)
+
+    result = run(
+        proxy.search_memories(
+            "ARDA-CODEX-IMAGE-TEMP",
+            user_id="my_lord",
+            limit=1,
+            threshold=None,
+            filters=None,
+        )
+    )
+
+    assert [hit["id"] for hit in result] == ["image-1"]
+
+
+def test_search_memories_lexical_fallback_honors_filters(proxy, fake_memory, monkeypatch):
+    fake_memory._store["dev-note"] = {
+        "id": "dev-note",
+        "memory": "ARDA-FILTER-TOKEN belongs in dev",
+        "metadata": {"source_group": "user-write", "domain": "dev"},
+        "user_id": "my_lord",
+    }
+    fake_memory._store["infra-note"] = {
+        "id": "infra-note",
+        "memory": "ARDA-FILTER-TOKEN belongs in infra",
+        "metadata": {"source_group": "user-write", "domain": "infra"},
+        "user_id": "my_lord",
+    }
+
+    def fake_search(query, **kwargs):
+        return {"results": []}
+
+    monkeypatch.setattr(proxy.memory, "search", fake_search)
+
+    result = run(
+        proxy.search_memories(
+            "ARDA-FILTER-TOKEN",
+            user_id="my_lord",
+            limit=3,
+            threshold=None,
+            filters={"domain": "infra"},
+        )
+    )
+
+    assert [hit["id"] for hit in result] == ["infra-note"]
