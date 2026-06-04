@@ -1415,6 +1415,9 @@ class Mem0ChatProxy:
         }
 
     def _document_url(self, record_id: str, metadata: dict[str, Any]) -> str:
+        blob_ref = metadata.get("blob_ref")
+        if isinstance(blob_ref, str) and blob_ref:
+            return self._signed_blob_url(blob_ref)
         source_url = metadata.get("source_url")
         if isinstance(source_url, str) and source_url.startswith(("http://", "https://")):
             return source_url
