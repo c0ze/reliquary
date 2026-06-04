@@ -2,9 +2,92 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+from typing import Any
+
+
+IMPORT_BOOKKEEPING_KEYS = {"import_record_id", "import_content_hash", "source_group"}
+
+
+def _clean_import_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in metadata.items() if key not in IMPORT_BOOKKEEPING_KEYS}
+
+
+def record_content_hash(item: dict[str, Any]) -> str:
+    payload = {
+        "text": item.get("text") or "",
+        "metadata": _clean_import_metadata(dict(item.get("metadata") or {})),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def import_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(item["metadata"])
+    metadata["import_record_id"] = item["id"]
+    metadata["import_content_hash"] = record_content_hash(item)
+    metadata["source_group"] = "imported"
+    return metadata
+
+
+def _memory_results(result: Any) -> list[dict[str, Any]]:
+    if isinstance(result, dict):
+        hits = result.get("results")
+        return hits if isinstance(hits, list) else []
+    return result if isinstance(result, list) else []
+
+
+def existing_import_index(memory: Any, *, user_id: str) -> dict[str, dict[str, Any]]:
+    if not hasattr(memory, "get_all"):
+        return {}
+    result = memory.get_all(user_id=user_id)
+    index: dict[str, dict[str, Any]] = {}
+    for hit in _memory_results(result):
+        metadata = hit.get("metadata") or {}
+        import_id = metadata.get("import_record_id")
+        memory_id = hit.get("id")
+        if not import_id or not memory_id:
+            continue
+        content_hash = metadata.get("import_content_hash")
+        if not content_hash:
+            content_hash = record_content_hash({
+                "id": import_id,
+                "text": hit.get("memory") or "",
+                "metadata": metadata,
+            })
+        index[str(import_id)] = {"id": str(memory_id), "content_hash": str(content_hash)}
+    return index
+
+
+def ingest_records(
+    memory: Any,
+    records: list[dict[str, Any]],
+    *,
+    user_id: str,
+    infer: bool = False,
+    incremental: bool = False,
+) -> dict[str, int]:
+    existing = existing_import_index(memory, user_id=user_id) if incremental else {}
+    summary = {"selected": len(records), "added": 0, "updated": 0, "skipped": 0}
+
+    for item in records:
+        metadata = import_metadata(item)
+        current_hash = metadata["import_content_hash"]
+        previous = existing.get(str(item["id"]))
+        if previous and previous["content_hash"] == current_hash:
+            summary["skipped"] += 1
+            continue
+        if previous and hasattr(memory, "update"):
+            memory.update(previous["id"], item["text"], metadata)
+            summary["updated"] += 1
+            continue
+        memory.add(item["text"], user_id=user_id, metadata=metadata, infer=infer)
+        summary["added"] += 1
+
+    return summary
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -160,6 +243,11 @@ def main() -> None:
     parser.add_argument("--limit", type=non_negative_int, default=None, help="Only ingest the first N unique records.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be imported without calling Mem0.")
     parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Skip unchanged records and update changed records by stable JSONL id.",
+    )
+    parser.add_argument(
         "--infer",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -206,12 +294,18 @@ def main() -> None:
 
     config = load_config(args.config)
     memory = Memory.from_config(config)
-    for index, item in enumerate(ordered, start=1):
-        metadata = dict(item["metadata"])
-        metadata["import_record_id"] = item["id"]
-        memory.add(item["text"], user_id=args.user_id, metadata=metadata, infer=args.infer)
-        title = metadata.get("title", "<untitled>")
-        print(f"[{index}/{len(ordered)}] Imported: {title}")
+    summary = ingest_records(
+        memory,
+        ordered,
+        user_id=args.user_id,
+        infer=args.infer,
+        incremental=args.incremental,
+    )
+    print(
+        "Ingest complete: "
+        f"{summary['added']} added, {summary['updated']} updated, "
+        f"{summary['skipped']} skipped, {summary['selected']} selected."
+    )
 
 
 if __name__ == "__main__":

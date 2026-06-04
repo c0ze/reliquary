@@ -147,8 +147,15 @@ Run `python app/server.py --help` for the full flag list.
 python app/ingest.py path/to/corpus.jsonl --config config.yaml --user-id default
 ```
 
+For re-runs, add `--incremental` to skip unchanged JSONL records by stable `id`
+and update records whose text or metadata changed.
+
 `metadata.title` is used as the result title; `domain`/`hall`/`room`/`topic`
 enable routing; any `source_url`/`source_ref` becomes the document URL.
+
+Agent write-back is opt-in. `--writeback` stores successful chat turns in Mem0;
+add `--writeback-path /path/to/Agent.md` (or `MEM0_WRITEBACK_PATH`) to also
+append those turns to a Markdown note, such as an Obsidian inbox.
 
 Building the JSONL from your own notes is up to you.
 [`examples/obsidian_to_jsonl.py`](examples/obsidian_to_jsonl.py) is a runnable
