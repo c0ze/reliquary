@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from retrieval_quality import apply_retrieval_quality
+from retrieval_quality import apply_retrieval_quality, retrieval_candidate_limit
 
 
 def run(coro):
@@ -84,6 +84,11 @@ def test_quality_pass_reranks_lexically_stronger_hits_without_overriding_large_s
     result = apply_retrieval_quality("Bob hiking Kamakura", hits, limit=3, now=1_780_000_000)
 
     assert [hit["id"] for hit in result] == ["much-better-vector", "specific", "broad"]
+
+
+def test_candidate_limit_never_under_fetches_requested_limit():
+    assert retrieval_candidate_limit(2) > 2
+    assert retrieval_candidate_limit(61) >= 61
 
 
 def test_search_memories_overfetches_before_quality_limit(proxy, monkeypatch):

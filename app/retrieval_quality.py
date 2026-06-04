@@ -40,7 +40,10 @@ _STOPWORDS = {
 
 def retrieval_candidate_limit(limit: int) -> int:
     """Return how many raw vector candidates to request before quality filtering."""
-    return min(50, max(limit * 4, limit + 8))
+    if limit <= 0:
+        return 0
+    overfetch = min(50, max(limit * 4, limit + 8))
+    return max(limit, overfetch)
 
 
 def apply_retrieval_quality(
