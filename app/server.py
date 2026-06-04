@@ -695,6 +695,18 @@ class Mem0ChatProxy:
                         "additionalProperties": False,
                     },
                 },
+                {
+                    "name": "fetch_image",
+                    "title": "Fetch Image",
+                    "description": "Fetch a stored binary file by blob_id; returns it inline plus a signed url.",
+                    "annotations": read_only,
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string", "description": "blob_id from search results."}},
+                        "required": ["id"],
+                        "additionalProperties": False,
+                    },
+                },
             ]
             if profile.allow_write:
                 tools.append(
@@ -867,6 +879,19 @@ class Mem0ChatProxy:
                     "additionalProperties": False,
                 },
             },
+            {
+                "name": "fetch_image",
+                "title": "Fetch Image",
+                "description": "Fetch a stored binary file by blob_id. Returns the image inline plus a "
+                "signed url for direct download of large files.",
+                "annotations": {"readOnlyHint": True, "openWorldHint": False},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string", "description": "blob_id from add_image or mem0_search."}},
+                    "required": ["id"],
+                    "additionalProperties": False,
+                },
+            },
         ]
 
     async def call_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -883,6 +908,8 @@ class Mem0ChatProxy:
                     )
                 if tool_name == "fetch":
                     return await self.handle_fetch_tool(arguments)
+                if tool_name == "fetch_image":
+                    return await self.handle_fetch_image_tool(arguments)
                 if tool_name == "add_memory":
                     if not profile.allow_write:
                         return self.mcp_tool_result(
@@ -933,6 +960,8 @@ class Mem0ChatProxy:
                 return await self.handle_search_tool(arguments)
             if tool_name == "mem0_fetch":
                 return await self.handle_fetch_tool(arguments)
+            if tool_name == "fetch_image":
+                return await self.handle_fetch_image_tool(arguments)
             if tool_name == "mem0_add_memory":
                 if not profile.allow_write:
                     return self.mcp_tool_result(
@@ -1219,6 +1248,33 @@ class Mem0ChatProxy:
                 "size": info.size,
                 "user_id": user_id,
             },
+        )
+
+    async def handle_fetch_image_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        blob_id = str(arguments.get("id") or "").strip()
+        if not blob_id:
+            return self.mcp_tool_result(
+                text="A non-empty `id` is required.",
+                structured={"error": "missing_id"},
+                is_error=True,
+            )
+        try:
+            result = self.blobs.get(blob_id)
+        except ValueError:
+            result = None
+        if result is None:
+            return self.mcp_tool_result(
+                text=f"No blob found for id={blob_id}.",
+                structured={"error": "not_found", "id": blob_id},
+                is_error=True,
+            )
+        data, mimetype = result
+        encoded = base64.b64encode(data).decode("ascii")
+        url = self._signed_blob_url(blob_id)
+        return self.mcp_tool_result(
+            text=f"Image {blob_id} ({mimetype}, {len(data)} bytes). Download: {url}",
+            structured={"blob_id": blob_id, "url": url, "mimetype": mimetype, "size": len(data)},
+            image=(encoded, mimetype),
         )
 
     async def handle_delete_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
