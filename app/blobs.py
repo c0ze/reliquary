@@ -197,15 +197,20 @@ class BlobStore:
         Returns ``None`` if unknown, ``True`` if the blob was unlinked, ``False``
         if it was only decremented (still referenced).
 
-        If ``owner`` is provided and present in ``info.owners``, it is removed
-        before the ref_count logic runs. The ref_count still drives unlinking.
+        An owner-scoped delete is authoritative: if ``owner`` is provided but is
+        not a registered owner, nothing is decremented (returns ``False``). This
+        stops a duplicate/forged delete from double-decrementing a blob that is
+        still owned by another memory. Otherwise the owner is removed and the
+        ref_count drives unlinking.
         """
         _validate_blob_id(blob_id)
         with _STORE_LOCK:
             info = self.info(blob_id)
             if info is None:
                 return None
-            if owner is not None and owner in info.owners:
+            if owner is not None:
+                if owner not in info.owners:
+                    return False
                 info.owners.remove(owner)
             info.ref_count -= 1
             if info.ref_count > 0:

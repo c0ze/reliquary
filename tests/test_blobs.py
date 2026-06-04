@@ -129,3 +129,15 @@ def test_delete_with_owner_tracks_owners_and_unlinks_last(tmp_path):
     assert store.get(info.id) is not None
     assert store.delete(info.id, owner="mem-2") is True    # ref 0 -> unlink
     assert store.get(info.id) is None
+
+
+def test_delete_owner_mismatch_does_not_decrement(tmp_path):
+    store = make_store(tmp_path)
+    info = store.put(PNG)
+    store.register_owner(info.id, "mem-1")  # ref_count 1, owners {mem-1}
+    # A non-owner (e.g. forged blob_ref, or a duplicate concurrent delete) must
+    # not decrement ref_count or unlink the blob.
+    assert store.delete(info.id, owner="not-an-owner") is False
+    assert store.get(info.id) is not None
+    assert store.info(info.id).ref_count == 1
+    assert store.is_owner(info.id, "mem-1") is True

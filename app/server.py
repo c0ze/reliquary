@@ -1301,7 +1301,26 @@ class Mem0ChatProxy:
                 structured={"error": "memory_write_failed", "blob_id": info.id},
                 is_error=True,
             )
-        self.blobs.register_owner(info.id, memory_id)
+        try:
+            self.blobs.register_owner(info.id, memory_id)
+        except Exception:
+            # Ownership is what makes the blob deletable later; if we can't record
+            # it, don't leave a memory/blob pair that delete_image can never clean.
+            LOG.exception(
+                "Failed to register blob owner blob_id=%s memory_id=%s; rolling back",
+                info.id,
+                memory_id,
+            )
+            try:
+                await self.delete_memory(memory_id)
+            except Exception:
+                LOG.exception("Rollback delete_memory failed for memory_id=%s", memory_id)
+            self.blobs.delete(info.id)
+            return self.mcp_tool_result(
+                text="Failed to finalize image ownership; rolled back.",
+                structured={"error": "ownership_registration_failed", "blob_id": info.id, "memory_id": memory_id},
+                is_error=True,
+            )
         url = self._signed_blob_url(info.id)
         return self.mcp_tool_result(
             text=f"Stored image (blob_id={info.id}, memory_id={memory_id}): {trim_text(caption, 160)}",
