@@ -1,0 +1,184 @@
+"""Integration tests: MCP tool handlers against the in-memory FakeMemory backend."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+# --------------------------------------------------------------------------- #
+# 1. CRUD text flow
+# --------------------------------------------------------------------------- #
+
+def test_add_memory_returns_id(proxy):
+    result = run(proxy.handle_add_memory_tool({"text": "Alice likes tea"}))
+    assert not result["isError"]
+    ids = result["structuredContent"]["ids"]
+    assert len(ids) == 1
+    assert ids[0].startswith("fake-")
+
+
+def test_search_finds_added_memory(proxy):
+    run(proxy.handle_add_memory_tool({"text": "Bob enjoys hiking"}))
+    result = run(proxy.handle_search_tool({"query": "Bob"}))
+    assert not result["isError"]
+    sc = result["structuredContent"]
+    assert sc["results"]
+    texts = [r["text"] for r in sc["results"]]
+    assert any("Bob" in t for t in texts)
+
+
+def test_fetch_returns_text(proxy):
+    add_result = run(proxy.handle_add_memory_tool({"text": "Carol plays chess"}))
+    mid = add_result["structuredContent"]["ids"][0]
+    fetch_result = run(proxy.handle_fetch_tool({"id": mid}))
+    assert not fetch_result["isError"]
+    sc = fetch_result["structuredContent"]
+    assert sc["text"] == "Carol plays chess"
+
+
+def test_update_changes_text(proxy):
+    add_result = run(proxy.handle_add_memory_tool({"text": "Dave reads novels"}))
+    mid = add_result["structuredContent"]["ids"][0]
+    update_result = run(proxy.handle_update_tool({"id": mid, "text": "Dave reads comics"}, allow_user_id=True))
+    assert not update_result["isError"]
+    fetch_result = run(proxy.handle_fetch_tool({"id": mid}))
+    assert not fetch_result["isError"]
+    assert fetch_result["structuredContent"]["text"] == "Dave reads comics"
+
+
+def test_delete_removes_memory(proxy):
+    add_result = run(proxy.handle_add_memory_tool({"text": "Eve writes code"}))
+    mid = add_result["structuredContent"]["ids"][0]
+    del_result = run(proxy.handle_delete_tool({"id": mid}, allow_user_id=True))
+    assert not del_result["isError"]
+    assert del_result["structuredContent"]["deleted"] is True
+    # Fetch should now return not_found
+    fetch_result = run(proxy.handle_fetch_tool({"id": mid}))
+    assert fetch_result["isError"]
+    assert fetch_result["structuredContent"]["error"] == "not_found"
+
+
+# --------------------------------------------------------------------------- #
+# 2. Corpus protection
+# --------------------------------------------------------------------------- #
+
+def test_delete_refuses_protected_record(proxy, fake_memory):
+    # Seed a record that looks like an imported corpus entry (source_group != "user-write")
+    fake_memory._store["corpus-1"] = {
+        "id": "corpus-1",
+        "memory": "Corpus record content",
+        "metadata": {"source_group": "imported", "kind": "article"},
+        "user_id": "my_lord",
+    }
+    result = run(proxy.handle_delete_tool({"id": "corpus-1"}, allow_user_id=True))
+    assert result["isError"]
+    assert result["structuredContent"]["error"] == "protected_record"
+
+
+def test_update_refuses_protected_record(proxy, fake_memory):
+    fake_memory._store["corpus-2"] = {
+        "id": "corpus-2",
+        "memory": "Another corpus record",
+        "metadata": {"source_group": "imported", "kind": "article"},
+        "user_id": "my_lord",
+    }
+    result = run(proxy.handle_update_tool({"id": "corpus-2", "text": "changed"}, allow_user_id=True))
+    assert result["isError"]
+    assert result["structuredContent"]["error"] == "protected_record"
+
+
+# --------------------------------------------------------------------------- #
+# 3. Image flow
+# --------------------------------------------------------------------------- #
+
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+_PNG_B64 = base64.b64encode(_PNG_BYTES).decode("ascii")
+
+
+def test_add_image_returns_ids(proxy):
+    result = run(proxy.handle_add_image_tool({
+        "caption": "A test PNG image",
+        "image_base64": _PNG_B64,
+    }))
+    assert not result["isError"], result
+    sc = result["structuredContent"]
+    assert "blob_id" in sc
+    assert "memory_id" in sc
+    assert "url" in sc
+
+
+def test_fetch_image_returns_image_block(proxy):
+    add_result = run(proxy.handle_add_image_tool({
+        "caption": "Fetchable image",
+        "image_base64": _PNG_B64,
+    }))
+    assert not add_result["isError"]
+    blob_id = add_result["structuredContent"]["blob_id"]
+    fetch_result = run(proxy.handle_fetch_image_tool({"id": blob_id}))
+    assert not fetch_result["isError"]
+    content_types = [block["type"] for block in fetch_result["content"]]
+    assert "image" in content_types
+
+
+def test_search_finds_image_caption(proxy):
+    run(proxy.handle_add_image_tool({
+        "caption": "Searchable sunset photo",
+        "image_base64": _PNG_B64,
+    }))
+    result = run(proxy.handle_search_tool({"query": "sunset photo"}))
+    assert not result["isError"]
+    texts = [r["text"] for r in result["structuredContent"]["results"]]
+    assert any("sunset" in t.lower() for t in texts)
+
+
+def test_delete_image_succeeds(proxy):
+    add_result = run(proxy.handle_add_image_tool({
+        "caption": "Deletable image",
+        "image_base64": _PNG_B64,
+    }))
+    assert not add_result["isError"]
+    sc = add_result["structuredContent"]
+    memory_id = sc["memory_id"]
+    blob_id = sc["blob_id"]
+    del_result = run(proxy.handle_delete_image_tool({"memory_id": memory_id}, allow_user_id=True))
+    assert not del_result["isError"]
+    assert del_result["structuredContent"]["deleted"] is True
+    # fetch_image should now be not_found
+    fetch_result = run(proxy.handle_fetch_image_tool({"id": blob_id}))
+    assert fetch_result["isError"]
+    assert fetch_result["structuredContent"]["error"] == "not_found"
+
+
+# --------------------------------------------------------------------------- #
+# 4. Update cannot forge image metadata
+# --------------------------------------------------------------------------- #
+
+def test_update_cannot_forge_blob_ref(proxy):
+    add_result = run(proxy.handle_add_image_tool({
+        "caption": "Original image caption",
+        "image_base64": _PNG_B64,
+    }))
+    assert not add_result["isError"]
+    sc = add_result["structuredContent"]
+    memory_id = sc["memory_id"]
+    original_blob_ref = sc["blob_id"]
+
+    # Try to overwrite system-managed keys via update
+    update_result = run(proxy.handle_update_tool(
+        {"id": memory_id, "text": "Updated caption", "metadata": {"blob_ref": "deadbeef", "kind": "note"}},
+        allow_user_id=True,
+    ))
+    assert not update_result["isError"]
+
+    # The stored record must still have the original blob_ref and kind == "image"
+    from tests.conftest import FakeMemory  # noqa: F401  (already imported via fixture)
+    rec = proxy.memory.get(memory_id)
+    assert rec is not None
+    metadata = rec["metadata"]
+    assert metadata.get("blob_ref") == original_blob_ref, "blob_ref must not be overwritten"
+    assert metadata.get("kind") == "image", "kind must not be overwritten"
