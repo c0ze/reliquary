@@ -1301,6 +1301,7 @@ class Mem0ChatProxy:
                 structured={"error": "memory_write_failed", "blob_id": info.id},
                 is_error=True,
             )
+        self.blobs.register_owner(info.id, memory_id)
         url = self._signed_blob_url(info.id)
         return self.mcp_tool_result(
             text=f"Stored image (blob_id={info.id}, memory_id={memory_id}): {trim_text(caption, 160)}",
@@ -1372,21 +1373,15 @@ class Mem0ChatProxy:
                 structured={"error": "protected_record", "id": memory_id},
                 is_error=True,
             )
-        # Require both the image kind and a blob_ref. This is the marker add_image
-        # stamps; it guards against decref'ing a live blob via a plain note that
-        # merely carries a (forged) blob_ref in caller-supplied metadata. Note: a
-        # caller forging BOTH kind="image" and blob_ref via mem0_add_memory can
-        # still target a blob — acceptable in this single-user store, but see the
-        # follow-up on an authoritative memory<->blob registration.
         blob_ref = metadata.get("blob_ref")
-        if metadata.get("kind") != "image" or not blob_ref:
+        if metadata.get("kind") != "image" or not blob_ref or not self.blobs.is_owner(str(blob_ref), memory_id):
             return self.mcp_tool_result(
-                text=f"memory_id={memory_id} is not an image (no image blob_ref).",
+                text=f"memory_id={memory_id} is not a deletable image (no owned blob).",
                 structured={"error": "not_an_image", "id": memory_id},
                 is_error=True,
             )
         await self.delete_memory(memory_id)
-        unlinked = self.blobs.delete(str(blob_ref))
+        unlinked = self.blobs.delete(str(blob_ref), owner=memory_id)
         return self.mcp_tool_result(
             text=f"Deleted image memory_id={memory_id} (blob_id={blob_ref}, blob_unlinked={bool(unlinked)}).",
             structured={

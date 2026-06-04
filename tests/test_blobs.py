@@ -96,3 +96,36 @@ def test_size_cap(tmp_path):
     # 0 disables the cap.
     nolimit = make_store(tmp_path, max_bytes=0)
     assert nolimit.put(b"too many bytes").size == 14
+
+
+def test_register_owner_and_is_owner(tmp_path):
+    store = make_store(tmp_path)
+    info = store.put(PNG)
+    store.register_owner(info.id, "mem-1")
+    store.register_owner(info.id, "mem-1")  # idempotent
+    store.register_owner(info.id, "mem-2")
+    assert store.is_owner(info.id, "mem-1") is True
+    assert store.is_owner(info.id, "mem-2") is True
+    assert store.is_owner(info.id, "mem-x") is False
+    assert sorted(store.info(info.id).owners) == ["mem-1", "mem-2"]
+
+
+def test_is_owner_false_for_unknown_blob(tmp_path):
+    store = make_store(tmp_path)
+    # 64-hex but absent
+    assert store.is_owner("a" * 64, "mem-1") is False
+
+
+def test_delete_with_owner_tracks_owners_and_unlinks_last(tmp_path):
+    store = make_store(tmp_path)
+    # Two add_image-style cycles for the SAME bytes: two puts (ref_count=2),
+    # two distinct owners.
+    info = store.put(PNG)
+    store.register_owner(info.id, "mem-1")
+    store.put(PNG)
+    store.register_owner(info.id, "mem-2")
+    assert store.delete(info.id, owner="mem-1") is False  # ref 1, owners {mem-2}
+    assert store.is_owner(info.id, "mem-1") is False
+    assert store.get(info.id) is not None
+    assert store.delete(info.id, owner="mem-2") is True    # ref 0 -> unlink
+    assert store.get(info.id) is None

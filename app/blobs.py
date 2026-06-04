@@ -20,7 +20,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 _BLOB_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_BLOB_ID_RE = re.compile(r"^[0-9a-zA-Z_\-]+$")
@@ -51,6 +51,7 @@ class BlobInfo:
     ext: str
     ref_count: int
     created: float
+    owners: list[str] = field(default_factory=list)
 
 
 # (signature, mimetype, extension). RIFF/WEBP is special-cased in sniff_mimetype.
@@ -169,17 +170,43 @@ class BlobStore:
         except FileNotFoundError:
             return None
 
-    def delete(self, blob_id: str) -> bool | None:
+    def register_owner(self, blob_id: str, memory_id: str) -> None:
+        """Record that ``memory_id`` is an authoritative owner of ``blob_id``.
+
+        Idempotent: registering the same owner twice is a no-op. Silently
+        returns if the blob is unknown (already deleted).
+        """
+        _validate_blob_id(blob_id)
+        with _STORE_LOCK:
+            info = self.info(blob_id)
+            if info is None:
+                return
+            if memory_id not in info.owners:
+                info.owners.append(memory_id)
+                self._write_sidecar(info)
+
+    def is_owner(self, blob_id: str, memory_id: str) -> bool:
+        """Return ``True`` iff ``memory_id`` is a registered owner of ``blob_id``."""
+        _validate_blob_id(blob_id)
+        info = self.info(blob_id)
+        return bool(info and memory_id in info.owners)
+
+    def delete(self, blob_id: str, *, owner: str | None = None) -> bool | None:
         """Decrement the ref count; unlink bytes + sidecar when it reaches zero.
 
         Returns ``None`` if unknown, ``True`` if the blob was unlinked, ``False``
         if it was only decremented (still referenced).
+
+        If ``owner`` is provided and present in ``info.owners``, it is removed
+        before the ref_count logic runs. The ref_count still drives unlinking.
         """
         _validate_blob_id(blob_id)
         with _STORE_LOCK:
             info = self.info(blob_id)
             if info is None:
                 return None
+            if owner is not None and owner in info.owners:
+                info.owners.remove(owner)
             info.ref_count -= 1
             if info.ref_count > 0:
                 self._write_sidecar(info)
