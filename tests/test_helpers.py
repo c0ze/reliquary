@@ -11,6 +11,7 @@ from helpers import (  # noqa: E402
     added_memory_ids,
     coerce_threshold,
     decode_headers,
+    decode_image_payload,
     extract_assistant_text_from_response,
     extract_text_content,
     extract_text_from_stream_event,
@@ -177,6 +178,41 @@ def test_added_memory_ids():
     assert added_memory_ids({"results": [123, {"id": "ok"}]}) == ["ok"]  # non-dict item skipped
     assert added_memory_ids("nope") == []
     assert added_memory_ids({}) == []
+
+
+def test_decode_image_payload_clean():
+    import base64
+    raw = b"\x89PNG\r\n\x1a\n" + bytes(range(200))
+    assert decode_image_payload(base64.b64encode(raw).decode()) == raw
+
+
+def test_decode_image_payload_line_wrapped():
+    import base64
+    raw = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 8
+    clean = base64.b64encode(raw).decode()
+    wrapped = "\n".join(clean[i:i + 76] for i in range(0, len(clean), 76))
+    assert decode_image_payload(wrapped) == raw
+
+
+def test_decode_image_payload_data_uri():
+    import base64
+    raw = b"\x89PNG\r\n\x1a\n" + b"abc123"
+    uri = "data:image/png;base64," + base64.b64encode(raw).decode()
+    assert decode_image_payload(uri) == raw
+
+
+def test_decode_image_payload_urlsafe_and_unpadded():
+    import base64
+    raw = bytes(range(0, 255, 3)) + b"\xff\xfe"  # produces +// chars in std alphabet
+    safe = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    assert decode_image_payload(safe) == raw
+
+
+def test_decode_image_payload_rejects_garbage_and_empty():
+    import pytest
+    for bad in ("", "   ", "not base64!!!@@@", "data:image/png;base64"):
+        with pytest.raises(ValueError):
+            decode_image_payload(bad)
 
 
 if __name__ == "__main__":
