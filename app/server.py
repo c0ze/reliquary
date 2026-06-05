@@ -1434,27 +1434,30 @@ class Mem0ChatProxy:
         )
 
         routes = self.catalog.build_routes(query) if self.catalog else [_GlobalRoute()]
-        results: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
         result_cap = offset + limit + 1
 
+        # Collect candidates from every route, deduping by id but keeping the
+        # highest-scoring copy: an early domain route may match a record weakly
+        # while the global route matches the same record strongly (e.g. an exact
+        # lexical hit at score ~2.0). Route priority must not shadow the better copy.
+        by_key: dict[str, dict[str, Any]] = {}
         for route in routes:
             hits = await self.search_memories(
                 query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters
             )
             for hit in hits:
                 enriched = self._enrich_hit(hit, route=route.description)
-                result_id = enriched.get("id") or enriched.get("url") or enriched.get("title")
-                key = str(result_id)
-                if key in seen_ids:
-                    continue
-                seen_ids.add(key)
-                results.append(enriched)
-                if len(results) >= result_cap:
-                    break
-            if len(results) >= result_cap:
-                break
+                key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
+                existing = by_key.get(key)
+                if existing is None or self._numeric_score(enriched.get("score")) > self._numeric_score(existing.get("score")):
+                    by_key[key] = enriched
 
+        # Order by relevance score across ALL routes, not by route priority, so the
+        # best hit (e.g. an exact lexical match) ranks first wherever it came from.
+        results = sorted(
+            by_key.values(),
+            key=lambda item: (-self._numeric_score(item.get("score")), str(item.get("id") or "")),
+        )
         next_cursor = str(offset + limit) if len(results) > offset + limit else None
         results = results[offset:offset + limit]
         lines = [f"Search for {query!r} returned {len(results)} result(s)."]
