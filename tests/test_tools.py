@@ -276,3 +276,40 @@ def test_add_image_url_ingest_disabled(proxy):
         assert result["structuredContent"]["error"] == "url_ingest_disabled"
     finally:
         proxy.settings.image_url_ingest = True
+
+
+def test_exact_marker_ranks_first_across_routes(proxy, fake_memory):
+    """An exact-token match from the global route must outrank domain-routed
+    vector hits, even though domain routes are processed first (issue #33)."""
+    import types
+
+    from server import _GlobalRoute
+
+    # Noise first so insertion order alone would NOT put the marker on top.
+    for i in range(4):
+        fake_memory.add(f"unrelated dev note about images {i}", user_id="my_lord",
+                        metadata={"source_group": "imported", "domain": "dev"})
+    marker = "RELIQUARY-EXACT-MARKER-ABC-20260605"
+    fake_memory.add(f"{marker} persistent handoff note", user_id="my_lord",
+                    metadata={"source_group": "user-write"})
+    for i in range(4):
+        fake_memory.add(f"more dev notes {i}", user_id="my_lord",
+                        metadata={"source_group": "imported", "domain": "dev"})
+
+    # Route the query to a domain first, then global (mirrors production routing).
+    cat = types.SimpleNamespace()
+    cat.routeable_domains = ["dev"]
+    cat.records_by_id = {}
+    cat.build_routes = lambda q: [
+        types.SimpleNamespace(description="domain=dev", filters={"domain": "dev"}),
+        _GlobalRoute(),
+    ]
+    proxy.catalog = cat
+
+    claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    res = run(proxy.call_mcp_tool(claude, "mem0_search", {"query": marker, "limit": 5}, can_write=False))
+    results = res["structuredContent"]["results"]
+    assert results, "expected search results"
+    top = results[0]
+    assert marker in (top.get("text") or ""), f"exact marker not ranked #1: {top.get('text')!r}"
+    assert top.get("score") and top["score"] >= 2.0
