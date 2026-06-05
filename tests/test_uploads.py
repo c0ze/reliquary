@@ -7,6 +7,8 @@ import re
 
 import httpx
 
+from server import PendingUpload
+
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 
@@ -300,6 +302,36 @@ def test_upload_rejects_bearer_for_a_different_endpoint(proxy):
 
         assert resp.status_code == 401
         assert proxy.pending_uploads[upload_id].blob_id is None
+
+    run(scenario())
+
+
+def test_cleanup_preserves_committed_blob(proxy):
+    """A stale pending slot left behind after a successful commit (e.g. a crash
+    before the slot was dropped) must NOT delete the committed memory's blob when
+    it is later reaped — only truly orphaned (uncommitted) blobs are reclaimed."""
+    async def scenario():
+        profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+        create = await proxy.call_mcp_tool(
+            profile, "create_image_upload", {"mimetype": "image/png"}, can_write=True
+        )
+        upload_id = create["structuredContent"]["upload_id"]
+        up = await _post_bytes(proxy, upload_id)
+        blob_id = up.json()["blob_id"]
+
+        commit = await proxy.call_mcp_tool(
+            profile, "commit_image_upload", {"upload_id": upload_id, "caption": "kept"}, can_write=True
+        )
+        assert commit["isError"] is False
+
+        # Simulate a crash that left the (already committed) slot behind, now expired.
+        proxy.pending_uploads[upload_id] = PendingUpload(
+            id=upload_id, created_at=0.0, expires_at=1.0, blob_id=blob_id, profile="claude"
+        )
+        proxy._cleanup_expired_uploads()
+
+        # The committed memory still owns the blob, so its bytes must survive.
+        assert proxy.blobs.get(blob_id) is not None
 
     run(scenario())
 

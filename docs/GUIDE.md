@@ -113,10 +113,10 @@ make ordinary HTTP requests but should not push large base64 strings through MCP
 use the discoverable upload flow:
 
 1. Call `create_image_upload` with optional `mimetype`, `size`, and `filename`.
-2. `POST` the raw bytes to the returned `/uploads/{upload_id}` URL using the
-   returned `Content-Type` **and the same `Authorization: Bearer` token you use for
-   this MCP endpoint** — anonymous uploads are rejected with `401` before any bytes
-   are read.
+2. `POST` the raw bytes to the returned `upload_url` using the `method` and
+   `headers` from the `create_image_upload` response — these include the
+   `Content-Type` and the same `Authorization: Bearer` token you use for this MCP
+   endpoint. Anonymous uploads are rejected with `401` before any bytes are read.
 3. Call `commit_image_upload` with the `upload_id` and `caption`.
 
 Upload slots are short-lived and one-time use, and are bound to the endpoint that

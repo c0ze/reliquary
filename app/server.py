@@ -1746,7 +1746,13 @@ class Mem0ChatProxy:
         for upload_id in expired:
             upload = self.pending_uploads.pop(upload_id, None)
             if upload and upload.blob_id:
-                self.blobs.delete(upload.blob_id)
+                # Only reclaim a truly orphaned blob (uploaded but never committed).
+                # If a memory owns it, this slot outlived a successful commit (e.g. a
+                # crash before the slot was dropped); deleting would destroy bytes
+                # backing a committed memory.
+                info = self.blobs.info(upload.blob_id)
+                if info is not None and not info.owners:
+                    self.blobs.delete(upload.blob_id)
         if expired:
             self._save_pending_uploads()
 
@@ -1824,6 +1830,29 @@ class Mem0ChatProxy:
             },
         )
 
+    @staticmethod
+    async def _read_body_limited(receive, max_bytes: int) -> bytes | None:
+        """Read the request body incrementally, returning None as soon as it would
+        exceed ``max_bytes`` (0 = unlimited) so an oversize upload is never fully
+        buffered in memory."""
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                break
+            if message["type"] != "http.request":
+                continue
+            chunk = message.get("body", b"")
+            if chunk:
+                total += len(chunk)
+                if max_bytes and total > max_bytes:
+                    return None
+                chunks.append(chunk)
+            if not message.get("more_body", False):
+                break
+        return b"".join(chunks)
+
     async def handle_upload_post(self, upload_id: str, scope: dict[str, Any], receive, send) -> None:
         upload = self.pending_uploads.get(upload_id)
         if upload is None:
@@ -1836,7 +1865,8 @@ class Mem0ChatProxy:
             self.settings.openai_mcp_path if upload.profile == "openai" else self.settings.claude_mcp_path
         )
         profile = self.endpoint_profiles.get(profile_path)
-        if profile is None or not profile.allow_write or self.resolve_scope(profile, decode_headers(scope)) != "write":
+        headers = decode_headers(scope)
+        if profile is None or not profile.allow_write or self.resolve_scope(profile, headers) != "write":
             await self._send_unauthorized(send)
             return
         if upload.expires_at <= time.time():
@@ -1847,18 +1877,25 @@ class Mem0ChatProxy:
             await self.send_json(send, 409, {"error": "upload_already_used", "upload_id": upload_id})
             return
 
-        data = await self.read_body(receive)
+        max_bytes = self.settings.blob_max_bytes
+        if max_bytes:
+            try:
+                declared_size = int(headers.get("content-length", "") or 0)
+            except ValueError:
+                declared_size = 0
+            if declared_size > max_bytes:
+                await self.send_json(
+                    send, 413, {"error": "too_large", "size": declared_size, "max_bytes": max_bytes}
+                )
+                return
+        data = await self._read_body_limited(receive, max_bytes)
+        if data is None:
+            await self.send_json(send, 413, {"error": "too_large", "max_bytes": max_bytes})
+            return
         if not data:
             await self.send_json(send, 400, {"error": "empty_upload", "upload_id": upload_id})
             return
-        if self.settings.blob_max_bytes and len(data) > self.settings.blob_max_bytes:
-            await self.send_json(
-                send,
-                413,
-                {"error": "too_large", "size": len(data), "max_bytes": self.settings.blob_max_bytes},
-            )
-            return
-        content_type = decode_headers(scope).get("content-type") or upload.expected_mimetype
+        content_type = headers.get("content-type") or upload.expected_mimetype
         try:
             info = self.blobs.put(data, mimetype=content_type)
         except BlobTooLarge as exc:
