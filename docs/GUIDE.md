@@ -91,8 +91,9 @@ server — MCP + OAuth + the Mem0 client). No chat LLM is involved in retrieval.
 
 | Path | Method | Auth | Purpose |
 |------|--------|------|---------|
-| `/claude/mcp` | POST | Bearer or OAuth | Full MCP: `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_delete` |
-| `/openai/mcp` | POST | Bearer (or no-auth) | Lean MCP: `search`, `fetch`, + `add_memory` & `delete` if writes enabled |
+| `/claude/mcp` | POST | Bearer or OAuth | Full MCP: `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_delete`, image/blob tools |
+| `/openai/mcp` | POST | Bearer (or no-auth) | Lean MCP: `search`, `fetch`, + write/image tools if writes enabled |
+| `/uploads/{upload_id}` | POST | Same MCP bearer (write) | Raw binary upload endpoint returned by `create_image_upload`; finalize with `commit_image_upload` |
 | `/healthz` | GET | none | Liveness check |
 | `/status` | GET | Claude bearer | Config + taxonomy introspection |
 | `/mem0/search?q=` | GET | Claude bearer | Raw debug search (returns memories directly) |
@@ -103,6 +104,26 @@ server — MCP + OAuth + the Mem0 client). No chat LLM is involved in retrieval.
 > id. It only deletes memories **written through this server** — imported corpus
 > records are protected, so an agent can't erase your curated corpus. `add_memory`
 > returns the new id so a write can be undone without a search.
+
+### Binary image uploads
+
+`add_image` remains the simplest MCP-only path: send `image_base64`, or provide a
+public `source_url` that Reliquary can fetch server-side. For clients that can
+make ordinary HTTP requests but should not push large base64 strings through MCP,
+use the discoverable upload flow:
+
+1. Call `create_image_upload` with optional `mimetype`, `size`, and `filename`.
+2. `POST` the raw bytes to the returned `upload_url` using the `method` and
+   `headers` from the `create_image_upload` response — these include the
+   `Content-Type` and the same `Authorization: Bearer` token you use for this MCP
+   endpoint. Anonymous uploads are rejected with `401` before any bytes are read.
+3. Call `commit_image_upload` with the `upload_id` and `caption`.
+
+Upload slots are short-lived and one-time use, and are bound to the endpoint that
+minted them (a slot created on `/claude/mcp` can only be uploaded/finalized with
+the Claude bearer). Finalizing also goes through the MCP write tool, and the
+result shape matches `add_image`: `blob_id`, `memory_id`, signed `url`,
+`mimetype`, `size`, and `user_id`.
 
 ---
 

@@ -84,7 +84,7 @@ Caddy, or Traefik.
 
 | Endpoint | For | Auth | Tools |
 |----------|-----|------|-------|
-| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_delete`, `add_image`, `fetch_image`, `delete_image` |
+| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_update`, `mem0_delete`, `list_domains`, `add_image`, `fetch_image`, `delete_image`, `create_image_upload`, `commit_image_upload` |
 | `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `search`, `fetch`, `fetch_image` (lean snippet shape); `add_memory` + `delete` + `add_image` if `MEM0_OPENAI_ALLOW_WRITE=true` |
 
 **Binary blobs.** `add_image` stores a file (base64) plus a searchable caption;
@@ -139,7 +139,10 @@ Run `python app/server.py --help` for the full flag list.
   *server*; an embedded on-disk store is auto-detected and serialized (it is not
   read-thread-safe).
 - Publish only behind TLS, and prefer narrowing your reverse proxy to the
-  `/claude/*`, `/openai/*`, `/oauth/*`, `/.well-known/*`, `/healthz` paths.
+  `/claude/*`, `/openai/*`, `/uploads/*`, `/oauth/*`, `/.well-known/*`, `/healthz`
+  paths. (`/uploads/*` requires the same write bearer as the MCP endpoint that
+  minted the slot — anonymous uploads are rejected with `401` before any bytes are
+  read; the one-time slot id is also unguessable and short-lived.)
 
 ## Loading data
 

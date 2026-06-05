@@ -12,7 +12,7 @@ import os
 import re
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urljoin
@@ -77,6 +77,8 @@ ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 ICON_SIZES = (16, 32, 64, 128, 256, 512)
 ICON_PATH_RE = re.compile(r"/icon-(?:%s)\.png" % "|".join(str(s) for s in ICON_SIZES))
 BLOB_PATH_RE = re.compile(r"/blobs/([0-9a-f]{64})\Z")
+UPLOAD_PATH_RE = re.compile(r"/uploads/(upl_[A-Za-z0-9_-]+)\Z")
+UPLOAD_SLOT_TTL = 600.0
 # Passive raster image types safe to serve inline same-origin. Anything else
 # (SVG, PDF, HTML, unknown) is forced to an octet-stream download by /blobs/{id}.
 _INLINE_SAFE_MIMETYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
@@ -215,6 +217,22 @@ class ProxySettings:
     image_url_ingest: bool = True
 
 
+@dataclass
+class PendingUpload:
+    id: str
+    created_at: float
+    expires_at: float
+    expected_mimetype: str | None = None
+    expected_size: int | None = None
+    filename: str | None = None
+    blob_id: str | None = None
+    mimetype: str | None = None
+    size: int | None = None
+    # Endpoint that minted the slot ("claude"/"openai"). A slot can only be
+    # finalized through the same endpoint it was created on.
+    profile: str | None = None
+
+
 class Mem0ChatProxy:
     def __init__(self, settings: ProxySettings, *, memory: Any = None) -> None:
         self.settings = settings
@@ -294,6 +312,13 @@ class Mem0ChatProxy:
             signing_key=(settings.blob_signing_key or secrets.token_hex(32)).encode("utf-8"),
             max_bytes=settings.blob_max_bytes,
         )
+        self.pending_uploads: dict[str, PendingUpload] = {}
+        self.pending_upload_store = (
+            JsonFileStore(os.path.join(settings.state_dir, "pending_uploads.json"))
+            if settings.state_dir
+            else None
+        )
+        self._load_pending_uploads()
         if not settings.blob_signing_key:
             LOG.warning(
                 "MEM0_BLOB_SIGNING_KEY is unset; using a random per-process key. "
@@ -441,6 +466,14 @@ class Mem0ChatProxy:
             blob_match = BLOB_PATH_RE.fullmatch(path)
             if method == "GET" and blob_match:
                 await self.handle_blob_get(blob_match.group(1), scope, send)
+                return
+
+            upload_match = UPLOAD_PATH_RE.fullmatch(path)
+            if upload_match:
+                if method != "POST":
+                    await self.send_empty(send, 405, extra_headers={"allow": "POST"})
+                    return
+                await self.handle_upload_post(upload_match.group(1), scope, receive, send)
                 return
 
             profile = self.endpoint_profiles.get(path)
@@ -823,7 +856,8 @@ class Mem0ChatProxy:
     @staticmethod
     def _tool_category(tool_name: str) -> str:
         writes = {"mem0_add_memory", "add_memory", "mem0_delete", "delete",
-                  "mem0_update", "update", "add_image", "delete_image"}
+                  "mem0_update", "update", "add_image", "delete_image",
+                  "create_image_upload", "commit_image_upload"}
         reads = {"mem0_search", "search", "mem0_fetch", "fetch", "fetch_image", "list_domains"}
         if tool_name in writes:
             return "write"
@@ -922,6 +956,54 @@ class Mem0ChatProxy:
                 "messages": [{"role": "user", "content": {"type": "text", "text": text}}],
             }
         return None
+
+    @staticmethod
+    def _upload_flow_tools() -> list[dict[str, Any]]:
+        write = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
+        return [
+            {
+                "name": "create_image_upload",
+                "title": "Create Image Upload",
+                "description": "Create a short-lived, one-time HTTP upload slot for raw image bytes. "
+                "Use this instead of add_image.image_base64 when you have local binary bytes and can "
+                "make HTTP requests. POST the raw bytes to the returned upload_url, sending the SAME "
+                "`Authorization: Bearer` token you use for this MCP endpoint (anonymous uploads are "
+                "rejected with 401), then call commit_image_upload with the upload_id and caption.",
+                "annotations": write,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "mimetype": {"type": "string", "description": "Expected content type, e.g. image/png."},
+                        "size": {"type": "integer", "minimum": 1, "description": "Expected byte size, if known."},
+                        "filename": {"type": "string", "description": "Optional client filename for display/debugging."},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "commit_image_upload",
+                "title": "Commit Image Upload",
+                "description": "Finalize a successful create_image_upload + HTTP POST by creating the "
+                "searchable image caption memory. Returns the same blob_id, memory_id and signed url "
+                "shape as add_image.",
+                "annotations": write,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "upload_id": {"type": "string", "description": "upload_id returned by create_image_upload."},
+                        "caption": {"type": "string", "description": "Searchable text describing the image."},
+                        "title": {"type": "string"},
+                        "domain": {"type": "string"},
+                        "hall": {"type": "string"},
+                        "room": {"type": "string"},
+                        "topic": {"type": "string"},
+                        "metadata": {"type": "object", "description": "Extra metadata fields to merge into the record."},
+                    },
+                    "required": ["upload_id", "caption"],
+                    "additionalProperties": False,
+                },
+            },
+        ]
 
     def mcp_tools_for(self, profile: EndpointProfile, *, can_write: bool = False) -> list[dict[str, Any]]:
         read_only = {"readOnlyHint": True, "openWorldHint": False}
@@ -1080,6 +1162,7 @@ class Mem0ChatProxy:
                         },
                     }
                 )
+                tools.extend(self._upload_flow_tools())
             return tools
 
         claude_tools = [
@@ -1249,6 +1332,7 @@ class Mem0ChatProxy:
                         "additionalProperties": False,
                     },
                 },
+                *self._upload_flow_tools(),
             ])
         return claude_tools
 
@@ -1317,6 +1401,22 @@ class Mem0ChatProxy:
                         )
                     # allow_user_id=False: deletes are always scoped to the default user_id.
                     return await self.handle_delete_image_tool(arguments, allow_user_id=False)
+                if tool_name == "create_image_upload":
+                    if not can_write:
+                        return self.mcp_tool_result(
+                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                            structured={"error": "insufficient_scope"},
+                            is_error=True,
+                        )
+                    return self.handle_create_image_upload_tool(arguments, profile=profile)
+                if tool_name == "commit_image_upload":
+                    if not can_write:
+                        return self.mcp_tool_result(
+                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                            structured={"error": "insufficient_scope"},
+                            is_error=True,
+                        )
+                    return await self.handle_commit_image_upload_tool(arguments, allow_user_id=False, profile=profile)
                 return self.mcp_tool_result(
                     text=f"Unknown tool: {tool_name}",
                     structured={"error": "unknown_tool"},
@@ -1389,6 +1489,22 @@ class Mem0ChatProxy:
                         is_error=True,
                     )
                 return await self.handle_delete_image_tool(arguments, allow_user_id=True)
+            if tool_name == "create_image_upload":
+                if not can_write:
+                    return self.mcp_tool_result(
+                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                        structured={"error": "insufficient_scope"},
+                        is_error=True,
+                    )
+                return self.handle_create_image_upload_tool(arguments, profile=profile)
+            if tool_name == "commit_image_upload":
+                if not can_write:
+                    return self.mcp_tool_result(
+                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                        structured={"error": "insufficient_scope"},
+                        is_error=True,
+                    )
+                return await self.handle_commit_image_upload_tool(arguments, allow_user_id=True, profile=profile)
         except Exception as exc:
             LOG.exception("MCP tool failed: %s", tool_name)
             return self.mcp_tool_result(
@@ -1589,6 +1705,350 @@ class Mem0ChatProxy:
         return self.mcp_tool_result(
             text=f"Stored memory for user_id={user_id}{id_note}: {trim_text(text, 160)}",
             structured={"ids": new_ids, "user_id": user_id, "infer": infer, "metadata": metadata},
+        )
+
+    def _load_pending_uploads(self) -> None:
+        """Restore persisted upload slots (if a state_dir is configured) and reap
+        any that already expired while the process was down — otherwise bytes that
+        were uploaded but never committed would orphan their blob across restarts."""
+        if not self.pending_upload_store:
+            return
+        restored: dict[str, PendingUpload] = {}
+        for upload_id, rec in self.pending_upload_store.load().items():
+            if not isinstance(rec, dict):
+                continue
+            try:
+                restored[upload_id] = PendingUpload(**rec)
+            except TypeError:
+                continue
+        self.pending_uploads = restored
+        self._cleanup_expired_uploads()
+
+    def _save_pending_uploads(self) -> None:
+        if not self.pending_upload_store:
+            return
+        self.pending_upload_store.save(
+            {upload_id: asdict(upload) for upload_id, upload in self.pending_uploads.items()}
+        )
+
+    def _drop_upload(self, upload_id: str) -> None:
+        """Forget a slot and persist the change."""
+        self.pending_uploads.pop(upload_id, None)
+        self._save_pending_uploads()
+
+    def _cleanup_expired_uploads(self) -> None:
+        now = time.time()
+        expired = [
+            upload_id
+            for upload_id, upload in self.pending_uploads.items()
+            if upload.expires_at <= now
+        ]
+        for upload_id in expired:
+            upload = self.pending_uploads.pop(upload_id, None)
+            if upload and upload.blob_id:
+                # Only reclaim a truly orphaned blob (uploaded but never committed).
+                # If a memory owns it, this slot outlived a successful commit (e.g. a
+                # crash before the slot was dropped); deleting would destroy bytes
+                # backing a committed memory.
+                info = self.blobs.info(upload.blob_id)
+                if info is not None and not info.owners:
+                    self.blobs.delete(upload.blob_id)
+        if expired:
+            self._save_pending_uploads()
+
+    def _new_upload_id(self) -> str:
+        while True:
+            upload_id = f"upl_{secrets.token_urlsafe(18)}"
+            if upload_id not in self.pending_uploads:
+                return upload_id
+
+    def handle_create_image_upload_tool(
+        self, arguments: dict[str, Any], *, profile: EndpointProfile | None = None
+    ) -> dict[str, Any]:
+        self._cleanup_expired_uploads()
+        mimetype = str(arguments.get("mimetype") or "application/octet-stream").strip()
+        filename_raw = arguments.get("filename")
+        filename = str(filename_raw).strip() if filename_raw is not None else None
+        expected_size = None
+        if arguments.get("size") is not None:
+            try:
+                expected_size = int(arguments.get("size"))
+            except (TypeError, ValueError):
+                return self.mcp_tool_result(
+                    text="`size` must be an integer byte count.",
+                    structured={"error": "invalid_size"},
+                    is_error=True,
+                )
+            if expected_size <= 0:
+                return self.mcp_tool_result(
+                    text="`size` must be greater than zero.",
+                    structured={"error": "invalid_size"},
+                    is_error=True,
+                )
+            if self.settings.blob_max_bytes and expected_size > self.settings.blob_max_bytes:
+                return self.mcp_tool_result(
+                    text=f"Expected upload size exceeds the {self.settings.blob_max_bytes}-byte limit.",
+                    structured={
+                        "error": "too_large",
+                        "size": expected_size,
+                        "max_bytes": self.settings.blob_max_bytes,
+                    },
+                    is_error=True,
+                )
+
+        now = time.time()
+        upload_id = self._new_upload_id()
+        self.pending_uploads[upload_id] = PendingUpload(
+            id=upload_id,
+            created_at=now,
+            expires_at=now + UPLOAD_SLOT_TTL,
+            expected_mimetype=mimetype,
+            expected_size=expected_size,
+            filename=filename,
+            profile=profile.name if profile else None,
+        )
+        self._save_pending_uploads()
+        upload_url = f"/uploads/{upload_id}"
+        return self.mcp_tool_result(
+            text=(
+                f"Created upload slot {upload_id}. POST the raw bytes to {upload_url} with the SAME "
+                "`Authorization: Bearer <token>` header you use for this MCP endpoint (anonymous "
+                "uploads are rejected), then call commit_image_upload with the upload_id and caption."
+            ),
+            structured={
+                "upload_id": upload_id,
+                "upload_url": upload_url,
+                "method": "POST",
+                "headers": {
+                    "Content-Type": mimetype,
+                    "Authorization": "Bearer <same token you use for this MCP endpoint>",
+                },
+                "auth": "required: send the same bearer token you use for this MCP endpoint.",
+                "accepted_mimetypes": ["image/png", "image/jpeg", "image/gif", "image/webp"],
+                "max_bytes": self.settings.blob_max_bytes,
+                "expires_at": self.pending_uploads[upload_id].expires_at,
+            },
+        )
+
+    @staticmethod
+    async def _read_body_limited(receive, max_bytes: int) -> bytes | None:
+        """Read the request body incrementally, returning None as soon as it would
+        exceed ``max_bytes`` (0 = unlimited) so an oversize upload is never fully
+        buffered in memory."""
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                break
+            if message["type"] != "http.request":
+                continue
+            chunk = message.get("body", b"")
+            if chunk:
+                total += len(chunk)
+                if max_bytes and total > max_bytes:
+                    return None
+                chunks.append(chunk)
+            if not message.get("more_body", False):
+                break
+        return b"".join(chunks)
+
+    async def handle_upload_post(self, upload_id: str, scope: dict[str, Any], receive, send) -> None:
+        upload = self.pending_uploads.get(upload_id)
+        if upload is None:
+            await self.send_json(send, 404, {"error": "unknown_upload", "upload_id": upload_id})
+            return
+        # Require the same write-scoped bearer used for the MCP endpoint that minted
+        # this slot. Rejects anonymous and foreign-endpoint callers with 401 before
+        # any request body is read, so unauthenticated traffic can't drive uploads.
+        profile_path = (
+            self.settings.openai_mcp_path if upload.profile == "openai" else self.settings.claude_mcp_path
+        )
+        profile = self.endpoint_profiles.get(profile_path)
+        headers = decode_headers(scope)
+        if profile is None or not profile.allow_write or self.resolve_scope(profile, headers) != "write":
+            await self._send_unauthorized(send)
+            return
+        if upload.expires_at <= time.time():
+            self._drop_upload(upload_id)
+            await self.send_json(send, 410, {"error": "upload_expired", "upload_id": upload_id})
+            return
+        if upload.blob_id:
+            await self.send_json(send, 409, {"error": "upload_already_used", "upload_id": upload_id})
+            return
+
+        max_bytes = self.settings.blob_max_bytes
+        if max_bytes:
+            try:
+                declared_size = int(headers.get("content-length", "") or 0)
+            except ValueError:
+                declared_size = 0
+            if declared_size > max_bytes:
+                await self.send_json(
+                    send, 413, {"error": "too_large", "size": declared_size, "max_bytes": max_bytes}
+                )
+                return
+        data = await self._read_body_limited(receive, max_bytes)
+        if data is None:
+            await self.send_json(send, 413, {"error": "too_large", "max_bytes": max_bytes})
+            return
+        if not data:
+            await self.send_json(send, 400, {"error": "empty_upload", "upload_id": upload_id})
+            return
+        content_type = headers.get("content-type") or upload.expected_mimetype
+        try:
+            info = self.blobs.put(data, mimetype=content_type)
+        except BlobTooLarge as exc:
+            await self.send_json(
+                send,
+                413,
+                {"error": "too_large", "size": exc.size, "max_bytes": exc.max_bytes},
+            )
+            return
+        upload.blob_id = info.id
+        upload.mimetype = info.mimetype
+        upload.size = info.size
+        self._save_pending_uploads()
+        await self.send_json(
+            send,
+            201,
+            {
+                "upload_id": upload_id,
+                "blob_id": info.id,
+                "mimetype": info.mimetype,
+                "size": info.size,
+            },
+        )
+
+    async def handle_commit_image_upload_tool(
+        self,
+        arguments: dict[str, Any],
+        *,
+        allow_user_id: bool = False,
+        profile: EndpointProfile | None = None,
+    ) -> dict[str, Any]:
+        upload_id = str(arguments.get("upload_id") or "").strip()
+        if not upload_id:
+            return self.mcp_tool_result(
+                text="A non-empty `upload_id` is required.",
+                structured={"error": "missing_upload_id"},
+                is_error=True,
+            )
+        caption = str(arguments.get("caption") or "").strip()
+        if not caption:
+            return self.mcp_tool_result(
+                text="A non-empty `caption` is required.",
+                structured={"error": "missing_caption"},
+                is_error=True,
+            )
+        upload = self.pending_uploads.get(upload_id)
+        if upload is None:
+            return self.mcp_tool_result(
+                text=f"No upload slot found for upload_id={upload_id}.",
+                structured={"error": "unknown_upload", "upload_id": upload_id},
+                is_error=True,
+            )
+        if profile is not None and upload.profile is not None and upload.profile != profile.name:
+            return self.mcp_tool_result(
+                text=f"Upload slot {upload_id} was created on a different endpoint and cannot be finalized here.",
+                structured={"error": "forbidden_endpoint", "upload_id": upload_id},
+                is_error=True,
+            )
+        if upload.expires_at <= time.time():
+            self._drop_upload(upload_id)
+            if upload.blob_id:
+                self.blobs.delete(upload.blob_id)
+            return self.mcp_tool_result(
+                text=f"Upload slot {upload_id} has expired.",
+                structured={"error": "upload_expired", "upload_id": upload_id},
+                is_error=True,
+            )
+        if not upload.blob_id:
+            return self.mcp_tool_result(
+                text=f"Upload slot {upload_id} has no uploaded bytes yet.",
+                structured={"error": "upload_not_ready", "upload_id": upload_id},
+                is_error=True,
+            )
+
+        user_id = (
+            str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
+        )
+        raw_metadata = arguments.get("metadata") or {}
+        if not isinstance(raw_metadata, dict):
+            return self.mcp_tool_result(
+                text="`metadata` must be an object.",
+                structured={"error": "invalid_metadata"},
+                is_error=True,
+            )
+        metadata = dict(raw_metadata)
+        metadata.setdefault("source", "mcp")
+        metadata["kind"] = "image"
+        metadata["source_group"] = "user-write"
+        metadata["blob_ref"] = upload.blob_id
+        metadata["blob_mime"] = upload.mimetype
+        metadata["blob_size"] = upload.size
+        metadata["upload_id"] = upload_id
+        for key in ("title", "domain", "hall", "room", "topic"):
+            value = arguments.get(key)
+            if value is not None and str(value).strip():
+                metadata[key] = str(value).strip()
+
+        try:
+            result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)
+        except Exception:
+            self.blobs.delete(upload.blob_id)
+            self._drop_upload(upload_id)
+            raise
+        new_ids = added_memory_ids(result)
+        memory_id = new_ids[0] if new_ids else None
+        if memory_id is None:
+            self.blobs.delete(upload.blob_id)
+            self._drop_upload(upload_id)
+            return self.mcp_tool_result(
+                text="Uploaded the blob but failed to create its caption memory; rolled back.",
+                structured={"error": "memory_write_failed", "blob_id": upload.blob_id, "upload_id": upload_id},
+                is_error=True,
+            )
+        try:
+            self.blobs.register_owner(upload.blob_id, memory_id)
+        except Exception:
+            LOG.exception(
+                "Failed to register uploaded blob owner blob_id=%s memory_id=%s; rolling back",
+                upload.blob_id,
+                memory_id,
+            )
+            try:
+                await self.delete_memory(memory_id)
+            except Exception:
+                LOG.exception("Rollback delete_memory failed for memory_id=%s", memory_id)
+            self.blobs.delete(upload.blob_id)
+            self._drop_upload(upload_id)
+            return self.mcp_tool_result(
+                text="Failed to finalize upload ownership; rolled back.",
+                structured={
+                    "error": "ownership_registration_failed",
+                    "blob_id": upload.blob_id,
+                    "memory_id": memory_id,
+                    "upload_id": upload_id,
+                },
+                is_error=True,
+            )
+
+        blob_id = upload.blob_id
+        mimetype = upload.mimetype
+        size = upload.size
+        self._drop_upload(upload_id)
+        return self.mcp_tool_result(
+            text=f"Committed uploaded image (blob_id={blob_id}, memory_id={memory_id}): {trim_text(caption, 160)}",
+            structured={
+                "blob_id": blob_id,
+                "memory_id": memory_id,
+                "url": self._signed_blob_url(blob_id),
+                "mimetype": mimetype,
+                "size": size,
+                "user_id": user_id,
+                "upload_id": upload_id,
+            },
         )
 
     async def _fetch_image_from_url(self, url: str) -> tuple[bytes, str | None] | dict[str, Any]:
