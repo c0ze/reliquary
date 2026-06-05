@@ -8,10 +8,42 @@ straightforward to unit-test in isolation.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import math
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
+
+
+def decode_image_payload(value: str) -> bytes:
+    """Decode a base64 image payload tolerantly.
+
+    Real-world agents send base64 line-wrapped (newlines), with a
+    ``data:<mime>;base64,`` prefix, in the url-safe alphabet, or with stripped
+    padding. ``base64.b64decode(..., validate=True)`` rejects all of those, so a
+    perfectly valid PNG comes back as ``invalid_image``. This normalises the
+    input first, then decodes; it raises ``ValueError`` only on genuinely
+    undecodable data.
+    """
+    text = (value or "").strip()
+    if text.startswith("data:"):
+        comma = text.find(",")
+        if comma == -1:
+            raise ValueError("malformed data URI")
+        text = text[comma + 1:]
+    text = "".join(text.split())  # drop newlines/spaces from wrapped base64
+    if not text:
+        raise ValueError("empty base64 payload")
+    padded = text + "=" * (-len(text) % 4)
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            data = decoder(padded, validate=True) if decoder is base64.b64decode else decoder(padded)
+            if data:
+                return data
+        except (ValueError, binascii.Error):
+            continue
+    raise ValueError("invalid base64 payload")
 
 if TYPE_CHECKING:
     import httpx

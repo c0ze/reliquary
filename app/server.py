@@ -34,6 +34,7 @@ from helpers import (
     SEARCH_PREVIEW_CHAR_CAP,
     coerce_threshold,
     decode_headers,
+    decode_image_payload,
     extract_assistant_text_from_response,
     extract_text_content,
     added_memory_ids,
@@ -1679,8 +1680,8 @@ class Mem0ChatProxy:
             metadata.setdefault("source_url", source_url.strip())
         else:
             try:
-                data = base64.b64decode(image_b64, validate=True)
-            except (ValueError, base64.binascii.Error):
+                data = decode_image_payload(image_b64)
+            except ValueError:
                 return self.mcp_tool_result(
                     text="`image_base64` is not valid base64.",
                     structured={"error": "invalid_image"},
