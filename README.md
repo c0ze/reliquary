@@ -140,9 +140,9 @@ Run `python app/server.py --help` for the full flag list.
   read-thread-safe).
 - Publish only behind TLS, and prefer narrowing your reverse proxy to the
   `/claude/*`, `/openai/*`, `/uploads/*`, `/oauth/*`, `/.well-known/*`, `/healthz`
-  paths. (`/uploads/*` is unauthenticated but capability-gated: the slot id is a
-  one-time, unguessable token minted only by the write-scoped `create_image_upload`
-  tool, and finalizing still requires the write-scoped `commit_image_upload` tool.)
+  paths. (`/uploads/*` requires the same write bearer as the MCP endpoint that
+  minted the slot — anonymous uploads are rejected with `401` before any bytes are
+  read; the one-time slot id is also unguessable and short-lived.)
 
 ## Loading data
 

@@ -966,8 +966,9 @@ class Mem0ChatProxy:
                 "title": "Create Image Upload",
                 "description": "Create a short-lived, one-time HTTP upload slot for raw image bytes. "
                 "Use this instead of add_image.image_base64 when you have local binary bytes and can "
-                "make HTTP requests. POST the raw bytes to the returned upload_url, then call "
-                "commit_image_upload with the upload_id and caption.",
+                "make HTTP requests. POST the raw bytes to the returned upload_url, sending the SAME "
+                "`Authorization: Bearer` token you use for this MCP endpoint (anonymous uploads are "
+                "rejected with 401), then call commit_image_upload with the upload_id and caption.",
                 "annotations": write,
                 "inputSchema": {
                     "type": "object",
@@ -1804,14 +1805,19 @@ class Mem0ChatProxy:
         upload_url = f"/uploads/{upload_id}"
         return self.mcp_tool_result(
             text=(
-                f"Created upload slot {upload_id}. POST raw bytes to {upload_url}, then call "
-                "commit_image_upload with the upload_id and caption."
+                f"Created upload slot {upload_id}. POST the raw bytes to {upload_url} with the SAME "
+                "`Authorization: Bearer <token>` header you use for this MCP endpoint (anonymous "
+                "uploads are rejected), then call commit_image_upload with the upload_id and caption."
             ),
             structured={
                 "upload_id": upload_id,
                 "upload_url": upload_url,
                 "method": "POST",
-                "headers": {"Content-Type": mimetype},
+                "headers": {
+                    "Content-Type": mimetype,
+                    "Authorization": "Bearer <same token you use for this MCP endpoint>",
+                },
+                "auth": "required: send the same bearer token you use for this MCP endpoint.",
                 "accepted_mimetypes": ["image/png", "image/jpeg", "image/gif", "image/webp"],
                 "max_bytes": self.settings.blob_max_bytes,
                 "expires_at": self.pending_uploads[upload_id].expires_at,
@@ -1822,6 +1828,16 @@ class Mem0ChatProxy:
         upload = self.pending_uploads.get(upload_id)
         if upload is None:
             await self.send_json(send, 404, {"error": "unknown_upload", "upload_id": upload_id})
+            return
+        # Require the same write-scoped bearer used for the MCP endpoint that minted
+        # this slot. Rejects anonymous and foreign-endpoint callers with 401 before
+        # any request body is read, so unauthenticated traffic can't drive uploads.
+        profile_path = (
+            self.settings.openai_mcp_path if upload.profile == "openai" else self.settings.claude_mcp_path
+        )
+        profile = self.endpoint_profiles.get(profile_path)
+        if profile is None or not profile.allow_write or self.resolve_scope(profile, decode_headers(scope)) != "write":
+            await self._send_unauthorized(send)
             return
         if upload.expires_at <= time.time():
             self._drop_upload(upload_id)

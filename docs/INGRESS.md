@@ -12,7 +12,7 @@ Only these paths should be reachable from untrusted networks:
 |---|---|
 | `/claude/*` | Claude MCP endpoint (bearer-protected) |
 | `/openai/*` | ChatGPT / OpenAI MCP endpoint (bearer or no-auth) |
-| `/uploads/*` | Raw binary upload slots for `create_image_upload`. Unauthenticated but capability-gated: the `upl_` id is a one-time, unguessable token minted only by the write-scoped `create_image_upload` tool, and finalizing requires the write-scoped `commit_image_upload` tool. |
+| `/uploads/*` | Raw binary upload slots for `create_image_upload`. Requires the same write bearer as the MCP endpoint that minted the slot (anonymous uploads → `401` before any bytes are read); the one-time `upl_` id is also unguessable and short-lived. |
 | `/oauth/*` | OAuth 2.1 token exchange |
 | `/.well-known/*` | OAuth discovery metadata |
 | `/healthz` | Liveness probe (unauthenticated, read-only) |

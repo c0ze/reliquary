@@ -93,7 +93,7 @@ server — MCP + OAuth + the Mem0 client). No chat LLM is involved in retrieval.
 |------|--------|------|---------|
 | `/claude/mcp` | POST | Bearer or OAuth | Full MCP: `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_delete`, image/blob tools |
 | `/openai/mcp` | POST | Bearer (or no-auth) | Lean MCP: `search`, `fetch`, + write/image tools if writes enabled |
-| `/uploads/{upload_id}` | POST | one-time upload slot | Raw binary upload endpoint returned by `create_image_upload`; finalize with `commit_image_upload` |
+| `/uploads/{upload_id}` | POST | Same MCP bearer (write) | Raw binary upload endpoint returned by `create_image_upload`; finalize with `commit_image_upload` |
 | `/healthz` | GET | none | Liveness check |
 | `/status` | GET | Claude bearer | Config + taxonomy introspection |
 | `/mem0/search?q=` | GET | Claude bearer | Raw debug search (returns memories directly) |
@@ -114,12 +114,16 @@ use the discoverable upload flow:
 
 1. Call `create_image_upload` with optional `mimetype`, `size`, and `filename`.
 2. `POST` the raw bytes to the returned `/uploads/{upload_id}` URL using the
-   returned `Content-Type`.
+   returned `Content-Type` **and the same `Authorization: Bearer` token you use for
+   this MCP endpoint** — anonymous uploads are rejected with `401` before any bytes
+   are read.
 3. Call `commit_image_upload` with the `upload_id` and `caption`.
 
-Upload slots are short-lived and one-time use. Finalizing still requires the MCP
-write tool, and the result shape matches `add_image`: `blob_id`, `memory_id`,
-signed `url`, `mimetype`, `size`, and `user_id`.
+Upload slots are short-lived and one-time use, and are bound to the endpoint that
+minted them (a slot created on `/claude/mcp` can only be uploaded/finalized with
+the Claude bearer). Finalizing also goes through the MCP write tool, and the
+result shape matches `add_image`: `blob_id`, `memory_id`, signed `url`,
+`mimetype`, `size`, and `user_id`.
 
 ---
 

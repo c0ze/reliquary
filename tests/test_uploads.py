@@ -70,7 +70,11 @@ def test_upload_commit_fetch_delete_roundtrip(proxy):
             transport=httpx.ASGITransport(app=proxy),
             base_url="http://testserver",
         ) as client:
-            upload = await client.post(upload_url, content=PNG, headers={"content-type": "image/png"})
+            upload = await client.post(
+                upload_url,
+                content=PNG,
+                headers={"content-type": "image/png", "authorization": "Bearer claude-secret"},
+            )
 
         assert upload.status_code == 201
         assert upload.json()["upload_id"] == upload_id
@@ -116,7 +120,9 @@ def test_upload_rejects_unknown_and_expired_slots(proxy):
             transport=httpx.ASGITransport(app=proxy),
             base_url="http://testserver",
         ) as client:
-            expired = await client.post(f"/uploads/{upload_id}", content=PNG)
+            expired = await client.post(
+                f"/uploads/{upload_id}", content=PNG, headers={"authorization": "Bearer claude-secret"}
+            )
         assert expired.status_code == 410
 
     run(scenario())
@@ -148,21 +154,26 @@ def test_upload_rejects_oversize_body(proxy):
             transport=httpx.ASGITransport(app=proxy),
             base_url="http://testserver",
         ) as client:
-            response = await client.post(create["structuredContent"]["upload_url"], content=b"too large")
+            response = await client.post(
+                create["structuredContent"]["upload_url"],
+                content=b"too large",
+                headers={"authorization": "Bearer claude-secret"},
+            )
 
         assert response.status_code == 413
 
     run(scenario())
 
 
-async def _post_bytes(proxy, upload_id, data=PNG, content_type="image/png"):
+async def _post_bytes(proxy, upload_id, data=PNG, content_type="image/png", token="claude-secret"):
+    headers = {"content-type": content_type}
+    if token is not None:
+        headers["authorization"] = f"Bearer {token}"
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=proxy),
         base_url="http://testserver",
     ) as client:
-        return await client.post(
-            f"/uploads/{upload_id}", content=data, headers={"content-type": content_type}
-        )
+        return await client.post(f"/uploads/{upload_id}", content=data, headers=headers)
 
 
 def test_create_image_upload_requires_write_scope(proxy):
@@ -255,6 +266,40 @@ def test_commit_applies_taxonomy_and_merges_metadata(proxy):
         assert stored["hall"] == "images"
         assert stored["room"] == "screenshots"
         assert stored["custom_key"] == "custom_value"
+
+    run(scenario())
+
+
+def test_upload_rejects_missing_bearer(proxy):
+    """An anonymous POST to a valid slot is rejected with 401 and stores nothing."""
+    async def scenario():
+        profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+        create = await proxy.call_mcp_tool(
+            profile, "create_image_upload", {"mimetype": "image/png"}, can_write=True
+        )
+        upload_id = create["structuredContent"]["upload_id"]
+
+        resp = await _post_bytes(proxy, upload_id, token=None)
+
+        assert resp.status_code == 401
+        assert proxy.pending_uploads[upload_id].blob_id is None
+
+    run(scenario())
+
+
+def test_upload_rejects_bearer_for_a_different_endpoint(proxy):
+    """A slot minted on /claude/mcp cannot be uploaded with the /openai/mcp bearer."""
+    async def scenario():
+        claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+        create = await proxy.call_mcp_tool(
+            claude, "create_image_upload", {"mimetype": "image/png"}, can_write=True
+        )
+        upload_id = create["structuredContent"]["upload_id"]
+
+        resp = await _post_bytes(proxy, upload_id, token="openai-secret")
+
+        assert resp.status_code == 401
+        assert proxy.pending_uploads[upload_id].blob_id is None
 
     run(scenario())
 
