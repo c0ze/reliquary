@@ -84,3 +84,34 @@ def proxy(tmp_path, fake_memory, monkeypatch):
         blob_signing_key="test-signing-key",
     )
     return Mem0ChatProxy(settings, memory=fake_memory)
+
+
+@pytest.fixture
+def make_proxy(tmp_path, monkeypatch):
+    """Factory for building proxies with custom settings (e.g. a shared
+    state_dir/blob_dir across two instances to simulate a restart)."""
+
+    async def inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", inline_to_thread)
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "vector_store": {"provider": "qdrant", "config": {"host": "x", "port": 6333}},
+        "embedder": {"provider": "openai", "config": {"model": "text-embedding-3-small"}},
+    }))
+
+    def _make(*, memory=None, **overrides):
+        opts = dict(
+            config_path=str(cfg),
+            user_id="my_lord",
+            claude_token="claude-secret",
+            openai_token="openai-secret",
+            openai_allow_write=True,
+            blob_dir=str(tmp_path / "blobs"),
+            blob_signing_key="test-signing-key",
+        )
+        opts.update(overrides)
+        return Mem0ChatProxy(ProxySettings(**opts), memory=memory or FakeMemory())
+
+    return _make
