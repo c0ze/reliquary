@@ -1715,6 +1715,17 @@ class Mem0ChatProxy:
                 is_error=True,
             )
 
+        if self.pages is not None:
+            page = self.pages.get(record_id)
+            if page is not None:
+                body, blob_id = self.pages.read_body(record_id) or ("", page.current_blob)
+                return self.mcp_tool_result(
+                    text=body,
+                    structured={"id": page.slug, "title": page.title, "text": body,
+                                "url": self._signed_blob_url(blob_id), "kind": "synthesis",
+                                "status": page.status, "derived_from": page.derived_from,
+                                "metadata": {"kind": "synthesis", "slug": page.slug, "status": page.status}})
+
         if self.catalog is not None:
             document = self.catalog.fetch_document(record_id)
             if document is not None:

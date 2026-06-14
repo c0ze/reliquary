@@ -332,3 +332,34 @@ def test_new_tools_not_on_openai_endpoint(proxy):
         assert "mem0_compile_page" not in names
         assert "mem0_list_pages" not in names
         assert "mem0_page_history" not in names
+
+
+# ---------------------------------------------------------------------------
+# Task 3.5 — compiled-aware mem0_fetch
+# ---------------------------------------------------------------------------
+
+
+def test_mem0_fetch_compiled_page(proxy):
+    """mem0_fetch resolves a compiled page by slug."""
+    run(proxy.handle_compile_page_tool({
+        "markdown": "Synthesis body here",
+        "slug": "fetch-me",
+        "title": "Fetch Me",
+    }))
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    result = run(proxy.call_mcp_tool(
+        profile, "mem0_fetch", {"id": "fetch-me"}, can_write=False,
+    ))
+    assert result.get("isError") is not True
+    sc = result["structuredContent"]
+    assert sc["id"] == "fetch-me"
+    assert sc["kind"] == "synthesis"
+    assert "Synthesis body here" in sc["text"]
+    assert sc["url"].startswith("/blobs/")
+
+
+def test_mem0_fetch_unknown_id_still_returns_not_found(proxy):
+    """Unknown ids still get the usual not_found response."""
+    result = run(proxy.handle_fetch_tool({"id": "totally-unknown-xyz"}))
+    assert result.get("isError") is True
+    assert result["structuredContent"]["error"] == "not_found"
