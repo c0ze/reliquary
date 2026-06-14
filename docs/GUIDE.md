@@ -522,8 +522,8 @@ on disk at `/data/compiled` (bind-mounted via `COMPILED_HOST_DIR` in Compose).
 
 To **disable** the compiled layer — for lightweight or read-only deployments — set
 `MEM0_COMPILED_COLLECTION` to an empty string in your `.env`. When the collection
-name is empty, `self.pages` and `self.compiled_memory` are both `None`, and the
-layer is a complete query-time no-op: no reads, no writes, no collection required.
+name is empty the compiled layer is fully inactive — a complete query-time no-op:
+no reads, no writes, no second collection required.
 
 ```env
 # disable compiled layer
@@ -535,7 +535,8 @@ Key environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `MEM0_COMPILED_COLLECTION` | `reliquary_compiled` | Qdrant collection name. Empty = disabled. |
-| `COMPILED_HOST_DIR` | `./data/compiled` | Host path bind-mounted to `/data/compiled`. |
+| `COMPILED_HOST_DIR` | `./data/compiled` | Compose only: host path bind-mounted to `/data/compiled`. |
+| `MEM0_COMPILED_DIR` | `/data/compiled` | Container path for the page registry + vault export. |
 | `MEM0_SCHEMA_PATH` | *(built-in)* | Path to an editable memory constitution file. |
 | `MEM0_LINT_COVERAGE_MIN` | `8` | Raw record threshold before lint flags a gap. |
 
