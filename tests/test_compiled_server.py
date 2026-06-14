@@ -229,7 +229,7 @@ def test_page_history_multiple_revisions(proxy):
     result = run(proxy.handle_page_history_tool({"slug": "multi-rev"}))
     sc = result["structuredContent"]
     assert len(sc["revisions"]) == 2
-    assert len(sc["history"]) == 1
+    assert sc["revisions"][0] == sc["current"]  # newest-first ordering
 
 
 def test_page_history_not_found(proxy):
@@ -363,3 +363,13 @@ def test_mem0_fetch_unknown_id_still_returns_not_found(proxy):
     result = run(proxy.handle_fetch_tool({"id": "totally-unknown-xyz"}))
     assert result.get("isError") is True
     assert result["structuredContent"]["error"] == "not_found"
+
+
+def test_mem0_fetch_page_with_missing_blob_errors(proxy):
+    """A registered page whose blob bytes are gone surfaces an error, not an empty body."""
+    _file_page(proxy, "ghost")
+    info = proxy.pages.get("ghost")
+    proxy.blobs.delete(info.current_blob)  # simulate disk inconsistency
+    result = run(proxy.handle_fetch_tool({"id": "ghost"}))
+    assert result.get("isError") is True
+    assert result["structuredContent"]["error"] == "blob_missing"

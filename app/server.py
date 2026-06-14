@@ -1718,7 +1718,14 @@ class Mem0ChatProxy:
         if self.pages is not None:
             page = self.pages.get(record_id)
             if page is not None:
-                body, blob_id = self.pages.read_body(record_id) or ("", page.current_blob)
+                body_result = self.pages.read_body(record_id)
+                if body_result is None:
+                    return self.mcp_tool_result(
+                        text=f"Page {record_id} exists but its body could not be read (blob missing).",
+                        structured={"error": "blob_missing", "id": record_id},
+                        is_error=True,
+                    )
+                body, blob_id = body_result
                 return self.mcp_tool_result(
                     text=body,
                     structured={"id": page.slug, "title": page.title, "text": body,
@@ -1826,7 +1833,7 @@ class Mem0ChatProxy:
         try:
             info = await asyncio.to_thread(self.pages.put_revision, slug, markdown, frontmatter)
         except BlobTooLarge as exc:
-            return self.mcp_tool_result(text=str(exc), structured={"error": "too_large", "max_bytes": exc.max_bytes}, is_error=True)
+            return self.mcp_tool_result(text=str(exc), structured={"error": "too_large", "size": exc.size, "max_bytes": exc.max_bytes}, is_error=True)
         user_id = str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
         metadata = {"kind": "synthesis", "source_group": "compiled", "slug": slug,
                     "blob_ref": info.current_blob, "derived_from": derived_from}
@@ -1868,7 +1875,7 @@ class Mem0ChatProxy:
         revisions = [info.current_blob] + list(reversed(info.history))
         return self.mcp_tool_result(text=f"{len(revisions)} revision(s) for {slug}.",
                                     structured={"slug": slug, "current": info.current_blob,
-                                                "history": list(info.history), "revisions": revisions})
+                                                "revisions": revisions})
 
     def _load_pending_uploads(self) -> None:
         """Restore persisted upload slots (if a state_dir is configured) and reap
