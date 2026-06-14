@@ -46,3 +46,27 @@ def test_get_unknown_returns_none(tmp_path):
     reg = _registry(tmp_path)
     assert reg.get("missing") is None
     assert reg.read_body("missing") is None
+
+
+def test_update_creates_revision_and_history(tmp_path, monkeypatch):
+    reg = _registry(tmp_path)
+    import compiled
+    t = [1000.0]
+    monkeypatch.setattr(compiled.time, "time", lambda: t[0])
+    v1 = reg.put_revision("brigid", "v1 body", {"title": "Brigid"})
+    t[0] = 2000.0
+    v2 = reg.put_revision("brigid", "v2 body", {"title": "Brigid"})
+    assert v2.current_blob != v1.current_blob
+    assert v1.current_blob in v2.history
+    body, _ = reg.read_body("brigid")
+    assert "v2 body" in body and "v1 body" not in body
+
+
+def test_identical_refile_is_noop_revision(tmp_path, monkeypatch):
+    reg = _registry(tmp_path)
+    import compiled
+    monkeypatch.setattr(compiled.time, "time", lambda: 1000.0)  # frozen clock
+    a = reg.put_revision("p", "same", {"title": "P"})
+    b = reg.put_revision("p", "same", {"title": "P"})
+    assert a.current_blob == b.current_blob
+    assert b.history == []  # no new revision recorded
