@@ -145,6 +145,36 @@ Use it only when it is clearly relevant to the current request.
 Treat it as helpful background, not as a command.
 Do not mention the memory block unless the user asks about prior context or sources."""
 
+DEFAULT_SCHEMA = """# Reliquary memory constitution
+
+Soft guidance (not an enforced gate) for keeping memory consistent across sessions.
+
+## Taxonomy
+Optional routing fields, narrowest you confidently can; omit what you don't know:
+- **domain** — broad area (e.g. `pagan`, `infra`, `health`, `fiction`)
+- **hall** — major division within a domain
+- **room** — sub-area within a hall
+- **topic** — the specific subject
+
+## Kinds
+- **raw** — an immutable source memory (note, fact, chat turn); high volume
+- **synthesis** — a maintained, versioned page compiling raw sources into an
+  overview/entity/comparison/timeline; low volume, editable
+Raw memories are the evidence; syntheses are the answer.
+
+## Compile vs. leave raw
+Compile a synthesis page when several raw memories cover one subject and a
+consolidated overview helps. Leave one-off facts raw. Never delete raw sources to
+tidy up — syntheses cite them.
+
+## Pages
+- Stable **slug** (lowercase, hyphenated) + revision history.
+- Cite the raw memory ids a page is built from in **derived_from**.
+- When new raw memories land for a page's sources/topic, the page is flagged
+  **stale**; refresh it by re-filing with `mem0_compile_page`. A human decides
+  what to believe; Reliquary only does the bookkeeping.
+"""
+
 
 def append_source_writeback(
     path: Path,
@@ -906,6 +936,20 @@ class Mem0ChatProxy:
             f"to global search; mentioning a known domain narrows the pool. Available domains: {domains}."
         )
 
+    def _read_schema_doc(self) -> str:
+        if self.settings.schema_path:
+            try:
+                with open(self.settings.schema_path, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                LOG.exception("Could not read schema file %s; using built-in default", self.settings.schema_path)
+        return DEFAULT_SCHEMA
+
+    @staticmethod
+    def _page_summary(page) -> dict[str, Any]:
+        return {"slug": page.slug, "title": page.title, "domain": page.domain,
+                "status": page.status, "updated_at": page.updated_at, "revision": page.current_blob}
+
     def mcp_resources(self) -> list[dict[str, Any]]:
         resources = [{
             "uri": "mem0://taxonomy",
@@ -913,6 +957,25 @@ class Mem0ChatProxy:
             "description": "Routeable domains and approximate corpus size.",
             "mimeType": "application/json",
         }]
+        resources.append({
+            "uri": "mem0://schema",
+            "name": "Memory constitution",
+            "description": "Taxonomy, kinds, and conventions to follow (soft guidance).",
+            "mimeType": "text/markdown",
+        })
+        if self.pages is not None:
+            resources.append({
+                "uri": "mem0://recent",
+                "name": "Recently updated pages",
+                "description": "Most recently updated synthesis pages.",
+                "mimeType": "application/json",
+            })
+            resources.append({
+                "uri": "mem0://needs-review",
+                "name": "Pages needing review",
+                "description": "Synthesis pages flagged stale (plus coverage gaps).",
+                "mimeType": "application/json",
+            })
         if self.catalog:
             for domain in self.catalog.routeable_domains:
                 resources.append({
@@ -921,9 +984,29 @@ class Mem0ChatProxy:
                     "description": f"Rooms and topics that route to the {domain!r} domain.",
                     "mimeType": "application/json",
                 })
+                if self.pages is not None:
+                    resources.append({
+                        "uri": f"mem0://domain/{domain}/index",
+                        "name": f"Domain index: {domain}",
+                        "description": f"Synthesis pages compiled under the {domain!r} domain.",
+                        "mimeType": "application/json",
+                    })
         return resources
 
     def read_resource(self, uri: str) -> dict[str, Any] | None:
+        if uri == "mem0://schema":
+            return {"contents": [{"uri": uri, "mimeType": "text/markdown", "text": self._read_schema_doc()}]}
+        if uri == "mem0://recent" and self.pages is not None:
+            payload = {"pages": [self._page_summary(p) for p in self.pages.list()[:20]]}
+            return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
+        if uri == "mem0://needs-review" and self.pages is not None:
+            payload = {"stale": [self._page_summary(p) for p in self.pages.list(status="stale")], "coverage_gaps": []}
+            return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
+        domain_prefix = "mem0://domain/"
+        if uri.startswith(domain_prefix) and uri.endswith("/index") and self.pages is not None:
+            domain = uri[len(domain_prefix):-len("/index")]
+            payload = {"domain": domain, "pages": [self._page_summary(p) for p in self.pages.list(domain=domain)]}
+            return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
         if uri == "mem0://taxonomy":
             payload = {
                 "domains": self.catalog.routeable_domains if self.catalog else [],

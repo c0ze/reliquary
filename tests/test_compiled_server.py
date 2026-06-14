@@ -425,3 +425,70 @@ def test_synthesis_leads_beyond_first_page(proxy):
     ))["structuredContent"]
     kinds = [(r.get("metadata") or {}).get("kind") for r in page2["results"]]
     assert "synthesis" in kinds  # the 6th current synthesis must surface on page 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 (#49, #52) — schema resource + wiki index resources
+# ---------------------------------------------------------------------------
+
+
+def _read_resource(proxy, uri):
+    return proxy.read_resource(uri)
+
+
+def test_schema_resource_default(proxy):
+    res = _read_resource(proxy, "mem0://schema")
+    assert res is not None
+    content = res["contents"][0]
+    assert content["mimeType"] == "text/markdown"
+    assert "constitution" in content["text"].lower() or "taxonomy" in content["text"].lower()
+
+
+def test_schema_resource_from_file(make_proxy, tmp_path):
+    schema_file = tmp_path / "schema.md"
+    schema_file.write_text("# My Custom Constitution\n", encoding="utf-8")
+    proxy = make_proxy(schema_path=str(schema_file))
+    res = _read_resource(proxy, "mem0://schema")
+    assert "My Custom Constitution" in res["contents"][0]["text"]
+
+
+def test_recent_resource_lists_pages(proxy):
+    _file_page(proxy, "alpha")
+    _file_page(proxy, "beta")
+    res = _read_resource(proxy, "mem0://recent")
+    slugs = {p["slug"] for p in __import__("json").loads(res["contents"][0]["text"])["pages"]}
+    assert {"alpha", "beta"} <= slugs
+
+
+def test_needs_review_lists_stale_pages(proxy):
+    _file_page(proxy, "fresh")
+    _file_page(proxy, "old")
+    proxy.pages.set_status("old", "stale")
+    res = _read_resource(proxy, "mem0://needs-review")
+    payload = __import__("json").loads(res["contents"][0]["text"])
+    stale_slugs = {p["slug"] for p in payload["stale"]}
+    assert "old" in stale_slugs and "fresh" not in stale_slugs
+
+
+def test_domain_index_resource(proxy):
+    _file_page(proxy, "p-pagan", domain="pagan")
+    _file_page(proxy, "p-infra", domain="infra")
+    res = _read_resource(proxy, "mem0://domain/pagan/index")
+    payload = __import__("json").loads(res["contents"][0]["text"])
+    slugs = {p["slug"] for p in payload["pages"]}
+    assert "p-pagan" in slugs and "p-infra" not in slugs
+
+
+def test_schema_resource_listed(proxy):
+    uris = {r["uri"] for r in proxy.mcp_resources()}
+    assert "mem0://schema" in uris
+    assert "mem0://recent" in uris
+    assert "mem0://needs-review" in uris
+
+
+def test_compiled_resources_absent_when_disabled(make_proxy):
+    proxy = make_proxy(compiled_collection="")
+    uris = {r["uri"] for r in proxy.mcp_resources()}
+    assert "mem0://schema" in uris            # schema always available
+    assert "mem0://recent" not in uris        # compiled-only resources hidden
+    assert "mem0://needs-review" not in uris
