@@ -57,5 +57,91 @@ class PageInfo:
     memory_id: str | None = None
 
 
+def _emit_frontmatter(info: "PageInfo") -> str:
+    """Minimal one-way YAML frontmatter for Obsidian/serving. The registry's JSON
+    sidecar is the source of truth; this is never parsed back."""
+    def scalar(v: object) -> str:
+        return "" if v is None else str(v)
+
+    lines = ["---"]
+    for key in ("slug", "title", "domain", "hall", "room", "topic", "status", "kind"):
+        val = getattr(info, key)
+        if val:
+            lines.append(f"{key}: {scalar(val)}")
+    for key in ("derived_from", "supersedes"):
+        vals = getattr(info, key)
+        if vals:
+            lines.append(f"{key}: [{', '.join(scalar(v) for v in vals)}]")
+    lines.append(f"updated_at: {info.updated_at}")
+    lines.append("---")
+    return "\n".join(lines)
+
+
+def assemble_markdown(info: "PageInfo", body: str) -> str:
+    return f"{_emit_frontmatter(info)}\n\n{body.strip()}\n"
+
+
 class PageRegistry:
-    """Stub — fleshed out in Task 1.2."""
+    def __init__(self, registry_dir: str, blobs: "BlobStore") -> None:
+        self.registry_dir = registry_dir
+        self.blobs = blobs
+        os.makedirs(self.registry_dir, exist_ok=True)
+
+    # --- paths ---
+    def _shard_dir(self, slug: str) -> str:
+        return os.path.join(self.registry_dir, slug[:2])
+
+    def _path(self, slug: str) -> str:
+        return os.path.join(self._shard_dir(slug), f"{slug}.json")
+
+    # --- read ---
+    def get(self, slug: str) -> "PageInfo | None":
+        try:
+            with open(self._path(slug), "r", encoding="utf-8") as fh:
+                return PageInfo(**json.load(fh))
+        except (FileNotFoundError, ValueError, TypeError):
+            return None
+
+    def read_body(self, slug: str) -> "tuple[str, str] | None":
+        info = self.get(slug)
+        if info is None:
+            return None
+        result = self.blobs.get(info.current_blob)
+        if result is None:
+            return None
+        data, _mime = result
+        return data.decode("utf-8"), info.current_blob
+
+    # --- write ---
+    def _save(self, info: "PageInfo") -> None:
+        os.makedirs(self._shard_dir(info.slug), exist_ok=True)
+        path = self._path(info.slug)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(asdict(info), fh)
+        os.replace(tmp, path)
+
+    def put_revision(self, slug: str, body: str, frontmatter: dict) -> "PageInfo":
+        slug = slugify(slug)
+        if not slug:
+            raise ValueError("empty slug")
+        now = time.time()
+        with _REGISTRY_LOCK:
+            existing = self.get(slug)
+            info = existing or PageInfo(slug=slug, current_blob="", created_at=now)
+            for key in ("title", "domain", "hall", "room", "topic", "status", "kind"):
+                if frontmatter.get(key) is not None:
+                    setattr(info, key, frontmatter[key])
+            for key in ("derived_from", "supersedes"):
+                if frontmatter.get(key) is not None:
+                    setattr(info, key, [str(v) for v in frontmatter[key]])
+            info.updated_at = now
+            if not info.created_at:
+                info.created_at = now
+            blob_info = self.blobs.put(assemble_markdown(info, body).encode("utf-8"),
+                                       mimetype="text/markdown")
+            if existing and existing.current_blob and existing.current_blob != blob_info.id:
+                info.history.append(existing.current_blob)
+            info.current_blob = blob_info.id
+            self._save(info)
+            return info
