@@ -504,3 +504,41 @@ def test_compiled_resources_absent_when_disabled(make_proxy):
     assert "mem0://schema" in uris            # schema always available
     assert "mem0://recent" not in uris        # compiled-only resources hidden
     assert "mem0://needs-review" not in uris
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 (#53) — ingest-time staleness fan-out on live writes
+# ---------------------------------------------------------------------------
+
+
+def test_live_add_flags_matching_page_stale(proxy):
+    # File a current page with a domain AND topic so taxonomy fan-out can match.
+    run(proxy.handle_compile_page_tool({
+        "markdown": "Deities of the pagan domain.",
+        "slug": "deities-overview",
+        "domain": "pagan",
+        "topic": "deities",
+    }))
+    assert proxy.pages.get("deities-overview").status == "current"
+    # A raw add in the same domain/topic should flag the page stale.
+    run(proxy.handle_add_memory_tool({"text": "new fact", "domain": "pagan", "topic": "deities"}))
+    assert proxy.pages.get("deities-overview").status == "stale"
+
+
+def test_live_add_different_taxonomy_leaves_page_current(proxy):
+    run(proxy.handle_compile_page_tool({
+        "markdown": "Deities of the pagan domain.",
+        "slug": "deities-overview",
+        "domain": "pagan",
+        "topic": "deities",
+    }))
+    # A raw add in a *different* domain/topic must NOT flag the page.
+    run(proxy.handle_add_memory_tool({"text": "unrelated", "domain": "infra", "topic": "containers"}))
+    assert proxy.pages.get("deities-overview").status == "current"
+
+
+def test_live_add_no_compiled_layer_is_noop(make_proxy):
+    proxy = make_proxy(compiled_collection="")
+    # Must not crash when the compiled layer is disabled.
+    result = run(proxy.handle_add_memory_tool({"text": "x", "domain": "pagan", "topic": "deities"}))
+    assert result.get("isError") is not True

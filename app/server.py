@@ -1849,6 +1849,21 @@ class Mem0ChatProxy:
             is_error=True,
         )
 
+    def _fan_out_staleness(self, source_ids: list[str], metadata: dict[str, Any]) -> None:
+        """Flag current synthesis pages deriving from the same sources/topics as a
+        freshly-added raw memory. Bookkeeping only (queue, never rewrite); wrapped
+        so it can never break the write."""
+        if self.pages is None:
+            return
+        try:
+            domain = (metadata or {}).get("domain")
+            topic = (metadata or {}).get("topic")
+            for page in self.pages.pages_deriving_from(ids=source_ids, domain=domain, topic=topic):
+                if page.status == "current":
+                    self.pages.set_status(page.slug, "stale")
+        except Exception:
+            LOG.exception("Staleness fan-out failed (non-fatal)")
+
     async def handle_add_memory_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         text = str(arguments.get("text") or "").strip()
         if not text:
@@ -1876,6 +1891,7 @@ class Mem0ChatProxy:
 
         result = await self.add_memory(text, user_id=user_id, metadata=metadata, infer=infer)
         new_ids = added_memory_ids(result)
+        self._fan_out_staleness(new_ids, metadata)
         if len(new_ids) == 1:
             id_note = f" (id={new_ids[0]})"
         elif new_ids:
