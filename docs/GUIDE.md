@@ -509,6 +509,38 @@ expose a public `*.ts.net` HTTPS URL) or a Cloudflare Tunnel for ChatGPT.
 
 ---
 
+## Compilation layer
+
+Reliquary maintains two Qdrant collections: the raw corpus (all ingested memories)
+and a **compiled synthesis layer** that stores versioned, human-readable synthesis
+pages sitting above the raw records.
+
+The compiled layer is **on by default** and is kept in its own collection
+(`reliquary_compiled`). Each synthesis page has a stable slug, a blob-backed body
+(markdown + YAML frontmatter), and a full revision history. The page registry lives
+on disk at `/data/compiled` (bind-mounted via `COMPILED_HOST_DIR` in Compose).
+
+To **disable** the compiled layer — for lightweight or read-only deployments — set
+`MEM0_COMPILED_COLLECTION` to an empty string in your `.env`. When the collection
+name is empty, `self.pages` and `self.compiled_memory` are both `None`, and the
+layer is a complete query-time no-op: no reads, no writes, no collection required.
+
+```env
+# disable compiled layer
+MEM0_COMPILED_COLLECTION=
+```
+
+Key environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MEM0_COMPILED_COLLECTION` | `reliquary_compiled` | Qdrant collection name. Empty = disabled. |
+| `COMPILED_HOST_DIR` | `./data/compiled` | Host path bind-mounted to `/data/compiled`. |
+| `MEM0_SCHEMA_PATH` | *(built-in)* | Path to an editable memory constitution file. |
+| `MEM0_LINT_COVERAGE_MIN` | `8` | Raw record threshold before lint flags a gap. |
+
+---
+
 ## Operations
 
 ```bash
