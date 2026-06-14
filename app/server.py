@@ -208,6 +208,10 @@ class ProxySettings:
     blob_signing_key: str | None = None
     blob_max_bytes: int = 31457280
     blob_url_ttl: int = 3600
+    compiled_collection: str = "reliquary_compiled"
+    compiled_dir: str = "/data/compiled"
+    schema_path: str | None = None
+    lint_coverage_min: int = 8
     state_dir: str | None = None
     static_tokens: tuple[tuple[str, str, str], ...] = ()
     audit_log_path: str | None = None
@@ -3384,6 +3388,10 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         blob_signing_key=normalize_token(args.blob_signing_key),
         blob_max_bytes=args.blob_max_bytes,
         blob_url_ttl=args.blob_url_ttl,
+        compiled_collection=args.compiled_collection,
+        compiled_dir=args.compiled_dir,
+        schema_path=args.schema_path,
+        lint_coverage_min=args.lint_coverage_min,
         state_dir=args.state_dir,
         static_tokens=parse_static_tokens(args.static_tokens),
         audit_log_path=args.audit_log,
@@ -3518,6 +3526,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-url-ingest", action=argparse.BooleanOptionalAction,
         default=os.getenv("MEM0_IMAGE_URL_INGEST", "true").lower() in {"1", "true", "yes"},
         help="Allow add_image to fetch images from a source_url server-side (default true).")
+    parser.add_argument("--compiled-collection", default=os.getenv("MEM0_COMPILED_COLLECTION", "reliquary_compiled"),
+                        help="Qdrant collection for the compiled synthesis layer. Empty disables the layer.")
+    parser.add_argument("--compiled-dir", default=os.getenv("MEM0_COMPILED_DIR", "/data/compiled"),
+                        help="Host directory for the page registry + vault export.")
+    parser.add_argument("--schema-path", default=os.getenv("MEM0_SCHEMA_PATH"),
+                        help="Path to the editable memory constitution (mem0://schema). Unset uses a built-in default.")
+    parser.add_argument("--lint-coverage-min", type=int, default=int(os.getenv("MEM0_LINT_COVERAGE_MIN", "8")),
+                        help="Min raw records in a domain/topic with no synthesis before lint flags a coverage gap.")
     return parser.parse_args()
 
 
