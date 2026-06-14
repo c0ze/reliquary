@@ -470,6 +470,33 @@ def test_needs_review_lists_stale_pages(proxy):
     assert "old" in stale_slugs and "fresh" not in stale_slugs
 
 
+def test_needs_review_surfaces_coverage_gaps(proxy):
+    # A catalog stub reports raw records in `pagan`, but no current pagan page
+    # exists, so needs-review should flag it as a coverage gap.
+    class _Cat:
+        routeable_domains = []
+        value_counts = {"domain": {"pagan": 10}}
+
+    proxy.catalog = _Cat()
+    res = _read_resource(proxy, "mem0://needs-review")
+    payload = __import__("json").loads(res["contents"][0]["text"])
+    gap_domains = {g["domain"] for g in payload["coverage_gaps"]}
+    assert "pagan" in gap_domains
+
+
+def test_needs_review_no_gap_when_domain_covered(proxy):
+    class _Cat:
+        routeable_domains = []
+        value_counts = {"domain": {"pagan": 10}}
+
+    proxy.catalog = _Cat()
+    _file_page(proxy, "pagan-page", domain="pagan", status="current")
+    res = _read_resource(proxy, "mem0://needs-review")
+    payload = __import__("json").loads(res["contents"][0]["text"])
+    gap_domains = {g["domain"] for g in payload["coverage_gaps"]}
+    assert "pagan" not in gap_domains  # covered by a current page
+
+
 def test_domain_index_resource(proxy):
     _file_page(proxy, "p-pagan", domain="pagan")
     _file_page(proxy, "p-infra", domain="infra")

@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urljoin
 
 import httpx
 
+import health
 from ingest import load_config
 from oauth import OAuthProvider, RegistrationDisabledError, scope_is_write
 from catalog import CorpusCatalog
@@ -1000,7 +1001,12 @@ class Mem0ChatProxy:
             payload = {"pages": [self._page_summary(p) for p in self.pages.list()[:20]]}
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
         if uri == "mem0://needs-review" and self.pages is not None:
-            payload = {"stale": [self._page_summary(p) for p in self.pages.list(status="stale")], "coverage_gaps": []}
+            pages = self.pages.list()
+            raw_counts = dict(self.catalog.value_counts["domain"]) if self.catalog else {}
+            payload = {
+                "stale": [self._page_summary(p) for p in pages if p.status == "stale"],
+                "coverage_gaps": health.coverage_gaps(pages, raw_counts, min_count=self.settings.lint_coverage_min),
+            }
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
         domain_prefix = "mem0://domain/"
         if uri.startswith(domain_prefix) and uri.endswith("/index") and self.pages is not None:
