@@ -238,7 +238,7 @@ class PendingUpload:
 
 
 class Mem0ChatProxy:
-    def __init__(self, settings: ProxySettings, *, memory: Any = None) -> None:
+    def __init__(self, settings: ProxySettings, *, memory: Any = None, compiled_memory: Any = None) -> None:
         self.settings = settings
         self.config = load_config(settings.config_path)
         if memory is not None:
@@ -328,6 +328,21 @@ class Mem0ChatProxy:
                 "MEM0_BLOB_SIGNING_KEY is unset; using a random per-process key. "
                 "Signed blob URLs will invalidate on restart."
             )
+
+        self.pages = None
+        self.compiled_memory = None
+        if settings.compiled_collection:
+            from compiled import PageRegistry
+            self.pages = PageRegistry(registry_dir=settings.compiled_dir, blobs=self.blobs)
+            if compiled_memory is not None:
+                self.compiled_memory = compiled_memory
+            else:
+                import copy
+                from mem0 import Memory
+                compiled_config = copy.deepcopy(self.config)
+                compiled_config.setdefault("vector_store", {}).setdefault("config", {})
+                compiled_config["vector_store"]["config"]["collection_name"] = settings.compiled_collection
+                self.compiled_memory = Memory.from_config(compiled_config)
 
         self.metrics = Metrics()
         self.audit = AuditLog(settings.audit_log_path)

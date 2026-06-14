@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import server  # noqa: E402
 from server import Mem0ChatProxy, ProxySettings  # noqa: E402
+from conftest import FakeMemory  # noqa: E402
 
 
 class RecordingMemory:
@@ -63,8 +64,10 @@ def test_writeback_turn_appends_source_note_when_configured(tmp_path, monkeypatc
             writeback=True,
             writeback_path=str(output),
             blob_dir=str(tmp_path / "blobs"),
+            compiled_dir=str(tmp_path / "compiled"),
         ),
         memory=memory,
+        compiled_memory=FakeMemory(),
     )
 
     asyncio.run(
@@ -102,8 +105,10 @@ def test_writeback_turn_swallows_source_note_errors(tmp_path, monkeypatch):
             writeback=True,
             writeback_path=str(tmp_path / "Writeback.md"),
             blob_dir=str(tmp_path / "blobs"),
+            compiled_dir=str(tmp_path / "compiled"),
         ),
         memory=RecordingMemory(),
+        compiled_memory=FakeMemory(),
     )
 
     asyncio.run(
