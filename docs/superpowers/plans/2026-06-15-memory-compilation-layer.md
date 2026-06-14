@@ -169,7 +169,7 @@ def test_create_get_read_roundtrip(tmp_path):
     assert got is not None and got.current_blob == info.current_blob
     body, blob_id = reg.read_body("brigid")
     assert "Forge goddess." in body and blob_id == info.current_blob
-    assert "---\ntitle: Brigid" in body  # frontmatter prepended
+    assert body.startswith("---\n") and "title: Brigid" in body  # frontmatter prepended
 
 
 def test_get_unknown_returns_none(tmp_path):
