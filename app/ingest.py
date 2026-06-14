@@ -62,6 +62,18 @@ def existing_import_index(memory: Any, *, user_id: str) -> dict[str, dict[str, A
     return index
 
 
+def _fan_out_bulk(page_registry, touched_ids: set[str], touched_tax: set) -> None:
+    """One-pass staleness fan-out after a bulk import (avoids O(records*pages))."""
+    try:
+        for page in page_registry.list(status="current"):
+            if (touched_ids & set(page.derived_from)) or (
+                page.domain and page.topic and (page.domain, page.topic) in touched_tax
+            ):
+                page_registry.set_status(page.slug, "stale")
+    except Exception:
+        pass
+
+
 def ingest_records(
     memory: Any,
     records: list[dict[str, Any]],
@@ -69,9 +81,12 @@ def ingest_records(
     user_id: str,
     infer: bool = False,
     incremental: bool = False,
+    page_registry=None,
 ) -> dict[str, int]:
     existing = existing_import_index(memory, user_id=user_id) if incremental else {}
     summary = {"selected": len(records), "added": 0, "updated": 0, "skipped": 0}
+    touched_ids: set[str] = set()
+    touched_tax: set[tuple[str, str]] = set()
 
     for item in records:
         metadata = import_metadata(item)
@@ -83,9 +98,22 @@ def ingest_records(
         if previous and hasattr(memory, "update"):
             memory.update(previous["id"], item["text"], metadata)
             summary["updated"] += 1
+            touched_ids.add(str(item["id"]))
+            d = str(metadata.get("domain") or "")
+            t = str(metadata.get("topic") or "")
+            if d and t:
+                touched_tax.add((d, t))
             continue
         memory.add(item["text"], user_id=user_id, metadata=metadata, infer=infer)
         summary["added"] += 1
+        touched_ids.add(str(item["id"]))
+        d = str(metadata.get("domain") or "")
+        t = str(metadata.get("topic") or "")
+        if d and t:
+            touched_tax.add((d, t))
+
+    if page_registry is not None and (touched_ids or touched_tax):
+        _fan_out_bulk(page_registry, touched_ids, touched_tax)
 
     return summary
 
@@ -294,12 +322,24 @@ def main() -> None:
 
     config = load_config(args.config)
     memory = Memory.from_config(config)
+    page_registry = None
+    if os.getenv("MEM0_COMPILED_COLLECTION", "reliquary_compiled"):
+        try:
+            from blobs import BlobStore
+            from compiled import PageRegistry
+            page_registry = PageRegistry(
+                registry_dir=os.getenv("MEM0_COMPILED_DIR", "/data/compiled"),
+                blobs=BlobStore(blob_dir=os.getenv("MEM0_BLOB_DIR", "/data/blobs"), signing_key=b"ingest", max_bytes=0),
+            )
+        except Exception:
+            page_registry = None
     summary = ingest_records(
         memory,
         ordered,
         user_id=args.user_id,
         infer=args.infer,
         incremental=args.incremental,
+        page_registry=page_registry,
     )
     print(
         "Ingest complete: "
