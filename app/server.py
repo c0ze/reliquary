@@ -1781,6 +1781,34 @@ class Mem0ChatProxy:
             structured={"slug": slug, "revision": info.current_blob, "memory_id": memory_id,
                         "url": url, "derived_from": derived_from, "status": status})
 
+    async def handle_list_pages_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.pages is None:
+            return self.mcp_tool_result(text="The compiled layer is not configured.",
+                                        structured={"error": "compiled_disabled"}, is_error=True)
+        domain = str(arguments.get("domain") or "").strip() or None
+        status = str(arguments.get("status") or "").strip() or None
+        pages = self.pages.list(domain=domain, status=status)
+        summaries = [{"slug": p.slug, "title": p.title, "domain": p.domain, "status": p.status,
+                      "updated_at": p.updated_at, "revision": p.current_blob} for p in pages]
+        return self.mcp_tool_result(text=f"{len(summaries)} page(s).", structured={"pages": summaries})
+
+    async def handle_page_history_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.pages is None:
+            return self.mcp_tool_result(text="The compiled layer is not configured.",
+                                        structured={"error": "compiled_disabled"}, is_error=True)
+        slug = str(arguments.get("slug") or "").strip()
+        if not slug:
+            return self.mcp_tool_result(text="A non-empty `slug` is required.",
+                                        structured={"error": "missing_slug"}, is_error=True)
+        info = self.pages.get(slug)
+        if info is None:
+            return self.mcp_tool_result(text=f"No page found for slug={slug}.",
+                                        structured={"error": "not_found", "slug": slug}, is_error=True)
+        revisions = [info.current_blob] + list(reversed(info.history))
+        return self.mcp_tool_result(text=f"{len(revisions)} revision(s) for {slug}.",
+                                    structured={"slug": slug, "current": info.current_blob,
+                                                "history": list(info.history), "revisions": revisions})
+
     def _load_pending_uploads(self) -> None:
         """Restore persisted upload slots (if a state_dir is configured) and reap
         any that already expired while the process was down — otherwise bytes that

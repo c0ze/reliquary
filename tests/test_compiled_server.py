@@ -149,3 +149,103 @@ def test_compile_page_derived_from_in_result(proxy):
         "derived_from": ["id-a", "id-b"],
     }))
     assert result["structuredContent"]["derived_from"] == ["id-a", "id-b"]
+
+
+# ---------------------------------------------------------------------------
+# Task 3.3 — handle_list_pages_tool + handle_page_history_tool
+# ---------------------------------------------------------------------------
+
+
+def _file_page(proxy, slug, markdown="Content", domain=None, status="current"):
+    args = {"markdown": markdown, "slug": slug}
+    if domain:
+        args["domain"] = domain
+    if status != "current":
+        args["status"] = status
+    return run(proxy.handle_compile_page_tool(args))
+
+
+def test_list_pages_empty(proxy):
+    result = run(proxy.handle_list_pages_tool({}))
+    assert result.get("isError") is not True
+    assert result["structuredContent"]["pages"] == []
+
+
+def test_list_pages_returns_all(proxy):
+    _file_page(proxy, "page-one")
+    _file_page(proxy, "page-two")
+    result = run(proxy.handle_list_pages_tool({}))
+    slugs = {p["slug"] for p in result["structuredContent"]["pages"]}
+    assert "page-one" in slugs
+    assert "page-two" in slugs
+
+
+def test_list_pages_filter_by_domain(proxy):
+    _file_page(proxy, "pagan-page", domain="pagan")
+    _file_page(proxy, "other-page", domain="other")
+    result = run(proxy.handle_list_pages_tool({"domain": "pagan"}))
+    slugs = {p["slug"] for p in result["structuredContent"]["pages"]}
+    assert "pagan-page" in slugs
+    assert "other-page" not in slugs
+
+
+def test_list_pages_filter_by_status(proxy):
+    _file_page(proxy, "current-page", status="current")
+    _file_page(proxy, "stale-page", status="stale")
+    result = run(proxy.handle_list_pages_tool({"status": "current"}))
+    slugs = {p["slug"] for p in result["structuredContent"]["pages"]}
+    assert "current-page" in slugs
+    assert "stale-page" not in slugs
+
+
+def test_list_pages_summary_shape(proxy):
+    _file_page(proxy, "shape-page")
+    result = run(proxy.handle_list_pages_tool({}))
+    page = result["structuredContent"]["pages"][0]
+    for key in ("slug", "title", "domain", "status", "updated_at", "revision"):
+        assert key in page, f"Missing key {key!r} in page summary"
+
+
+def test_list_pages_disabled_layer(make_proxy):
+    proxy = make_proxy(compiled_collection="")
+    result = run(proxy.handle_list_pages_tool({}))
+    assert result.get("isError") is True
+    assert result["structuredContent"]["error"] == "compiled_disabled"
+
+
+def test_page_history_single_revision(proxy):
+    _file_page(proxy, "history-page")
+    result = run(proxy.handle_page_history_tool({"slug": "history-page"}))
+    assert result.get("isError") is not True
+    sc = result["structuredContent"]
+    assert sc["slug"] == "history-page"
+    assert sc["current"] is not None
+    assert len(sc["revisions"]) == 1
+
+
+def test_page_history_multiple_revisions(proxy):
+    _file_page(proxy, "multi-rev", markdown="V1")
+    _file_page(proxy, "multi-rev", markdown="V2")
+    result = run(proxy.handle_page_history_tool({"slug": "multi-rev"}))
+    sc = result["structuredContent"]
+    assert len(sc["revisions"]) == 2
+    assert len(sc["history"]) == 1
+
+
+def test_page_history_not_found(proxy):
+    result = run(proxy.handle_page_history_tool({"slug": "no-such-slug"}))
+    assert result.get("isError") is True
+    assert result["structuredContent"]["error"] == "not_found"
+
+
+def test_page_history_missing_slug(proxy):
+    result = run(proxy.handle_page_history_tool({}))
+    assert result.get("isError") is True
+    assert result["structuredContent"]["error"] == "missing_slug"
+
+
+def test_page_history_disabled_layer(make_proxy):
+    proxy = make_proxy(compiled_collection="")
+    result = run(proxy.handle_page_history_tool({"slug": "any"}))
+    assert result.get("isError") is True
+    assert result["structuredContent"]["error"] == "compiled_disabled"
