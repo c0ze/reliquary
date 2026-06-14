@@ -876,8 +876,9 @@ class Mem0ChatProxy:
     def _tool_category(tool_name: str) -> str:
         writes = {"mem0_add_memory", "add_memory", "mem0_delete", "delete",
                   "mem0_update", "update", "add_image", "delete_image",
-                  "create_image_upload", "commit_image_upload"}
-        reads = {"mem0_search", "search", "mem0_fetch", "fetch", "fetch_image", "list_domains"}
+                  "create_image_upload", "commit_image_upload", "mem0_compile_page"}
+        reads = {"mem0_search", "search", "mem0_fetch", "fetch", "fetch_image", "list_domains",
+                 "mem0_list_pages", "mem0_page_history"}
         if tool_name in writes:
             return "write"
         if tool_name in reads:
@@ -1245,6 +1246,20 @@ class Mem0ChatProxy:
                     "additionalProperties": False,
                 },
             },
+            {
+                "name": "mem0_list_pages",
+                "title": "List Synthesis Pages",
+                "description": "List compiled synthesis pages, optionally filtered by domain and/or status.",
+                "annotations": read_only,
+                "inputSchema": {"type": "object", "properties": {"domain": {"type": "string"}, "status": {"type": "string"}}, "additionalProperties": False},
+            },
+            {
+                "name": "mem0_page_history",
+                "title": "Synthesis Page History",
+                "description": "List the revision history (blob ids) of a compiled page by slug.",
+                "annotations": read_only,
+                "inputSchema": {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"], "additionalProperties": False},
+            },
         ]
         if can_write:
             claude_tools.extend([
@@ -1352,6 +1367,29 @@ class Mem0ChatProxy:
                     },
                 },
                 *self._upload_flow_tools(),
+                {
+                    "name": "mem0_compile_page",
+                    "title": "Compile Synthesis Page",
+                    "description": "File a synthesized, human-readable page into the compiled layer. YOU author the "
+                    "markdown (Reliquary never generates prose); it is versioned, indexed for recall, and linked to its "
+                    "sources. Re-filing the same slug adds a revision. Cite raw memory ids in derived_from.",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "markdown": {"type": "string", "description": "The synthesis body (markdown)."},
+                            "slug": {"type": "string", "description": "Stable page id; derived from title/topic if omitted."},
+                            "title": {"type": "string"},
+                            "derived_from": {"type": "array", "items": {"type": "string"}, "description": "Raw memory ids this synthesis is based on."},
+                            "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Slugs this page supersedes."},
+                            "domain": {"type": "string"}, "hall": {"type": "string"}, "room": {"type": "string"}, "topic": {"type": "string"},
+                            "status": {"type": "string", "description": "current | stale | draft | archived (default current)."},
+                            "user_id": {"type": "string"},
+                        },
+                        "required": ["markdown"],
+                        "additionalProperties": False,
+                    },
+                },
             ])
         return claude_tools
 
@@ -1466,6 +1504,10 @@ class Mem0ChatProxy:
                 return await self.handle_search_tool(arguments)
             if tool_name == "mem0_fetch":
                 return await self.handle_fetch_tool(arguments)
+            if tool_name == "mem0_list_pages":
+                return await self.handle_list_pages_tool(arguments)
+            if tool_name == "mem0_page_history":
+                return await self.handle_page_history_tool(arguments)
             if tool_name == "fetch_image":
                 return await self.handle_fetch_image_tool(arguments)
             if tool_name == "mem0_add_memory":
@@ -1492,6 +1534,14 @@ class Mem0ChatProxy:
                         is_error=True,
                     )
                 return await self.handle_update_tool(arguments, allow_user_id=True)
+            if tool_name == "mem0_compile_page":
+                if not can_write:
+                    return self.mcp_tool_result(
+                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+                        structured={"error": "insufficient_scope"},
+                        is_error=True,
+                    )
+                return await self.handle_compile_page_tool(arguments, allow_user_id=True)
             if tool_name == "add_image":
                 if not can_write:
                     return self.mcp_tool_result(

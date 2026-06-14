@@ -249,3 +249,86 @@ def test_page_history_disabled_layer(make_proxy):
     result = run(proxy.handle_page_history_tool({"slug": "any"}))
     assert result.get("isError") is True
     assert result["structuredContent"]["error"] == "compiled_disabled"
+
+
+# ---------------------------------------------------------------------------
+# Task 3.4 — call_mcp_tool dispatch + tool list
+# ---------------------------------------------------------------------------
+
+
+def test_compile_page_via_call_mcp_tool_with_write(proxy):
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    result = run(proxy.call_mcp_tool(
+        profile, "mem0_compile_page",
+        {"markdown": "Hello synthesis", "slug": "dispatch-test"},
+        can_write=True,
+    ))
+    assert result.get("isError") is not True
+    assert result["structuredContent"]["slug"] == "dispatch-test"
+
+
+def test_compile_page_via_call_mcp_tool_without_write(proxy):
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    result = run(proxy.call_mcp_tool(
+        profile, "mem0_compile_page",
+        {"markdown": "Hello synthesis", "slug": "dispatch-test"},
+        can_write=False,
+    ))
+    assert result.get("isError") is True
+    assert result["structuredContent"]["error"] == "insufficient_scope"
+
+
+def test_list_pages_via_call_mcp_tool(proxy):
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    result = run(proxy.call_mcp_tool(
+        profile, "mem0_list_pages", {}, can_write=False,
+    ))
+    assert result.get("isError") is not True
+    assert "pages" in result["structuredContent"]
+
+
+def test_page_history_via_call_mcp_tool(proxy):
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    # File a page first
+    run(proxy.call_mcp_tool(
+        profile, "mem0_compile_page",
+        {"markdown": "Content", "slug": "mcp-history-test"},
+        can_write=True,
+    ))
+    result = run(proxy.call_mcp_tool(
+        profile, "mem0_page_history",
+        {"slug": "mcp-history-test"},
+        can_write=False,
+    ))
+    assert result.get("isError") is not True
+    assert result["structuredContent"]["slug"] == "mcp-history-test"
+
+
+def test_mcp_tools_for_claude_read_includes_list_and_history(proxy):
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    tools = proxy.mcp_tools_for(profile, can_write=False)
+    names = {t["name"] for t in tools}
+    assert "mem0_list_pages" in names
+    assert "mem0_page_history" in names
+    # compile_page must NOT appear in read-only list
+    assert "mem0_compile_page" not in names
+
+
+def test_mcp_tools_for_claude_write_includes_compile_page(proxy):
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    tools = proxy.mcp_tools_for(profile, can_write=True)
+    names = {t["name"] for t in tools}
+    assert "mem0_compile_page" in names
+    assert "mem0_list_pages" in names
+    assert "mem0_page_history" in names
+
+
+def test_new_tools_not_on_openai_endpoint(proxy):
+    """New compiled tools must NOT appear on the OpenAI endpoint."""
+    profile = proxy.endpoint_profiles[proxy.settings.openai_mcp_path]
+    for can_write in (False, True):
+        tools = proxy.mcp_tools_for(profile, can_write=can_write)
+        names = {t["name"] for t in tools}
+        assert "mem0_compile_page" not in names
+        assert "mem0_list_pages" not in names
+        assert "mem0_page_history" not in names
