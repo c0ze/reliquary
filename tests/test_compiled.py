@@ -62,14 +62,12 @@ def test_update_creates_revision_and_history(tmp_path, monkeypatch):
     assert "v2 body" in body and "v1 body" not in body
 
 
-def test_identical_refile_is_noop_revision(tmp_path, monkeypatch):
+def test_identical_refile_is_noop_revision(tmp_path):
     reg = _registry(tmp_path)
-    import compiled
-    monkeypatch.setattr(compiled.time, "time", lambda: 1000.0)  # frozen clock
     a = reg.put_revision("p", "same", {"title": "P"})
     b = reg.put_revision("p", "same", {"title": "P"})
     assert a.current_blob == b.current_blob
-    assert b.history == []  # no new revision recorded
+    assert b.history == []  # identical content => no new revision, even at a later time
 
 
 def test_list_history_status_provenance(tmp_path):

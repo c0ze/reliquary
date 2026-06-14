@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from blobs import BlobStore
 
-_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _REGISTRY_LOCK = threading.Lock()
 
 VALID_STATUSES = ("current", "stale", "draft", "archived")
@@ -72,7 +71,6 @@ def _emit_frontmatter(info: "PageInfo") -> str:
         vals = getattr(info, key)
         if vals:
             lines.append(f"{key}: [{', '.join(scalar(v) for v in vals)}]")
-    lines.append(f"updated_at: {info.updated_at}")
     lines.append("---")
     return "\n".join(lines)
 
@@ -98,7 +96,9 @@ class PageRegistry:
     def get(self, slug: str) -> "PageInfo | None":
         try:
             with open(self._path(slug), "r", encoding="utf-8") as fh:
-                return PageInfo(**json.load(fh))
+                data = json.load(fh)
+            fields = {k: v for k, v in data.items() if k in PageInfo.__dataclass_fields__}
+            return PageInfo(**fields)
         except (FileNotFoundError, ValueError, TypeError):
             return None
 
@@ -191,6 +191,8 @@ class PageRegistry:
 
     def pages_deriving_from(self, *, ids=(), domain: str | None = None,
                             topic: str | None = None) -> "list[PageInfo]":
+        """Pages whose synthesis derives from any of ``ids``, or (when there is no
+        id match) whose ``domain`` AND ``topic`` both match. Pass either or both."""
         idset = set(ids)
         out = []
         for info in self._iter_pages():
