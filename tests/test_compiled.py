@@ -70,3 +70,25 @@ def test_identical_refile_is_noop_revision(tmp_path, monkeypatch):
     b = reg.put_revision("p", "same", {"title": "P"})
     assert a.current_blob == b.current_blob
     assert b.history == []  # no new revision recorded
+
+
+def test_list_history_status_provenance(tmp_path):
+    reg = _registry(tmp_path)
+    reg.put_revision("brigid", "b", {"domain": "pagan", "topic": "deities", "derived_from": ["r1"]})
+    reg.put_revision("morrigan", "m", {"domain": "pagan", "topic": "deities", "derived_from": ["r2"]})
+    reg.put_revision("docker", "d", {"domain": "infra", "topic": "containers", "derived_from": ["r3"]})
+
+    assert {p.slug for p in reg.list(domain="pagan")} == {"brigid", "morrigan"}
+
+    reg.set_status("brigid", "stale")
+    assert reg.get("brigid").status == "stale"
+    assert {p.slug for p in reg.list(status="stale")} == {"brigid"}
+    assert reg.get("brigid").history == []  # status flag did NOT mint a revision
+
+    reg.set_memory_id("brigid", "mem-99")
+    assert reg.get("brigid").memory_id == "mem-99"
+
+    by_id = {p.slug for p in reg.pages_deriving_from(ids=["r2"])}
+    assert by_id == {"morrigan"}
+    by_tax = {p.slug for p in reg.pages_deriving_from(domain="pagan", topic="deities")}
+    assert by_tax == {"brigid", "morrigan"}

@@ -145,3 +145,57 @@ class PageRegistry:
             info.current_blob = blob_info.id
             self._save(info)
             return info
+
+    def _iter_pages(self):
+        for shard in os.listdir(self.registry_dir):
+            shard_path = os.path.join(self.registry_dir, shard)
+            if not os.path.isdir(shard_path):
+                continue
+            for name in os.listdir(shard_path):
+                if name.endswith(".json"):
+                    info = self.get(name[:-5])
+                    if info is not None:
+                        yield info
+
+    def list(self, *, domain: str | None = None, status: str | None = None) -> "list[PageInfo]":
+        out = []
+        for info in self._iter_pages():
+            if domain is not None and info.domain != domain:
+                continue
+            if status is not None and info.status != status:
+                continue
+            out.append(info)
+        return sorted(out, key=lambda p: p.updated_at, reverse=True)
+
+    def history(self, slug: str) -> "list[str]":
+        info = self.get(slug)
+        return list(info.history) if info else []
+
+    def set_status(self, slug: str, status: str) -> "PageInfo | None":
+        with _REGISTRY_LOCK:
+            info = self.get(slug)
+            if info is None:
+                return None
+            info.status = status
+            info.updated_at = time.time()
+            self._save(info)
+            return info
+
+    def set_memory_id(self, slug: str, memory_id: str) -> None:
+        with _REGISTRY_LOCK:
+            info = self.get(slug)
+            if info is None:
+                return
+            info.memory_id = memory_id
+            self._save(info)
+
+    def pages_deriving_from(self, *, ids=(), domain: str | None = None,
+                            topic: str | None = None) -> "list[PageInfo]":
+        idset = set(ids)
+        out = []
+        for info in self._iter_pages():
+            if idset and idset.intersection(info.derived_from):
+                out.append(info)
+            elif domain and topic and info.domain == domain and info.topic == topic:
+                out.append(info)
+        return out
