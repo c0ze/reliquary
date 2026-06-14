@@ -1726,6 +1726,61 @@ class Mem0ChatProxy:
             structured={"ids": new_ids, "user_id": user_id, "infer": infer, "metadata": metadata},
         )
 
+    async def _index_compiled_page(self, info, body, *, user_id, metadata):
+        text = f"{info.title}\n\n{body}".strip() if info.title else body
+        async with self.memory_lock.write():
+            if info.memory_id:
+                try:
+                    await asyncio.to_thread(self.compiled_memory.update, info.memory_id, text, metadata=metadata)
+                    return info.memory_id
+                except Exception:
+                    LOG.exception("Compiled re-index failed for slug=%s; adding fresh", info.slug)
+            result = await asyncio.to_thread(self.compiled_memory.add, text, user_id=user_id, metadata=metadata, infer=False)
+        ids = added_memory_ids(result)
+        return ids[0] if ids else None
+
+    async def handle_compile_page_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
+        if self.pages is None or self.compiled_memory is None:
+            return self.mcp_tool_result(text="The compiled layer is not configured.",
+                                        structured={"error": "compiled_disabled"}, is_error=True)
+        from compiled import slugify
+        markdown = str(arguments.get("markdown") or "").strip()
+        if not markdown:
+            return self.mcp_tool_result(text="A non-empty `markdown` is required.",
+                                        structured={"error": "missing_markdown"}, is_error=True)
+        title = str(arguments.get("title") or "").strip()
+        slug = slugify(str(arguments.get("slug") or "") or title or str(arguments.get("topic") or ""))
+        if not slug:
+            return self.mcp_tool_result(text="Provide a `slug`, `title`, or `topic` to name the page.",
+                                        structured={"error": "missing_slug"}, is_error=True)
+        derived_from = [str(x) for x in (arguments.get("derived_from") or []) if str(x).strip()]
+        supersedes = [str(x) for x in (arguments.get("supersedes") or []) if str(x).strip()]
+        status = str(arguments.get("status") or "current")
+        frontmatter: dict[str, Any] = {"title": title or slug, "status": status,
+                                       "derived_from": derived_from, "supersedes": supersedes}
+        for key in ("domain", "hall", "room", "topic"):
+            value = arguments.get(key)
+            if value is not None and str(value).strip():
+                frontmatter[key] = str(value).strip()
+        try:
+            info = await asyncio.to_thread(self.pages.put_revision, slug, markdown, frontmatter)
+        except BlobTooLarge as exc:
+            return self.mcp_tool_result(text=str(exc), structured={"error": "too_large", "max_bytes": exc.max_bytes}, is_error=True)
+        user_id = str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
+        metadata = {"kind": "synthesis", "source_group": "compiled", "slug": slug,
+                    "blob_ref": info.current_blob, "derived_from": derived_from}
+        for key in ("domain", "hall", "room", "topic"):
+            if getattr(info, key):
+                metadata[key] = getattr(info, key)
+        memory_id = await self._index_compiled_page(info, markdown, user_id=user_id, metadata=metadata)
+        if memory_id:
+            self.pages.set_memory_id(slug, memory_id)
+        url = self._signed_blob_url(info.current_blob)
+        return self.mcp_tool_result(
+            text=f"Filed synthesis page slug={slug} (revision {info.current_blob[:12]}, status={status}).",
+            structured={"slug": slug, "revision": info.current_blob, "memory_id": memory_id,
+                        "url": url, "derived_from": derived_from, "status": status})
+
     def _load_pending_uploads(self) -> None:
         """Restore persisted upload slots (if a state_dir is configured) and reap
         any that already expired while the process was down — otherwise bytes that
