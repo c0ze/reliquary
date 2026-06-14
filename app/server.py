@@ -1648,7 +1648,10 @@ class Mem0ChatProxy:
             key=lambda item: (-self._numeric_score(item.get("score")), str(item.get("id") or "")),
         )
         # Synthesis-first (#50): a current synthesis leads; raw hits follow as evidence.
-        synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=limit)
+        # Use result_cap (not limit) so paginated pages past the first still see syntheses.
+        synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
+        # synthesis ids are slugs, raw ids are mem0 uuids — disjoint namespaces, so this
+        # dedupe is a safety guard, not a real overlap risk.
         synthesis_ids = {str(s.get("id")) for s in synthesis_results}
         combined = synthesis_results + [r for r in raw_results if str(r.get("id")) not in synthesis_ids]
         next_cursor = str(offset + limit) if len(combined) > offset + limit else None

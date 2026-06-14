@@ -412,3 +412,16 @@ def test_search_unaffected_when_compiled_disabled(make_proxy):
     sc = run(proxy.call_mcp_tool(profile, "mem0_search", {"query": "brigid"}, can_write=False))["structuredContent"]
     kinds = [(r.get("metadata") or {}).get("kind") for r in sc["results"]]
     assert "synthesis" not in kinds  # no compiled layer => no synthesis hits, no crash
+
+
+def test_synthesis_leads_beyond_first_page(proxy):
+    # Regression: the synthesis pre-pass must be fetched up to result_cap, not just
+    # `limit`, so syntheses past the first page are not silently dropped on page 2+.
+    for i in range(6):
+        _file_page(proxy, f"page-{i}", markdown=f"synthesis number {i}")
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    page2 = run(proxy.call_mcp_tool(
+        profile, "mem0_search", {"query": "synthesis", "limit": 5, "cursor": 5}, can_write=False,
+    ))["structuredContent"]
+    kinds = [(r.get("metadata") or {}).get("kind") for r in page2["results"]]
+    assert "synthesis" in kinds  # the 6th current synthesis must surface on page 2
