@@ -479,6 +479,18 @@ def test_domain_index_resource(proxy):
     assert "p-pagan" in slugs and "p-infra" not in slugs
 
 
+def test_domain_index_listed_with_catalog(proxy):
+    # The per-domain index URI is only listed when a catalog supplies routeable
+    # domains AND the compiled layer is enabled.
+    class _Cat:
+        routeable_domains = ["pagan"]
+
+    proxy.catalog = _Cat()
+    _file_page(proxy, "p-pagan", domain="pagan")
+    uris = {r["uri"] for r in proxy.mcp_resources()}
+    assert "mem0://domain/pagan/index" in uris
+
+
 def test_schema_resource_listed(proxy):
     uris = {r["uri"] for r in proxy.mcp_resources()}
     assert "mem0://schema" in uris
