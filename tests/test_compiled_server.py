@@ -373,3 +373,42 @@ def test_mem0_fetch_page_with_missing_blob_errors(proxy):
     result = run(proxy.handle_fetch_tool({"id": "ghost"}))
     assert result.get("isError") is True
     assert result["structuredContent"]["error"] == "blob_missing"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 (#50) — synthesis-first retrieval
+# ---------------------------------------------------------------------------
+
+
+def _claude_search(proxy, query, limit=5):
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    return run(proxy.call_mcp_tool(profile, "mem0_search", {"query": query, "limit": limit}, can_write=False))
+
+
+def test_current_synthesis_leads_results(proxy):
+    # raw memory + a current synthesis page both match
+    run(proxy.handle_add_memory_tool({"text": "Brigid is a forge goddess"}))
+    _file_page(proxy, "brigid", markdown="Brigid: forge, poetry, healing.")
+    sc = _claude_search(proxy, "brigid")["structuredContent"]
+    assert sc["results"], "expected results"
+    first = sc["results"][0]
+    assert first["id"] == "brigid"
+    assert (first.get("metadata") or {}).get("kind") == "synthesis"
+
+
+def test_stale_synthesis_does_not_lead(proxy):
+    run(proxy.handle_add_memory_tool({"text": "Brigid is a forge goddess"}))
+    _file_page(proxy, "brigid", markdown="Brigid notes")
+    proxy.pages.set_status("brigid", "stale")
+    sc = _claude_search(proxy, "brigid")["structuredContent"]
+    kinds = [(r.get("metadata") or {}).get("kind") for r in sc["results"]]
+    assert "synthesis" not in kinds  # stale page must not lead
+
+
+def test_search_unaffected_when_compiled_disabled(make_proxy):
+    proxy = make_proxy(compiled_collection="")
+    run(proxy.handle_add_memory_tool({"text": "plain raw memory about brigid"}))
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    sc = run(proxy.call_mcp_tool(profile, "mem0_search", {"query": "brigid"}, can_write=False))["structuredContent"]
+    kinds = [(r.get("metadata") or {}).get("kind") for r in sc["results"]]
+    assert "synthesis" not in kinds  # no compiled layer => no synthesis hits, no crash

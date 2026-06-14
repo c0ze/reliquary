@@ -65,6 +65,9 @@ MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
 LIVE_LEXICAL_SCAN_LIMIT = 5000
+# Minimum vector score for a current synthesis page to lead search results.
+# 0.0 = lead whenever a current synthesis matches at all (simple MVP; tunable).
+COMPILED_LEAD_MIN_SCORE = 0.0
 
 SERVER_TITLE = "Reliquary"
 SERVER_WEBSITE_URL = "https://github.com/c0ze/reliquary"
@@ -1640,12 +1643,16 @@ class Mem0ChatProxy:
 
         # Order by relevance score across ALL routes, not by route priority, so the
         # best hit (e.g. an exact lexical match) ranks first wherever it came from.
-        results = sorted(
+        raw_results = sorted(
             by_key.values(),
             key=lambda item: (-self._numeric_score(item.get("score")), str(item.get("id") or "")),
         )
-        next_cursor = str(offset + limit) if len(results) > offset + limit else None
-        results = results[offset:offset + limit]
+        # Synthesis-first (#50): a current synthesis leads; raw hits follow as evidence.
+        synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=limit)
+        synthesis_ids = {str(s.get("id")) for s in synthesis_results}
+        combined = synthesis_results + [r for r in raw_results if str(r.get("id")) not in synthesis_ids]
+        next_cursor = str(offset + limit) if len(combined) > offset + limit else None
+        results = combined[offset:offset + limit]
         lines = [f"Search for {query!r} returned {len(results)} result(s)."]
         structured_results: list[dict[str, Any]] = []
         for index, item in enumerate(results, start=1):
@@ -2863,6 +2870,60 @@ class Mem0ChatProxy:
 
         matches.sort(key=lambda hit: (-self._numeric_score(hit.get("score")), str(hit.get("id") or "")))
         return matches[:limit]
+
+    async def _synthesis_first_hits(self, query: str, *, user_id: str, limit: int) -> list[dict[str, Any]]:
+        """Compiled-layer pre-pass for synthesis-first retrieval (#50).
+
+        Returns current (non-stale) synthesis pages matching the query, shaped like
+        enriched raw hits, so they can lead the result set. Status is read from the
+        registry (authoritative), not from the vector hit metadata.
+        """
+        if self.compiled_memory is None or self.pages is None or limit <= 0:
+            return []
+        kwargs: dict[str, Any] = {self._search_limit_param: retrieval_candidate_limit(limit)}
+        if self._search_user_id_param:
+            kwargs["user_id"] = user_id
+        else:
+            kwargs["filters"] = {"user_id": user_id}
+        try:
+            async with self._read_lock():
+                result = await asyncio.to_thread(self.compiled_memory.search, query, **kwargs)
+        except Exception:
+            LOG.exception("Compiled search failed for user_id=%s", user_id)
+            return []
+        hits = result.get("results") if isinstance(result, dict) else None
+        if not isinstance(hits, list):
+            return []
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            slug = str((hit.get("metadata") or {}).get("slug") or "")
+            if not slug or slug in seen:
+                continue
+            page = self.pages.get(slug)
+            if page is None or page.status != "current":
+                continue
+            if self._numeric_score(hit.get("score")) < COMPILED_LEAD_MIN_SCORE:
+                continue
+            body_result = self.pages.read_body(slug)
+            text = body_result[0] if body_result else str(hit.get("memory") or "")
+            seen.add(slug)
+            out.append({
+                "id": slug,
+                "title": page.title or slug,
+                "text": text,
+                "url": self._signed_blob_url(page.current_blob),
+                "score": hit.get("score"),
+                "route": "synthesis",
+                "metadata": {"kind": "synthesis", "slug": slug, "status": page.status,
+                             "derived_from": page.derived_from, "domain": page.domain,
+                             "hall": page.hall, "room": page.room, "topic": page.topic},
+            })
+            if len(out) >= limit:
+                break
+        return out
 
     @staticmethod
     def _memory_results(result: Any) -> list[Any]:
