@@ -66,6 +66,10 @@ MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
 LIVE_LEXICAL_SCAN_LIMIT = 5000
+# A hyphenated identifier token (>= 3 segments, e.g. ARDA-RELIQUARY-IMAGE-20260605-01)
+# is the exact-recall case the live lexical fallback was built for (#28); used to
+# gate that fallback so healthy searches avoid the broad get_all scroll (#30).
+_EXACT_ID_RE = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+){2,}")
 # Minimum vector score for a current synthesis page to lead search results.
 # 0.0 = lead whenever a current synthesis matches at all (simple MVP; tunable).
 COMPILED_LEAD_MIN_SCORE = 0.0
@@ -2910,12 +2914,14 @@ class Mem0ChatProxy:
         hits = result.get("results")
         if not isinstance(hits, list):
             return []
-        live_hits = await self.live_lexical_matches(
-            query,
-            user_id=user_id,
-            filters=filters,
-            limit=candidate_limit,
-        )
+        live_hits: list[dict[str, Any]] = []
+        if self._should_run_lexical(query, hits, limit):
+            live_hits = await self.live_lexical_matches(
+                query,
+                user_id=user_id,
+                filters=filters,
+                limit=candidate_limit,
+            )
         if live_hits:
             by_id: dict[str, dict[str, Any]] = {}
             for hit in hits:
@@ -2928,6 +2934,15 @@ class Mem0ChatProxy:
                     by_id[hit_id] = hit
             hits = list(by_id.values())
         return apply_retrieval_quality(query, hits, limit=limit)
+
+    def _should_run_lexical(self, query: str, hits: list[Any], limit: int) -> bool:
+        """Gate the live lexical fallback (#30). It issues a broad ``get_all`` scroll,
+        so only run it when vector results are thin (fewer than ``limit``) OR the query
+        contains an exact identifier token — the recall case it was built for (#28).
+        Healthy searches with a full result set and a natural-language query skip it."""
+        if len(hits) < limit:
+            return True
+        return bool(_EXACT_ID_RE.search(query))
 
     async def live_lexical_matches(
         self,
