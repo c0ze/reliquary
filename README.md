@@ -135,7 +135,7 @@ mutated), and rejection messages point you there. `reliquary://sources` reports
 provenance — where each memory came from. All of it is opt-in and soft: no session
 gating, no hard write-blocks.
 
-Also: `GET /healthz` (minimal, public), `GET /status` and `GET /mem0/search?q=...`
+Also: `GET /healthz` (minimal, public), `GET /status` and `GET /reliquary/search?q=...`
 (both **require the Claude bearer** — they return config/taxonomy and raw
 memories respectively), and the OAuth 2.1 discovery/authorize/token/revoke routes
 under `/.well-known/*` and `/oauth/*`.

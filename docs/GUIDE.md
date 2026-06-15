@@ -96,7 +96,7 @@ server — MCP + OAuth + the Mem0 client). No chat LLM is involved in retrieval.
 | `/uploads/{upload_id}` | POST | Same MCP bearer (write) | Raw binary upload endpoint returned by `create_image_upload`; finalize with `commit_image_upload` |
 | `/healthz` | GET | none | Liveness check |
 | `/status` | GET | Claude bearer | Config + taxonomy introspection |
-| `/mem0/search?q=` | GET | Claude bearer | Raw debug search (returns memories directly) |
+| `/reliquary/search?q=` | GET | Claude bearer | Raw debug search (returns memories directly) |
 | `/.well-known/oauth-*`, `/oauth/*` | — | — | OAuth 2.1 discovery / authorize / token / revoke |
 | `/favicon.ico`, `/icon[-<size>].png` | GET | none | Brand assets (also embedded in MCP `serverInfo`) |
 

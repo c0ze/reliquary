@@ -581,7 +581,7 @@ class Mem0ChatProxy:
                 await self.handle_mcp(profile, scope, receive, send)
                 return
 
-            if path == "/mem0/search":
+            if path == "/reliquary/search":
                 # Debug search returns raw memories; never expose it unauthenticated.
                 if not self._require_claude_auth(decode_headers(scope)):
                     await self._send_unauthorized(send)
@@ -737,7 +737,7 @@ class Mem0ChatProxy:
                 )
             base = self.oauth.base_url(headers)
             metadata_url = f"{base}/.well-known/oauth-protected-resource{profile.path}"
-            www_auth = f'Bearer realm="mem0", resource_metadata="{metadata_url}"'
+            www_auth = f'Bearer realm="reliquary", resource_metadata="{metadata_url}"'
             await self.send_json(
                 send,
                 401,
@@ -3390,7 +3390,7 @@ class Mem0ChatProxy:
     def _require_claude_auth(self, headers: dict[str, str]) -> bool:
         """True only when the request carries the Claude endpoint's bearer (or a
         valid derived OAuth token for it). Used to gate the privileged HTTP
-        helpers (/status, /mem0/search) with the same auth as /claude/mcp."""
+        helpers (/status, /reliquary/search) with the same auth as /claude/mcp."""
         profile = self.endpoint_profiles.get(self.settings.claude_mcp_path)
         return bool(profile and self.is_allowed_token(profile, headers))
 

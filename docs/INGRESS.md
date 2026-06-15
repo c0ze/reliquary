@@ -28,7 +28,7 @@ bearer-protected. Scrape or access them only from within a trusted network
 | Path | Reason |
 |---|---|
 | `/status` | Leaks config details (user IDs, upstream URLs, catalog domains) |
-| `/mem0/search` | Raw vector-store debug search |
+| `/reliquary/search` | Raw vector-store debug search |
 | `/metrics` | Prometheus endpoint — scrape internally, not from the internet |
 | `/blobs/*` | Signed blob downloads — bearer/signature protected but no public need |
 | `/v1/*` | Upstream LLM passthrough — internal only |
