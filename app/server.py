@@ -1152,6 +1152,14 @@ class Mem0ChatProxy:
             structured=payload,
         )
 
+    def _scope_error(self, tool_name: str) -> dict[str, Any]:
+        return self.mcp_tool_result(
+            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+            structured={"error": "insufficient_scope",
+                        "suggested_action": "Reconnect with a write-scoped token; this token or endpoint is read-only."},
+            is_error=True,
+        )
+
     def mcp_tools_for(self, profile: EndpointProfile, *, can_write: bool = False) -> list[dict[str, Any]]:
         read_only = {"readOnlyHint": True, "openWorldHint": False}
         routing_hint = self._routing_hint()
@@ -1559,62 +1567,34 @@ class Mem0ChatProxy:
                     return await self.handle_fetch_image_tool(arguments)
                 if tool_name == "add_memory":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     # Enforce the lean schema: no caller-supplied user_id / metadata /
                     # routing fields. Writes always land under the default user_id.
                     return await self.handle_add_memory_tool(lean_add_memory_args(arguments))
                 if tool_name == "delete":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     return await self.handle_delete_tool(arguments, allow_user_id=False)
                 if tool_name == "update":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     return await self.handle_update_tool(lean_update_args(arguments), allow_user_id=False)
                 if tool_name == "add_image":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     return await self.handle_add_image_tool(lean_add_image_args(arguments))
                 if tool_name == "delete_image":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     # allow_user_id=False: deletes are always scoped to the default user_id.
                     return await self.handle_delete_image_tool(arguments, allow_user_id=False)
                 if tool_name == "create_image_upload":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     return self.handle_create_image_upload_tool(arguments, profile=profile)
                 if tool_name == "commit_image_upload":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     return await self.handle_commit_image_upload_tool(arguments, allow_user_id=False, profile=profile)
                 return self.mcp_tool_result(
                     text=f"Unknown tool: {tool_name}",
@@ -1656,69 +1636,37 @@ class Mem0ChatProxy:
                 return await self.handle_fetch_image_tool(arguments)
             if tool_name == "mem0_add_memory":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return await self.handle_add_memory_tool(arguments)
             if tool_name == "mem0_delete":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return await self.handle_delete_tool(arguments, allow_user_id=True)
             if tool_name == "mem0_update":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return await self.handle_update_tool(arguments, allow_user_id=True)
             if tool_name == "mem0_compile_page":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 # Pages are a single global registry keyed by slug (not namespaced by
                 # user_id), so file them under the server user only — never a caller id.
                 return await self.handle_compile_page_tool(arguments, allow_user_id=False)
             if tool_name == "add_image":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return await self.handle_add_image_tool(arguments)
             if tool_name == "delete_image":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return await self.handle_delete_image_tool(arguments, allow_user_id=True)
             if tool_name == "create_image_upload":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return self.handle_create_image_upload_tool(arguments, profile=profile)
             if tool_name == "commit_image_upload":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return await self.handle_commit_image_upload_tool(arguments, allow_user_id=True, profile=profile)
         except Exception as exc:
             LOG.exception("MCP tool failed: %s", tool_name)
