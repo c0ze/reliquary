@@ -84,7 +84,7 @@ Caddy, or Traefik.
 
 | Endpoint | For | Auth | Tools |
 |----------|-----|------|-------|
-| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_update`, `mem0_delete`, `list_domains`, `add_image`, `fetch_image`, `delete_image`, `create_image_upload`, `commit_image_upload` |
+| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_update`, `mem0_delete`, `mem0_compile_page`, `mem0_list_pages`, `mem0_page_history`, `list_domains`, `add_image`, `fetch_image`, `delete_image`, `create_image_upload`, `commit_image_upload` |
 | `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `search`, `fetch`, `fetch_image` (lean snippet shape); `add_memory` + `delete` + `add_image` if `MEM0_OPENAI_ALLOW_WRITE=true` |
 
 **Binary blobs.** `add_image` stores a file (base64) plus a searchable caption;
@@ -93,6 +93,22 @@ it returns a `blob_id`, a `memory_id`, and a signed `url`. Find images later wit
 the caption memory and ref-counted blob. Files live under `BLOB_HOST_DIR` on the
 host (default `./data/blobs`) so you can browse and back them up. `GET /blobs/{id}`
 serves bytes to anyone holding a valid signed URL or the Claude bearer.
+
+**Compilation layer.** Beyond raw recall, Reliquary maintains an optional
+**compiled synthesis layer** — a versioned, domain-neutral set of markdown pages
+that sit above the raw corpus so memory compounds over time. The agent authors a
+page with `mem0_compile_page` (Reliquary never generates prose); it is stored as a
+revision in the blob store, indexed into a **separate Qdrant collection**, and
+cited back to its source memories via `derived_from`. Search then leads with a
+relevant *current* synthesis and surfaces raw memories as its evidence. New raw
+writes flag dependent pages `stale` (a queued suggestion, never an auto-rewrite).
+Inspect pages with `mem0_list_pages` / `mem0_page_history`, and read the
+`mem0://schema`, `mem0://recent`, `mem0://needs-review`, and
+`mem0://domain/<d>/index` resources. It is on by default; set
+`MEM0_COMPILED_COLLECTION=` (empty) to disable (an empty layer is a query-time
+no-op). Two cron-friendly CLIs support it: `python app/lint.py` proposes refreshes
+(never applies them) and `python app/export_vault.py --out vault/` exports pages to
+an Obsidian-style vault. See [`docs/GUIDE.md`](docs/GUIDE.md#compilation-layer).
 
 Also: `GET /healthz` (minimal, public), `GET /status` and `GET /mem0/search?q=...`
 (both **require the Claude bearer** — they return config/taxonomy and raw

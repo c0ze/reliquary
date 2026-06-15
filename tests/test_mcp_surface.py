@@ -34,7 +34,11 @@ def test_resources_list_and_read(proxy):
 
 def test_resources_with_no_catalog(proxy):
     assert proxy.catalog is None
-    assert [resource["uri"] for resource in proxy.mcp_resources()] == ["mem0://taxonomy"]
+    uris = [resource["uri"] for resource in proxy.mcp_resources()]
+    # mem0://taxonomy and mem0://schema are always present; compiled resources are
+    # present because the default proxy fixture enables the compiled layer.
+    assert "mem0://taxonomy" in uris
+    assert "mem0://schema" in uris
     assert json.loads(proxy.read_resource("mem0://taxonomy")["contents"][0]["text"])["records"] == 0
 
 

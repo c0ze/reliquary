@@ -56,6 +56,7 @@ services:
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ${BLOB_HOST_DIR:-./data/blobs}:/data/blobs
+      - ${COMPILED_HOST_DIR:-./data/compiled}:/data/compiled
     # Publish to loopback only; put Cloudflare Tunnel / Caddy / Traefik in front
     # for public TLS. Remove the 127.0.0.1 prefix at your own risk.
     ports:

@@ -82,8 +82,9 @@ def proxy(tmp_path, fake_memory, monkeypatch):
         openai_allow_write=True,
         blob_dir=str(tmp_path / "blobs"),
         blob_signing_key="test-signing-key",
+        compiled_dir=str(tmp_path / "compiled"),
     )
-    return Mem0ChatProxy(settings, memory=fake_memory)
+    return Mem0ChatProxy(settings, memory=fake_memory, compiled_memory=FakeMemory())
 
 
 @pytest.fixture
@@ -110,8 +111,11 @@ def make_proxy(tmp_path, monkeypatch):
             openai_allow_write=True,
             blob_dir=str(tmp_path / "blobs"),
             blob_signing_key="test-signing-key",
+            compiled_dir=str(tmp_path / "compiled"),
         )
+        compiled_memory = overrides.pop("compiled_memory", None) or FakeMemory()
         opts.update(overrides)
-        return Mem0ChatProxy(ProxySettings(**opts), memory=memory or FakeMemory())
+        return Mem0ChatProxy(ProxySettings(**opts), memory=memory or FakeMemory(),
+                             compiled_memory=compiled_memory)
 
     return _make

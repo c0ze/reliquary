@@ -5,6 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
+from blobs import BlobStore  # noqa: E402
+from compiled import PageRegistry  # noqa: E402
 from ingest import import_metadata, ingest_records, record_content_hash  # noqa: E402
 
 
@@ -112,3 +114,75 @@ def test_incremental_ingest_skips_unchanged_updates_changed_and_adds_new():
             },
         }
     ]
+
+
+def _page_registry(tmp_path):
+    blobs = BlobStore(blob_dir=str(tmp_path / "blobs"), signing_key=b"k", max_bytes=0)
+    return PageRegistry(registry_dir=str(tmp_path / "compiled"), blobs=blobs)
+
+
+def _record_with_tax(record_id, text, *, domain, topic):
+    return {"id": record_id, "text": text, "metadata": {"domain": domain, "topic": topic}}
+
+
+def test_bulk_ingest_flags_matching_page_stale(tmp_path):
+    registry = _page_registry(tmp_path)
+    registry.put_revision("deities", "deities synthesis",
+                          {"domain": "pagan", "topic": "deities", "status": "current"})
+    assert registry.get("deities").status == "current"
+
+    memory = RecordingMemory()
+    summary = ingest_records(
+        memory,
+        [_record_with_tax("rec-1", "A new deity fact", domain="pagan", topic="deities")],
+        user_id="u",
+        page_registry=registry,
+    )
+
+    assert summary["added"] == 1
+    assert registry.get("deities").status == "stale"
+
+
+def test_bulk_ingest_flags_page_by_derived_id(tmp_path):
+    registry = _page_registry(tmp_path)
+    # Page derives from a raw id; re-importing that id should flag it stale even
+    # without a taxonomy match.
+    registry.put_revision("brigid", "brigid synthesis",
+                          {"derived_from": ["rec-7"], "status": "current"})
+
+    memory = RecordingMemory()
+    ingest_records(
+        memory,
+        [{"id": "rec-7", "text": "updated brigid fact", "metadata": {}}],
+        user_id="u",
+        page_registry=registry,
+    )
+    assert registry.get("brigid").status == "stale"
+
+
+def test_bulk_ingest_unrelated_taxonomy_leaves_page_current(tmp_path):
+    registry = _page_registry(tmp_path)
+    registry.put_revision("deities", "deities synthesis",
+                          {"domain": "pagan", "topic": "deities", "status": "current"})
+
+    memory = RecordingMemory()
+    ingest_records(
+        memory,
+        [_record_with_tax("rec-2", "unrelated fact", domain="infra", topic="containers")],
+        user_id="u",
+        page_registry=registry,
+    )
+    assert registry.get("deities").status == "current"
+
+
+def test_bulk_ingest_without_registry_is_unchanged():
+    # Passing page_registry=None (the default) must not crash and must behave
+    # exactly as before.
+    memory = RecordingMemory()
+    summary = ingest_records(
+        memory,
+        [_record_with_tax("rec-3", "a fact", domain="pagan", topic="deities")],
+        user_id="u",
+        page_registry=None,
+    )
+    assert summary == {"selected": 1, "added": 1, "updated": 0, "skipped": 0}

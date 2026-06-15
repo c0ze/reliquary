@@ -236,3 +236,28 @@ def test_search_memories_lexical_fallback_scans_beyond_get_all_default(proxy, mo
     assert [hit["id"] for hit in result] == ["older-image"]
     assert captured["filters"] == {"user_id": "my_lord"}
     assert captured["top_k"] > 20
+
+
+def test_search_memories_skips_lexical_fallback_on_healthy_results(proxy, monkeypatch):
+    # #30: a full result set plus a natural-language query must NOT trigger the
+    # broad get_all scroll behind the live lexical fallback.
+    get_all_calls = {"n": 0}
+
+    def fake_search(query, **kwargs):
+        return {"results": [{"id": "a", "memory": "a relevant cat result",
+                             "metadata": {}, "user_id": "my_lord", "score": 0.9}]}
+
+    def fake_get_all(**kwargs):
+        get_all_calls["n"] += 1
+        return {"results": []}
+
+    monkeypatch.setattr(proxy.memory, "search", fake_search)
+    monkeypatch.setattr(proxy.memory, "get_all", fake_get_all)
+
+    result = run(
+        proxy.search_memories(
+            "tell me about cats", user_id="my_lord", limit=1, threshold=None, filters=None,
+        )
+    )
+    assert [hit["id"] for hit in result] == ["a"]
+    assert get_all_calls["n"] == 0  # fallback gated off => no get_all scroll
