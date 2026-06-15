@@ -124,3 +124,16 @@ def test_context_threaded_through_call_mcp_tool(proxy):
     ctx = resolve_context({"context": {"repo": "c0ze/reliquary"}}, {})
     result = run(proxy.call_mcp_tool(profile, "mem0_search", {"query": "alpha"}, can_write=False, context=ctx))
     assert result["structuredContent"]["results"][0]["id"] == "zzz-note"
+
+
+def test_context_bias_prefers_this_repo_over_other_dev(proxy):
+    # Tiered bias: this repo's memory (room match) must outrank generic dev memory
+    # from another repo, even when the other record's id sorts first.
+    from context import resolve_context
+    proxy.memory._store["zzz-mine"] = {"id": "zzz-mine", "memory": "alpha note for my repo",
+        "metadata": {"domain": "dev", "room": "reliquary"}, "user_id": "my_lord"}
+    proxy.memory._store["aaa-other"] = {"id": "aaa-other", "memory": "alpha note other dev project",
+        "metadata": {"domain": "dev", "room": "somethingelse"}, "user_id": "my_lord"}
+    ctx = resolve_context({"context": {"repo": "c0ze/reliquary"}}, {})
+    result = run(proxy.handle_search_tool({"query": "alpha"}, context=ctx))
+    assert result["structuredContent"]["results"][0]["id"] == "zzz-mine"

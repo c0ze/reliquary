@@ -3210,12 +3210,17 @@ class Mem0ChatProxy:
         except (TypeError, ValueError):
             return 0.0
 
-    def _context_bonus(self, hit: dict[str, Any], context) -> float:
+    @staticmethod
+    def _context_bonus(hit: dict[str, Any], context) -> float:
         if context is None or not getattr(context, "repo_slug", None):
             return 0.0
         md = hit.get("metadata") or {}
-        if md.get("domain") == "dev" or md.get("room") == context.repo_slug:
+        # Tiered: this repo's memory (room match) outranks generic dev-domain memory
+        # (a coarser "you're in a coding session" signal that also covers other repos).
+        if md.get("room") == context.repo_slug:
             return CONTEXT_MATCH_BONUS
+        if md.get("domain") == "dev":
+            return CONTEXT_MATCH_BONUS / 2
         return 0.0
 
     async def add_memory(
