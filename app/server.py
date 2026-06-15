@@ -1151,12 +1151,18 @@ class Mem0ChatProxy:
             },
         ]
 
-    def handle_capabilities_tool(self, profile: "EndpointProfile", context=None) -> dict[str, Any]:
+    def handle_capabilities_tool(self, profile: "EndpointProfile", context=None, can_write: bool = False) -> dict[str, Any]:
         is_openai = profile.name == "openai"
+        # Reflect the request's ACTUAL scope: a read-only token must not see write
+        # tools advertised as available (that would contradict tools/list and any
+        # call would return insufficient_scope). Write tools surface only with write.
+        available = [t["name"] for t in self.mcp_tools_for(profile, can_write=can_write)]
+        write_only = [t["name"] for t in self.mcp_tools_for(profile, can_write=True) if t["name"] not in available]
         payload = {
             "what": "Reliquary: domain-neutral semantic memory over Mem0 + Qdrant, served over MCP.",
             "endpoint": profile.name,
-            "tools": [t["name"] for t in self.mcp_tools_for(profile, can_write=True)],
+            "tools": available,
+            "write_tools_when_authorized": write_only,
             "rules": {
                 "imported_records": "read-only (protected); user-written records are mutable",
                 "corrections": "propose changes to imported records with propose_update (never mutates the import)",
@@ -1600,7 +1606,7 @@ class Mem0ChatProxy:
         try:
             if profile.name == "openai":
                 if tool_name == "capabilities":
-                    return self.handle_capabilities_tool(profile, context=context)
+                    return self.handle_capabilities_tool(profile, context=context, can_write=can_write)
                 if tool_name == "search":
                     return await self.handle_search_tool(
                         arguments,
@@ -1663,7 +1669,7 @@ class Mem0ChatProxy:
                 )
 
             if tool_name == "mem0_capabilities":
-                return self.handle_capabilities_tool(profile, context=context)
+                return self.handle_capabilities_tool(profile, context=context, can_write=can_write)
             if tool_name == "mem0_status":
                 status = {
                     "user_id": self.settings.user_id,

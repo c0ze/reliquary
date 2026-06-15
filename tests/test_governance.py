@@ -45,6 +45,19 @@ def test_capabilities_listed_on_both_endpoints(proxy):
     assert "capabilities" in openai_names
 
 
+def test_capabilities_reflects_write_scope(proxy):
+    # A read-only request must not advertise write tools as available; they belong
+    # under write_tools_when_authorized instead (matches tools/list for that scope).
+    profile = _profile(proxy, "claude")
+    ro = run(proxy.call_mcp_tool(profile, "mem0_capabilities", {}, can_write=False))["structuredContent"]
+    assert "mem0_add_memory" not in ro["tools"] and "propose_update" not in ro["tools"]
+    assert "mem0_add_memory" in ro["write_tools_when_authorized"]
+    assert "propose_update" in ro["write_tools_when_authorized"]
+    assert "mem0_capabilities" in ro["tools"] and "mem0_search" in ro["tools"]  # reads always available
+    rw = run(proxy.call_mcp_tool(profile, "mem0_capabilities", {}, can_write=True))["structuredContent"]
+    assert "mem0_add_memory" in rw["tools"] and rw["write_tools_when_authorized"] == []
+
+
 def test_propose_update_stores_correction(proxy):
     result = run(proxy.handle_propose_update_tool({"target_id": "imp-1", "reason": "wrong date", "replacement_text": "Correct: 1999"}))
     assert result.get("isError") is not True
