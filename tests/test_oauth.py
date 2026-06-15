@@ -318,6 +318,22 @@ def test_refresh_reuse_revokes_family():
     assert p.verify_access_token(new_access) is False
 
 
+def test_refresh_reuse_after_grace_is_plain_invalid_grant():
+    # Documented trade-off: once a consumed token ages past REFRESH_REUSE_GRACE it
+    # is pruned, so a later replay reads as an unknown token (invalid_grant) rather
+    # than triggering family revocation — and the live successor keeps working.
+    from oauth import REFRESH_REUSE_GRACE
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    _, refresh = p.issue_token_pair(client_id="c", scope="mcp")
+    resp, _ = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})  # consumes `refresh`
+    live = resp["refresh_token"]
+    p._refresh_tokens[refresh].created_at = time.time() - REFRESH_REUSE_GRACE - 1  # age past grace
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    assert err is not None and err[1] == "invalid_grant"
+    resp2, err2 = p.exchange_code({"grant_type": "refresh_token", "refresh_token": live})
+    assert err2 is None and resp2["refresh_token"] != live  # family NOT revoked; successor still rotates
+
+
 def test_unknown_refresh_token_invalid_grant():
     p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
     _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": "nope"})
