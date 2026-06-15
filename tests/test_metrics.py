@@ -12,16 +12,16 @@ from metrics import Metrics  # noqa: E402
 
 def test_record_tool_ok_appears_in_render():
     m = Metrics(clock=lambda: 0.0)
-    m.record_tool("mem0_search", ok=True)
+    m.record_tool("reliquary_search", ok=True)
     output = m.render()
-    assert 'reliquary_tool_calls_total{tool="mem0_search",status="ok"} 1' in output
+    assert 'reliquary_tool_calls_total{tool="reliquary_search",status="ok"} 1' in output
 
 
 def test_record_tool_error_appears_in_render():
     m = Metrics(clock=lambda: 0.0)
-    m.record_tool("mem0_add_memory", ok=False)
+    m.record_tool("reliquary_add_memory", ok=False)
     output = m.render()
-    assert 'reliquary_tool_calls_total{tool="mem0_add_memory",status="error"} 1' in output
+    assert 'reliquary_tool_calls_total{tool="reliquary_add_memory",status="error"} 1' in output
 
 
 def test_record_tool_counts_accumulate():

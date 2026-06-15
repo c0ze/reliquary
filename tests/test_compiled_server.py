@@ -360,12 +360,12 @@ def test_new_tools_not_on_openai_endpoint(proxy):
 
 
 # ---------------------------------------------------------------------------
-# Task 3.5 — compiled-aware mem0_fetch
+# Task 3.5 — compiled-aware reliquary_fetch
 # ---------------------------------------------------------------------------
 
 
-def test_mem0_fetch_compiled_page(proxy):
-    """mem0_fetch resolves a compiled page by slug."""
+def test_reliquary_fetch_compiled_page(proxy):
+    """reliquary_fetch resolves a compiled page by slug."""
     run(proxy.handle_compile_page_tool({
         "markdown": "Synthesis body here",
         "slug": "fetch-me",
@@ -383,14 +383,14 @@ def test_mem0_fetch_compiled_page(proxy):
     assert sc["url"].startswith("/blobs/")
 
 
-def test_mem0_fetch_unknown_id_still_returns_not_found(proxy):
+def test_reliquary_fetch_unknown_id_still_returns_not_found(proxy):
     """Unknown ids still get the usual not_found response."""
     result = run(proxy.handle_fetch_tool({"id": "totally-unknown-xyz"}))
     assert result.get("isError") is True
     assert result["structuredContent"]["error"] == "not_found"
 
 
-def test_mem0_fetch_page_with_missing_blob_errors(proxy):
+def test_reliquary_fetch_page_with_missing_blob_errors(proxy):
     """A registered page whose blob bytes are gone surfaces an error, not an empty body."""
     _file_page(proxy, "ghost")
     info = proxy.pages.get("ghost")
@@ -400,7 +400,7 @@ def test_mem0_fetch_page_with_missing_blob_errors(proxy):
     assert result["structuredContent"]["error"] == "blob_missing"
 
 
-def test_mem0_fetch_rejects_path_traversal_id(proxy):
+def test_reliquary_fetch_rejects_path_traversal_id(proxy):
     """A traversal/absolute id must not read outside the registry; it falls through
     to the normal not_found path rather than leaking an arbitrary file."""
     for bad in ("../../etc/passwd", "/etc/passwd", "a/../../b"):

@@ -14,13 +14,13 @@ from audit import AuditLog  # noqa: E402
 def test_record_writes_jsonl_line(tmp_path):
     log_path = str(tmp_path / "audit.jsonl")
     al = AuditLog(log_path, clock=lambda: 1000.0)
-    al.record(action="mem0_add_memory", endpoint="claude", user_id="alice")
+    al.record(action="reliquary_add_memory", endpoint="claude", user_id="alice")
 
     lines = Path(log_path).read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
     entry = json.loads(lines[0])
     assert entry["ts"] == 1000.0
-    assert entry["action"] == "mem0_add_memory"
+    assert entry["action"] == "reliquary_add_memory"
     assert entry["endpoint"] == "claude"
     assert entry["user_id"] == "alice"
 
@@ -28,25 +28,25 @@ def test_record_writes_jsonl_line(tmp_path):
 def test_record_appends_multiple_lines(tmp_path):
     log_path = str(tmp_path / "audit.jsonl")
     al = AuditLog(log_path, clock=lambda: 0.0)
-    al.record(action="mem0_add_memory", user_id="u1")
-    al.record(action="mem0_delete", user_id="u1")
+    al.record(action="reliquary_add_memory", user_id="u1")
+    al.record(action="reliquary_delete", user_id="u1")
 
     lines = Path(log_path).read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2
-    assert json.loads(lines[0])["action"] == "mem0_add_memory"
-    assert json.loads(lines[1])["action"] == "mem0_delete"
+    assert json.loads(lines[0])["action"] == "reliquary_add_memory"
+    assert json.loads(lines[1])["action"] == "reliquary_delete"
 
 
 def test_none_path_is_noop(tmp_path):
     al = AuditLog(None)
-    al.record(action="mem0_add_memory", user_id="u1")
+    al.record(action="reliquary_add_memory", user_id="u1")
     # No file should have been created anywhere in tmp_path
     assert list(tmp_path.iterdir()) == []
 
 
 def test_empty_string_path_is_noop(tmp_path):
     al = AuditLog("")
-    al.record(action="mem0_add_memory", user_id="u1")
+    al.record(action="reliquary_add_memory", user_id="u1")
     assert list(tmp_path.iterdir()) == []
 
 
