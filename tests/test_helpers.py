@@ -151,12 +151,12 @@ def test_preview_body_caps_and_flags():
 
 
 def test_format_fetched_document_includes_body():
-    doc = {"id": "abc", "title": "NAS", "url": "mem0://record/abc", "text": "Synology DS220+ at 192.168.11.3."}
+    doc = {"id": "abc", "title": "NAS", "url": "reliquary://record/abc", "text": "Synology DS220+ at 192.168.11.3."}
     out = format_fetched_document(doc)
     # The body must be in the text content, not just structuredContent.
     assert "Synology DS220+" in out
     assert "# NAS" in out
-    assert "mem0://record/abc" in out
+    assert "reliquary://record/abc" in out
 
 
 def test_format_fetched_document_handles_missing_fields():

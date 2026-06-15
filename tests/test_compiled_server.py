@@ -471,7 +471,7 @@ def _read_resource(proxy, uri):
 
 
 def test_schema_resource_default(proxy):
-    res = _read_resource(proxy, "mem0://schema")
+    res = _read_resource(proxy, "reliquary://schema")
     assert res is not None
     content = res["contents"][0]
     assert content["mimeType"] == "text/markdown"
@@ -482,14 +482,14 @@ def test_schema_resource_from_file(make_proxy, tmp_path):
     schema_file = tmp_path / "schema.md"
     schema_file.write_text("# My Custom Constitution\n", encoding="utf-8")
     proxy = make_proxy(schema_path=str(schema_file))
-    res = _read_resource(proxy, "mem0://schema")
+    res = _read_resource(proxy, "reliquary://schema")
     assert "My Custom Constitution" in res["contents"][0]["text"]
 
 
 def test_recent_resource_lists_pages(proxy):
     _file_page(proxy, "alpha")
     _file_page(proxy, "beta")
-    res = _read_resource(proxy, "mem0://recent")
+    res = _read_resource(proxy, "reliquary://recent")
     slugs = {p["slug"] for p in __import__("json").loads(res["contents"][0]["text"])["pages"]}
     assert {"alpha", "beta"} <= slugs
 
@@ -498,7 +498,7 @@ def test_needs_review_lists_stale_pages(proxy):
     _file_page(proxy, "fresh")
     _file_page(proxy, "old")
     proxy.pages.set_status("old", "stale")
-    res = _read_resource(proxy, "mem0://needs-review")
+    res = _read_resource(proxy, "reliquary://needs-review")
     payload = __import__("json").loads(res["contents"][0]["text"])
     stale_slugs = {p["slug"] for p in payload["stale"]}
     assert "old" in stale_slugs and "fresh" not in stale_slugs
@@ -512,7 +512,7 @@ def test_needs_review_surfaces_coverage_gaps(proxy):
         value_counts = {"domain": {"pagan": 10}}
 
     proxy.catalog = _Cat()
-    res = _read_resource(proxy, "mem0://needs-review")
+    res = _read_resource(proxy, "reliquary://needs-review")
     payload = __import__("json").loads(res["contents"][0]["text"])
     gap_domains = {g["domain"] for g in payload["coverage_gaps"]}
     assert "pagan" in gap_domains
@@ -525,7 +525,7 @@ def test_needs_review_no_gap_when_domain_covered(proxy):
 
     proxy.catalog = _Cat()
     _file_page(proxy, "pagan-page", domain="pagan", status="current")
-    res = _read_resource(proxy, "mem0://needs-review")
+    res = _read_resource(proxy, "reliquary://needs-review")
     payload = __import__("json").loads(res["contents"][0]["text"])
     gap_domains = {g["domain"] for g in payload["coverage_gaps"]}
     assert "pagan" not in gap_domains  # covered by a current page
@@ -534,7 +534,7 @@ def test_needs_review_no_gap_when_domain_covered(proxy):
 def test_domain_index_resource(proxy):
     _file_page(proxy, "p-pagan", domain="pagan")
     _file_page(proxy, "p-infra", domain="infra")
-    res = _read_resource(proxy, "mem0://domain/pagan/index")
+    res = _read_resource(proxy, "reliquary://domain/pagan/index")
     payload = __import__("json").loads(res["contents"][0]["text"])
     slugs = {p["slug"] for p in payload["pages"]}
     assert "p-pagan" in slugs and "p-infra" not in slugs
@@ -549,22 +549,22 @@ def test_domain_index_listed_with_catalog(proxy):
     proxy.catalog = _Cat()
     _file_page(proxy, "p-pagan", domain="pagan")
     uris = {r["uri"] for r in proxy.mcp_resources()}
-    assert "mem0://domain/pagan/index" in uris
+    assert "reliquary://domain/pagan/index" in uris
 
 
 def test_schema_resource_listed(proxy):
     uris = {r["uri"] for r in proxy.mcp_resources()}
-    assert "mem0://schema" in uris
-    assert "mem0://recent" in uris
-    assert "mem0://needs-review" in uris
+    assert "reliquary://schema" in uris
+    assert "reliquary://recent" in uris
+    assert "reliquary://needs-review" in uris
 
 
 def test_compiled_resources_absent_when_disabled(make_proxy):
     proxy = make_proxy(compiled_collection="")
     uris = {r["uri"] for r in proxy.mcp_resources()}
-    assert "mem0://schema" in uris            # schema always available
-    assert "mem0://recent" not in uris        # compiled-only resources hidden
-    assert "mem0://needs-review" not in uris
+    assert "reliquary://schema" in uris            # schema always available
+    assert "reliquary://recent" not in uris        # compiled-only resources hidden
+    assert "reliquary://needs-review" not in uris
 
 
 # ---------------------------------------------------------------------------

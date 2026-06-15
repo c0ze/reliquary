@@ -162,7 +162,7 @@ def test_context_bias_prefers_this_repo_over_other_dev(proxy):
 
 
 # ---------------------------------------------------------------------------
-# Phase 5: mem0://sources provenance registry (#46)
+# Phase 5: reliquary://sources provenance registry (#46)
 # ---------------------------------------------------------------------------
 
 def test_sources_resource_groups_by_source(proxy):
@@ -176,7 +176,7 @@ def test_sources_resource_groups_by_source(proxy):
             "u1": SimpleNamespace(import_record_id="u1", metadata={"source_group": "user-write"}),
         },
     )
-    res = proxy.read_resource("mem0://sources")
+    res = proxy.read_resource("reliquary://sources")
     payload = json.loads(res["contents"][0]["text"])
     assert payload["total"] == 3
     vault = next(s for s in payload["sources"] if s["source"] == "vault")
@@ -190,11 +190,11 @@ def test_sources_resource_listed_with_catalog(proxy):
     from types import SimpleNamespace
     proxy.catalog = SimpleNamespace(routeable_domains=[], records_by_id={})
     uris = {r["uri"] for r in proxy.mcp_resources()}
-    assert "mem0://sources" in uris
+    assert "reliquary://sources" in uris
 
 
 def test_sources_absent_without_catalog(proxy):
     proxy.catalog = None
     uris = {r["uri"] for r in proxy.mcp_resources()}
-    assert "mem0://sources" not in uris
-    assert proxy.read_resource("mem0://sources") is None
+    assert "reliquary://sources" not in uris
+    assert proxy.read_resource("reliquary://sources") is None

@@ -19,27 +19,34 @@ def _stub_catalog():
 def test_resources_list_and_read(proxy):
     proxy.catalog = _stub_catalog()
     uris = [resource["uri"] for resource in proxy.mcp_resources()]
-    assert "mem0://taxonomy" in uris
-    assert "mem0://domain/pagan" in uris
+    assert "reliquary://taxonomy" in uris
+    assert "reliquary://domain/pagan" in uris
 
-    tax = proxy.read_resource("mem0://taxonomy")
+    tax = proxy.read_resource("reliquary://taxonomy")
     payload = json.loads(tax["contents"][0]["text"])
     assert payload["domains"] == ["pagan", "7thshadow"]
 
-    dom = proxy.read_resource("mem0://domain/pagan")
+    dom = proxy.read_resource("reliquary://domain/pagan")
     assert json.loads(dom["contents"][0]["text"])["rooms"] == ["studio"]
-    assert proxy.read_resource("mem0://domain/nope") is None
+    assert proxy.read_resource("reliquary://domain/nope") is None
     assert proxy.read_resource("bogus://x") is None
 
 
 def test_resources_with_no_catalog(proxy):
     assert proxy.catalog is None
     uris = [resource["uri"] for resource in proxy.mcp_resources()]
-    # mem0://taxonomy and mem0://schema are always present; compiled resources are
+    # reliquary://taxonomy and reliquary://schema are always present; compiled resources are
     # present because the default proxy fixture enables the compiled layer.
-    assert "mem0://taxonomy" in uris
-    assert "mem0://schema" in uris
-    assert json.loads(proxy.read_resource("mem0://taxonomy")["contents"][0]["text"])["records"] == 0
+    assert "reliquary://taxonomy" in uris
+    assert "reliquary://schema" in uris
+    assert json.loads(proxy.read_resource("reliquary://taxonomy")["contents"][0]["text"])["records"] == 0
+
+
+def test_resource_uris_all_reliquary_scheme(proxy):
+    uris = [r["uri"] for r in proxy.mcp_resources()]
+    assert uris, "expected resources"
+    offenders = [u for u in uris if not u.startswith("reliquary://")]
+    assert offenders == [], f"non-reliquary resource URIs: {offenders}"
 
 
 def test_prompts(proxy):

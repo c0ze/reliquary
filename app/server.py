@@ -983,47 +983,47 @@ class Mem0ChatProxy:
 
     def mcp_resources(self) -> list[dict[str, Any]]:
         resources = [{
-            "uri": "mem0://taxonomy",
+            "uri": "reliquary://taxonomy",
             "name": "Corpus taxonomy",
             "description": "Routeable domains and approximate corpus size.",
             "mimeType": "application/json",
         }]
         resources.append({
-            "uri": "mem0://schema",
+            "uri": "reliquary://schema",
             "name": "Memory constitution",
             "description": "Taxonomy, kinds, and conventions to follow (soft guidance).",
             "mimeType": "text/markdown",
         })
         if self.pages is not None:
             resources.append({
-                "uri": "mem0://recent",
+                "uri": "reliquary://recent",
                 "name": "Recently updated pages",
                 "description": "Most recently updated synthesis pages.",
                 "mimeType": "application/json",
             })
             resources.append({
-                "uri": "mem0://needs-review",
+                "uri": "reliquary://needs-review",
                 "name": "Pages needing review",
                 "description": "Synthesis pages flagged stale (plus coverage gaps).",
                 "mimeType": "application/json",
             })
         if self.catalog:
             resources.append({
-                "uri": "mem0://sources",
+                "uri": "reliquary://sources",
                 "name": "Source registry",
                 "description": "Provenance of imported corpora and user writes (grouped by source).",
                 "mimeType": "application/json",
             })
             for domain in self.catalog.routeable_domains:
                 resources.append({
-                    "uri": f"mem0://domain/{domain}",
+                    "uri": f"reliquary://domain/{domain}",
                     "name": f"Domain: {domain}",
                     "description": f"Rooms and topics that route to the {domain!r} domain.",
                     "mimeType": "application/json",
                 })
                 if self.pages is not None:
                     resources.append({
-                        "uri": f"mem0://domain/{domain}/index",
+                        "uri": f"reliquary://domain/{domain}/index",
                         "name": f"Domain index: {domain}",
                         "description": f"Synthesis pages compiled under the {domain!r} domain.",
                         "mimeType": "application/json",
@@ -1031,12 +1031,12 @@ class Mem0ChatProxy:
         return resources
 
     def read_resource(self, uri: str) -> dict[str, Any] | None:
-        if uri == "mem0://schema":
+        if uri == "reliquary://schema":
             return {"contents": [{"uri": uri, "mimeType": "text/markdown", "text": self._read_schema_doc()}]}
-        if uri == "mem0://recent" and self.pages is not None:
+        if uri == "reliquary://recent" and self.pages is not None:
             payload = {"pages": [self._page_summary(p) for p in self.pages.list()[:20]]}
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
-        if uri == "mem0://needs-review" and self.pages is not None:
+        if uri == "reliquary://needs-review" and self.pages is not None:
             pages = self.pages.list()
             raw_counts = dict(self.catalog.value_counts["domain"]) if self.catalog else {}
             payload = {
@@ -1044,18 +1044,18 @@ class Mem0ChatProxy:
                 "coverage_gaps": health.coverage_gaps(pages, raw_counts, min_count=self.settings.lint_coverage_min),
             }
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
-        domain_prefix = "mem0://domain/"
+        domain_prefix = "reliquary://domain/"
         if uri.startswith(domain_prefix) and uri.endswith("/index") and self.pages is not None:
             domain = uri[len(domain_prefix):-len("/index")]
             payload = {"domain": domain, "pages": [self._page_summary(p) for p in self.pages.list(domain=domain)]}
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
-        if uri == "mem0://taxonomy":
+        if uri == "reliquary://taxonomy":
             payload = {
                 "domains": self.catalog.routeable_domains if self.catalog else [],
                 "records": len(self.catalog.records_by_id) if self.catalog else 0,
             }
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
-        if uri == "mem0://sources" and self.catalog:
+        if uri == "reliquary://sources" and self.catalog:
             groups: dict[tuple[str, str], dict[str, Any]] = {}
             for rec in self.catalog.records_by_id.values():
                 md = rec.metadata or {}
@@ -1073,7 +1073,7 @@ class Mem0ChatProxy:
             payload = {"sources": sorted(groups.values(), key=lambda e: (-e["count"], e["source"])),
                        "total": len(self.catalog.records_by_id)}
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
-        prefix = "mem0://domain/"
+        prefix = "reliquary://domain/"
         if uri.startswith(prefix) and self.catalog:
             domain = uri[len(prefix):]
             if domain not in self.catalog.routeable_domains:
@@ -2899,7 +2899,7 @@ class Mem0ChatProxy:
         source_ref = metadata.get("source_ref")
         if isinstance(source_ref, str) and source_ref.startswith(("http://", "https://")):
             return source_ref
-        return f"mem0://record/{record_id}"
+        return f"reliquary://record/{record_id}"
 
     async def fetch_live_memory(self, record_id: str) -> dict[str, Any] | None:
         try:
@@ -4070,7 +4070,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compiled-dir", default=os.getenv("MEM0_COMPILED_DIR", "/data/compiled"),
                         help="Host directory for the page registry + vault export.")
     parser.add_argument("--schema-path", default=os.getenv("MEM0_SCHEMA_PATH"),
-                        help="Path to the editable memory constitution (mem0://schema). Unset uses a built-in default.")
+                        help="Path to the editable memory constitution (reliquary://schema). Unset uses a built-in default.")
     parser.add_argument("--lint-coverage-min", type=int, default=int(os.getenv("MEM0_LINT_COVERAGE_MIN", "8")),
                         help="Min raw records in a domain/topic with no synthesis before lint flags a coverage gap.")
     return parser.parse_args()
