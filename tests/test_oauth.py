@@ -365,6 +365,14 @@ def test_revoke_access_token_still_works():
     assert p.verify_access_token(access) is False
 
 
+def test_revoke_token_handles_empty_and_unknown():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    assert p.revoke_token(None) is False
+    assert p.revoke_token("") is False
+    assert p.revoke_token("   ") is False
+    assert p.revoke_token("never-issued") is False
+
+
 def test_refresh_token_survives_restart(tmp_path):
     """A refresh token issued by one OAuthProvider survives a simulated restart
     and can still be used to rotate on the reloaded instance."""

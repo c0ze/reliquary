@@ -11,7 +11,7 @@ from urllib.parse import urlencode, urlparse
 
 
 AUTHORIZATION_CODE_TTL = 600
-ACCESS_TOKEN_TTL = 30 * 24 * 3600  # 30 days
+ACCESS_TOKEN_TTL = 5 * 24 * 3600  # 5 days (refresh rotation renews it; matches the server default)
 REFRESH_TOKEN_TTL = 0  # 0 = non-expiring
 # A consumed (rotated-away) refresh token is retained this long so a replay within
 # the window still triggers family revocation (delayed resend / short-window theft).
