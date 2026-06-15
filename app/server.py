@@ -77,6 +77,39 @@ _EXACT_ID_RE = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+){2,}")
 # 0.0 = lead whenever a current synthesis matches at all (simple MVP; tunable).
 COMPILED_LEAD_MIN_SCORE = 0.0
 
+# Former MEM0_* env var names -> their RELIQUARY_* replacements. Used only to warn
+# operators who still have stale vars set; the old names are no longer read.
+_RENAMED_ENV_SUFFIXES = (
+    "AUDIT_LOG", "BLOB_DIR", "BLOB_MAX_BYTES", "BLOB_SIGNING_KEY", "BLOB_URL_TTL",
+    "CLAUDE_MCP_PATH", "CLAUDE_MCP_TOKEN", "COMPILED_COLLECTION", "COMPILED_DIR",
+    "DATASET_PATH", "EMBEDDER_API_KEY", "EMBEDDER_BASE_URL", "EMBEDDER_DIMS",
+    "EMBEDDER_MODEL", "EMBEDDER_PROVIDER", "IMAGE_URL_INGEST", "LINT_COVERAGE_MIN",
+    "MEMORY_CONCURRENT_READS", "METRICS_PUBLIC", "OAUTH_ACCESS_TOKEN_TTL",
+    "OAUTH_ALLOW_REGISTRATION", "OAUTH_CLIENT_ID", "OAUTH_REFRESH_TOKEN_TTL",
+    "OAUTH_VERBATIM_TOKEN", "OPENAI_ALLOW_NOAUTH", "OPENAI_ALLOW_WRITE",
+    "OPENAI_MCP_PATH", "OPENAI_MCP_TOKEN", "RATE_LIMIT_SEARCHES", "RATE_LIMIT_WRITES",
+    "SCHEMA_PATH", "STATE_DIR", "STATIC_TOKENS", "WRITEBACK_PATH",
+)
+LEGACY_ENV_RENAMES = {f"MEM0_{s}": f"RELIQUARY_{s}" for s in _RENAMED_ENV_SUFFIXES}
+# The dropped alias has no suffix-symmetric successor; point operators at the canonical name:
+LEGACY_ENV_RENAMES["MEM0_MCP_TOKEN"] = "RELIQUARY_CLAUDE_MCP_TOKEN"
+
+
+def warn_legacy_env_vars(env=None) -> dict[str, str]:
+    """Warn about any stale MEM0_* env vars still set. Returns the {old: new} map of
+    those found. Non-fatal; the old names are NOT read by Reliquary anymore."""
+    import os as _os
+    env = _os.environ if env is None else env
+    found = {old: new for old, new in LEGACY_ENV_RENAMES.items() if old in env}
+    if found:
+        lines = "\n".join(f"  {old} -> {new}" for old, new in sorted(found.items()))
+        LOG.warning(
+            "Ignoring %d legacy MEM0_* env var(s) - Reliquary now reads RELIQUARY_* "
+            "names. Rename in your environment:\n%s", len(found), lines
+        )
+    return found
+
+
 SERVER_TITLE = "Reliquary"
 SERVER_WEBSITE_URL = "https://github.com/c0ze/reliquary"
 
@@ -4081,6 +4114,7 @@ def main() -> None:
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    warn_legacy_env_vars()
     settings = build_settings(args)
     if settings.openai_allow_write and settings.openai_allow_noauth:
         # No-auth lets tokenless requests through regardless of any configured
