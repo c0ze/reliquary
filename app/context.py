@@ -42,7 +42,7 @@ def _derive_slug(repo: str | None, git_root: str | None) -> str | None:
     return None
 
 
-def resolve_context(arguments: dict | None, headers: dict | None) -> "CallerContext | None":
+def resolve_context(arguments: dict | None, headers: dict | None) -> CallerContext | None:
     arguments = arguments if isinstance(arguments, dict) else {}
     headers = {str(k).lower(): v for k, v in (headers or {}).items()}
     raw = arguments.get("context")

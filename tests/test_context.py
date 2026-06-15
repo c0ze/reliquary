@@ -36,6 +36,16 @@ def test_no_signal_returns_none():
     assert resolve_context({"context": {"client": "codex"}}, {}) is None  # client only, no repo
 
 
+def test_header_key_case_insensitive():
+    ctx = resolve_context({}, {"X-Reliquary-Repo": "owner/MyRepo"})
+    assert ctx is not None and ctx.repo_slug == "myrepo"
+
+
+def test_trailing_slash_repo_slug():
+    ctx = resolve_context({"context": {"repo": "owner/name/"}}, {})
+    assert ctx is not None and ctx.repo_slug == "name"
+
+
 def test_malformed_context_is_ignored():
     assert resolve_context({"context": "not-a-dict"}, {}) is None
     assert resolve_context(None, None) is None
