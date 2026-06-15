@@ -4036,6 +4036,16 @@ def main() -> None:
             "expose PUBLIC WRITE access to the memory store on /openai/mcp. Require a bearer first: "
             "set MEM0_OPENAI_ALLOW_NOAUTH=false (and a MEM0_OPENAI_MCP_TOKEN) before enabling writes."
         )
+    if settings.oauth_access_token_ttl <= 0:
+        raise SystemExit(
+            "Refusing to start: MEM0_OAUTH_ACCESS_TOKEN_TTL must be > 0 "
+            f"(got {settings.oauth_access_token_ttl}); access tokens would be unusable on issue."
+        )
+    if settings.oauth_refresh_token_ttl < 0:
+        raise SystemExit(
+            "Refusing to start: MEM0_OAUTH_REFRESH_TOKEN_TTL must be >= 0 "
+            f"(0 = non-expiring; got {settings.oauth_refresh_token_ttl})."
+        )
     if not settings.claude_token:
         LOG.warning(
             "Claude MCP endpoint has no bearer token configured. "

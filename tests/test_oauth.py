@@ -301,7 +301,7 @@ def test_refresh_rotates_and_invalidates_old():
     _, refresh = p.issue_token_pair(client_id="c", scope="mcp")
     resp, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
     assert err is None and resp["access_token"] and resp["refresh_token"] != refresh
-    again, err2 = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    _again, err2 = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
     assert err2 is not None and err2[1] == "invalid_grant"  # rotated token rejected
 
 

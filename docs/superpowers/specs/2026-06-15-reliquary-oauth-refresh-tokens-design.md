@@ -50,7 +50,7 @@ still work (they re-auth once at access-token expiry).
 
 | # | Component (`app/oauth.py` unless noted) | Responsibility |
 |---|------|----------------|
-| 1 | `RefreshToken` dataclass + `_refresh_tokens` store | `{token, client_id, scope, resource, family_id, created_at, expires_at\|None}`; in-memory dict persisted to `state_dir` (`oauth_refresh_tokens.json`) and loaded on startup — mirrors the access-token store. |
+| 1 | `RefreshToken` dataclass + `_refresh_tokens` store | `{token, client_id, scope, resource, family_id, created_at, expires_at\|None, consumed}` (`consumed` carries the persisted replay state); in-memory dict persisted to `state_dir` (`oauth_refresh_tokens.json`) and loaded on startup — mirrors the access-token store. |
 | 2 | `issue_token_pair(...)` | The `authorization_code` grant returns **both** an access token (TTL) and a refresh token, linked by a `family_id`. |
 | 3 | `grant_type=refresh_token` handler | Validate the presented refresh token → mint a new access + new refresh token in the same family, invalidate the old. Reused/consumed token → revoke the family, `invalid_grant`. |
 | 4 | discovery | `grant_types_supported` gains `"refresh_token"`. |

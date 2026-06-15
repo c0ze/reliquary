@@ -388,10 +388,12 @@ class OAuthProvider:
         if entry.consumed:
             self._revoke_family(entry.family_id)  # replay of a rotated token => theft; kill the family
             return None, (400, "invalid_grant", "refresh token reuse detected; session revoked")
-        entry.consumed = True
+        # Mark the old token consumed only AFTER the new pair is issued, so a failure
+        # mid-rotation can't leave the user with a consumed-but-unreplaced token.
         access_token, refresh_token = self.issue_token_pair(
             client_id=entry.client_id, scope=entry.scope, resource=entry.resource, family_id=entry.family_id,
         )
+        entry.consumed = True
         self._persist_refresh_tokens()
         return (
             {"access_token": access_token, "token_type": "Bearer",

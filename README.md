@@ -169,7 +169,8 @@ Run `python app/server.py --help` for the full flag list.
   resource-scoped access token (default 5 days) plus a **rotating refresh token**
   (non-expiring by default, with reuse detection) so it renews silently. Set
   `MEM0_STATE_DIR` to persist tokens across restarts — without it, a restart signs
-  connectors out. `/oauth/revoke` on any token drops the whole rotation family.
+  connectors out. Revoking a *refresh* token via `/oauth/revoke` drops the whole
+  rotation family; revoking an access token removes just that token.
 - **Embedded vs server Qdrant.** Reads run concurrently only against a Qdrant
   *server*; an embedded on-disk store is auto-detected and serialized (it is not
   read-thread-safe).
