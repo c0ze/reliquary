@@ -43,3 +43,37 @@ def test_capabilities_listed_on_both_endpoints(proxy):
     openai_names = {t["name"] for t in proxy.mcp_tools_for(openai, can_write=True)}
     assert "mem0_capabilities" in claude_names
     assert "capabilities" in openai_names
+
+
+def test_propose_update_stores_correction(proxy):
+    result = run(proxy.handle_propose_update_tool({"target_id": "imp-1", "reason": "wrong date", "replacement_text": "Correct: 1999"}))
+    assert result.get("isError") is not True
+    sc = result["structuredContent"]
+    assert sc["target_id"] == "imp-1" and sc["status"] == "proposed"
+    rec = next(r for r in proxy.memory._store.values() if r.get("metadata", {}).get("kind") == "correction")
+    assert rec["metadata"]["target_id"] == "imp-1"
+    assert rec["metadata"]["status"] == "proposed"
+    assert rec["metadata"]["source_group"] == "user-write"
+
+
+def test_propose_update_missing_target(proxy):
+    result = run(proxy.handle_propose_update_tool({"reason": "x"}))
+    assert result.get("isError") is True
+    assert result["structuredContent"]["error"] == "missing_target"
+
+
+def test_propose_update_write_gated(proxy):
+    profile = _profile(proxy, "claude")
+    result = run(proxy.call_mcp_tool(profile, "propose_update", {"target_id": "imp-1"}, can_write=False))
+    assert result.get("isError") is True
+    sc = result["structuredContent"]
+    assert sc["error"] == "insufficient_scope" and "suggested_action" in sc
+
+
+def test_protected_delete_suggests_propose_update(proxy):
+    proxy.memory._store["imp-1"] = {"id": "imp-1", "memory": "imported", "metadata": {"source_group": "imported"}, "user_id": "my_lord"}
+    profile = _profile(proxy, "claude")
+    result = run(proxy.call_mcp_tool(profile, "mem0_delete", {"id": "imp-1"}, can_write=True))
+    assert result.get("isError") is True
+    sc = result["structuredContent"]
+    assert sc["error"] == "protected_record" and "propose_update" in sc["suggested_action"]

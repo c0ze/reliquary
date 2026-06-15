@@ -914,7 +914,8 @@ class Mem0ChatProxy:
     def _tool_category(tool_name: str) -> str:
         writes = {"mem0_add_memory", "add_memory", "mem0_delete", "delete",
                   "mem0_update", "update", "add_image", "delete_image",
-                  "create_image_upload", "commit_image_upload", "mem0_compile_page"}
+                  "create_image_upload", "commit_image_upload", "mem0_compile_page",
+                  "propose_update"}
         reads = {"mem0_search", "search", "mem0_fetch", "fetch", "fetch_image", "list_domains",
                  "mem0_list_pages", "mem0_page_history", "mem0_capabilities", "capabilities"}
         if tool_name in writes:
@@ -1325,6 +1326,18 @@ class Mem0ChatProxy:
                     }
                 )
                 tools.extend(self._upload_flow_tools())
+                tools.append(
+                    {
+                        "name": "propose_update",
+                        "title": "Propose Correction",
+                        "description": "File a correction for a protected/imported record without mutating it. Stores a linked user-write record (kind=correction, status=proposed).",
+                        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                        "inputSchema": {"type": "object", "properties": {
+                            "target_id": {"type": "string", "description": "Id of the record to correct."},
+                            "reason": {"type": "string"}, "replacement_text": {"type": "string"}, "source": {"type": "string"},
+                        }, "required": ["target_id"], "additionalProperties": False},
+                    }
+                )
             return tools
 
         claude_tools = [
@@ -1538,6 +1551,17 @@ class Mem0ChatProxy:
                         "additionalProperties": False,
                     },
                 },
+                {
+                    "name": "propose_update",
+                    "title": "Propose Correction",
+                    "description": "File a correction for a protected/imported record without mutating it. Stores a linked user-write record (kind=correction, status=proposed).",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                    "inputSchema": {"type": "object", "properties": {
+                        "target_id": {"type": "string", "description": "Id of the record to correct."},
+                        "reason": {"type": "string"}, "replacement_text": {"type": "string"}, "source": {"type": "string"},
+                        "user_id": {"type": "string"},
+                    }, "required": ["target_id"], "additionalProperties": False},
+                },
             ])
         return claude_tools
 
@@ -1596,6 +1620,10 @@ class Mem0ChatProxy:
                     if not can_write:
                         return self._scope_error(tool_name)
                     return await self.handle_commit_image_upload_tool(arguments, allow_user_id=False, profile=profile)
+                if tool_name == "propose_update":
+                    if not can_write:
+                        return self._scope_error(tool_name)
+                    return await self.handle_propose_update_tool(arguments, allow_user_id=False)
                 return self.mcp_tool_result(
                     text=f"Unknown tool: {tool_name}",
                     structured={"error": "unknown_tool"},
@@ -1668,6 +1696,10 @@ class Mem0ChatProxy:
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_commit_image_upload_tool(arguments, allow_user_id=True, profile=profile)
+            if tool_name == "propose_update":
+                if not can_write:
+                    return self._scope_error(tool_name)
+                return await self.handle_propose_update_tool(arguments, allow_user_id=True)
         except Exception as exc:
             LOG.exception("MCP tool failed: %s", tool_name)
             return self.mcp_tool_result(
@@ -1997,6 +2029,30 @@ class Mem0ChatProxy:
         return self.mcp_tool_result(text=f"{len(revisions)} revision(s) for {slug}.",
                                     structured={"slug": slug, "current": info.current_blob,
                                                 "revisions": revisions})
+
+    async def handle_propose_update_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
+        target_id = str(arguments.get("target_id") or "").strip()
+        if not target_id:
+            return self.mcp_tool_result(
+                text="A non-empty `target_id` is required.",
+                structured={"error": "missing_target",
+                            "suggested_action": "Pass target_id = the id of the record you want to correct."},
+                is_error=True)
+        user_id = str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
+        reason = str(arguments.get("reason") or "").strip()
+        replacement = str(arguments.get("replacement_text") or "").strip()
+        text = replacement or reason or f"Proposed correction for {target_id}"
+        metadata: dict[str, Any] = {
+            "kind": "correction", "target_id": target_id, "status": "proposed",
+            "source": str(arguments.get("source") or "mcp"), "source_group": "user-write",
+        }
+        if reason:
+            metadata["reason"] = reason
+        result = await self.add_memory(text, user_id=user_id, metadata=metadata, infer=False)
+        new_ids = added_memory_ids(result)
+        return self.mcp_tool_result(
+            text=f"Filed correction for {target_id} (status=proposed).",
+            structured={"id": new_ids[0] if new_ids else None, "target_id": target_id, "status": "proposed"})
 
     def _load_pending_uploads(self) -> None:
         """Restore persisted upload slots (if a state_dir is configured) and reap
