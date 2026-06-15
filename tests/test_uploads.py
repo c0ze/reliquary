@@ -24,7 +24,7 @@ def test_write_tools_advertise_upload_flow(proxy):
     claude_names = {tool["name"] for tool in proxy.mcp_tools_for(claude, can_write=True)}
     openai_names = {tool["name"] for tool in proxy.mcp_tools_for(openai, can_write=True)}
 
-    assert {"create_image_upload", "commit_image_upload"} <= claude_names
+    assert {"reliquary_create_image_upload", "reliquary_commit_image_upload"} <= claude_names
     assert {"create_image_upload", "commit_image_upload"} <= openai_names
 
 
@@ -32,8 +32,8 @@ def test_read_only_tools_do_not_advertise_upload_flow(proxy):
     claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     names = {tool["name"] for tool in proxy.mcp_tools_for(claude, can_write=False)}
 
-    assert "create_image_upload" not in names
-    assert "commit_image_upload" not in names
+    assert "reliquary_create_image_upload" not in names
+    assert "reliquary_commit_image_upload" not in names
 
 
 def test_create_image_upload_returns_one_time_http_instructions(proxy):
@@ -41,7 +41,7 @@ def test_create_image_upload_returns_one_time_http_instructions(proxy):
 
     result = run(proxy.call_mcp_tool(
         profile,
-        "create_image_upload",
+        "reliquary_create_image_upload",
         {"mimetype": "image/png", "size": len(PNG), "filename": "test.png"},
         can_write=True,
     ))
@@ -61,7 +61,7 @@ def test_upload_commit_fetch_delete_roundtrip(proxy):
         profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
         create = await proxy.call_mcp_tool(
             profile,
-            "create_image_upload",
+            "reliquary_create_image_upload",
             {"mimetype": "image/png", "size": len(PNG)},
             can_write=True,
         )
@@ -84,7 +84,7 @@ def test_upload_commit_fetch_delete_roundtrip(proxy):
 
         commit = await proxy.call_mcp_tool(
             profile,
-            "commit_image_upload",
+            "reliquary_commit_image_upload",
             {"upload_id": upload_id, "caption": "uploaded raw PNG", "title": "Raw upload"},
             can_write=True,
         )
@@ -114,7 +114,7 @@ def test_upload_rejects_unknown_and_expired_slots(proxy):
         assert unknown.status_code == 404
 
         profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
-        create = await proxy.call_mcp_tool(profile, "create_image_upload", {}, can_write=True)
+        create = await proxy.call_mcp_tool(profile, "reliquary_create_image_upload", {}, can_write=True)
         upload_id = create["structuredContent"]["upload_id"]
         proxy.pending_uploads[upload_id].expires_at = 1.0
 
@@ -132,12 +132,12 @@ def test_upload_rejects_unknown_and_expired_slots(proxy):
 
 def test_commit_rejects_upload_before_bytes_arrive(proxy):
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
-    create = run(proxy.call_mcp_tool(profile, "create_image_upload", {}, can_write=True))
+    create = run(proxy.call_mcp_tool(profile, "reliquary_create_image_upload", {}, can_write=True))
     upload_id = create["structuredContent"]["upload_id"]
 
     commit = run(proxy.call_mcp_tool(
         profile,
-        "commit_image_upload",
+        "reliquary_commit_image_upload",
         {"upload_id": upload_id, "caption": "not uploaded yet"},
         can_write=True,
     ))
@@ -150,7 +150,7 @@ def test_upload_rejects_oversize_body(proxy):
     async def scenario():
         proxy.settings.blob_max_bytes = 4
         profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
-        create = await proxy.call_mcp_tool(profile, "create_image_upload", {}, can_write=True)
+        create = await proxy.call_mcp_tool(profile, "reliquary_create_image_upload", {}, can_write=True)
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=proxy),
@@ -181,7 +181,7 @@ async def _post_bytes(proxy, upload_id, data=PNG, content_type="image/png", toke
 def test_create_image_upload_requires_write_scope(proxy):
     """A read-only token must not be able to mint upload slots."""
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
-    result = run(proxy.call_mcp_tool(profile, "create_image_upload", {}, can_write=False))
+    result = run(proxy.call_mcp_tool(profile, "reliquary_create_image_upload", {}, can_write=False))
 
     assert result["isError"] is True
     assert result["structuredContent"]["error"] == "insufficient_scope"
@@ -191,7 +191,7 @@ def test_upload_slot_is_one_time_use(proxy):
     """A second POST to the same slot (before commit) is rejected with 409."""
     async def scenario():
         profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
-        create = await proxy.call_mcp_tool(profile, "create_image_upload", {}, can_write=True)
+        create = await proxy.call_mcp_tool(profile, "reliquary_create_image_upload", {}, can_write=True)
         upload_id = create["structuredContent"]["upload_id"]
 
         first = await _post_bytes(proxy, upload_id)
@@ -211,7 +211,7 @@ def test_commit_rejects_slot_created_on_another_endpoint(proxy):
         openai = proxy.endpoint_profiles[proxy.settings.openai_mcp_path]
 
         create = await proxy.call_mcp_tool(
-            claude, "create_image_upload", {"mimetype": "image/png"}, can_write=True
+            claude, "reliquary_create_image_upload", {"mimetype": "image/png"}, can_write=True
         )
         upload_id = create["structuredContent"]["upload_id"]
         await _post_bytes(proxy, upload_id)
@@ -230,10 +230,10 @@ def test_commit_image_upload_schema_exposes_taxonomy_and_metadata(proxy):
     """A strict client must be able to discover domain/hall/room/metadata on commit."""
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     tools = {t["name"]: t for t in proxy.mcp_tools_for(profile, can_write=True)}
-    props = tools["commit_image_upload"]["inputSchema"]["properties"]
+    props = tools["reliquary_commit_image_upload"]["inputSchema"]["properties"]
 
     for key in ("domain", "hall", "room", "metadata"):
-        assert key in props, f"commit_image_upload schema is missing {key!r}"
+        assert key in props, f"reliquary_commit_image_upload schema is missing {key!r}"
 
 
 def test_commit_applies_taxonomy_and_merges_metadata(proxy):
@@ -242,14 +242,14 @@ def test_commit_applies_taxonomy_and_merges_metadata(proxy):
     async def scenario():
         profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
         create = await proxy.call_mcp_tool(
-            profile, "create_image_upload", {"mimetype": "image/png"}, can_write=True
+            profile, "reliquary_create_image_upload", {"mimetype": "image/png"}, can_write=True
         )
         upload_id = create["structuredContent"]["upload_id"]
         await _post_bytes(proxy, upload_id)
 
         commit = await proxy.call_mcp_tool(
             profile,
-            "commit_image_upload",
+            "reliquary_commit_image_upload",
             {
                 "upload_id": upload_id,
                 "caption": "tagged upload",
@@ -277,7 +277,7 @@ def test_upload_rejects_missing_bearer(proxy):
     async def scenario():
         profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
         create = await proxy.call_mcp_tool(
-            profile, "create_image_upload", {"mimetype": "image/png"}, can_write=True
+            profile, "reliquary_create_image_upload", {"mimetype": "image/png"}, can_write=True
         )
         upload_id = create["structuredContent"]["upload_id"]
 
@@ -294,7 +294,7 @@ def test_upload_rejects_bearer_for_a_different_endpoint(proxy):
     async def scenario():
         claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
         create = await proxy.call_mcp_tool(
-            claude, "create_image_upload", {"mimetype": "image/png"}, can_write=True
+            claude, "reliquary_create_image_upload", {"mimetype": "image/png"}, can_write=True
         )
         upload_id = create["structuredContent"]["upload_id"]
 
@@ -313,14 +313,14 @@ def test_cleanup_preserves_committed_blob(proxy):
     async def scenario():
         profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
         create = await proxy.call_mcp_tool(
-            profile, "create_image_upload", {"mimetype": "image/png"}, can_write=True
+            profile, "reliquary_create_image_upload", {"mimetype": "image/png"}, can_write=True
         )
         upload_id = create["structuredContent"]["upload_id"]
         up = await _post_bytes(proxy, upload_id)
         blob_id = up.json()["blob_id"]
 
         commit = await proxy.call_mcp_tool(
-            profile, "commit_image_upload", {"upload_id": upload_id, "caption": "kept"}, can_write=True
+            profile, "reliquary_commit_image_upload", {"upload_id": upload_id, "caption": "kept"}, can_write=True
         )
         assert commit["isError"] is False
 
@@ -346,7 +346,7 @@ def test_orphaned_upload_blob_reaped_after_restart(make_proxy, tmp_path):
         p1 = make_proxy(blob_dir=blob_dir, state_dir=state_dir)
         profile = p1.endpoint_profiles[p1.settings.claude_mcp_path]
         create = await p1.call_mcp_tool(
-            profile, "create_image_upload", {"mimetype": "image/png"}, can_write=True
+            profile, "reliquary_create_image_upload", {"mimetype": "image/png"}, can_write=True
         )
         upload_id = create["structuredContent"]["upload_id"]
         up = await _post_bytes(p1, upload_id)

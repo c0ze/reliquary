@@ -107,24 +107,24 @@ def test_mcp_tools_for_read_only_excludes_write_tools(proxy):
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     tools = proxy.mcp_tools_for(profile, can_write=False)
     names = {t["name"] for t in tools}
-    assert "mem0_add_memory" not in names
-    assert "add_image" not in names
-    assert "mem0_delete" not in names
-    assert "mem0_update" not in names
-    assert "delete_image" not in names
+    assert "reliquary_add_memory" not in names
+    assert "reliquary_add_image" not in names
+    assert "reliquary_delete" not in names
+    assert "reliquary_update" not in names
+    assert "reliquary_delete_image" not in names
     # Read tools must still be present
-    assert "mem0_search" in names
-    assert "mem0_fetch" in names
+    assert "reliquary_search" in names
+    assert "reliquary_fetch" in names
 
 
 def test_mcp_tools_for_write_includes_write_tools(proxy):
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     tools = proxy.mcp_tools_for(profile, can_write=True)
     names = {t["name"] for t in tools}
-    assert "mem0_add_memory" in names
-    assert "add_image" in names
-    assert "mem0_delete" in names
-    assert "mem0_update" in names
+    assert "reliquary_add_memory" in names
+    assert "reliquary_add_image" in names
+    assert "reliquary_delete" in names
+    assert "reliquary_update" in names
 
 
 def test_mcp_tools_for_openai_read_only_excludes_write_tools(proxy):
@@ -148,7 +148,7 @@ def test_call_mcp_tool_write_tool_with_read_scope_returns_error(proxy):
 
     async def _run():
         return await proxy.call_mcp_tool(
-            profile, "mem0_add_memory", {"text": "hello"}, can_write=False
+            profile, "reliquary_add_memory", {"text": "hello"}, can_write=False
         )
 
     result = asyncio.run(_run())
@@ -164,7 +164,7 @@ def test_call_mcp_tool_read_tool_with_read_scope_still_works(proxy):
 
     async def _run():
         return await proxy.call_mcp_tool(
-            profile, "mem0_search", {"query": "anything"}, can_write=False
+            profile, "reliquary_search", {"query": "anything"}, can_write=False
         )
 
     result = asyncio.run(_run())
@@ -176,7 +176,7 @@ def test_call_mcp_tool_write_tool_with_write_scope_works(proxy, fake_memory):
 
     async def _run():
         return await proxy.call_mcp_tool(
-            profile, "mem0_add_memory", {"text": "test memory"}, can_write=True
+            profile, "reliquary_add_memory", {"text": "test memory"}, can_write=True
         )
 
     result = asyncio.run(_run())

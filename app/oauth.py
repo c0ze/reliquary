@@ -185,7 +185,7 @@ class OAuthProvider:
         return (
             "<!doctype html>\n"
             '<html lang="en"><head><meta charset="utf-8">'
-            "<title>mem0 authorization</title>"
+            "<title>Reliquary authorization</title>"
             "<style>"
             "body{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;color:#222}"
             ".error{color:#b00;font-weight:600}"
@@ -194,7 +194,7 @@ class OAuthProvider:
             "button{padding:.6rem 1.2rem;margin-top:.75rem;border:0;border-radius:.3rem;background:#222;color:#fff;cursor:pointer}"
             "label{display:block;margin-top:1rem}"
             "</style></head><body>"
-            "<h1>mem0</h1>"
+            "<h1>Reliquary</h1>"
             f'<p>Authorize <span class="host">{redirect_host}</span> to access your memories.</p>'
             f"{error_html}"
             '<form method="post" action="/oauth/authorize">'

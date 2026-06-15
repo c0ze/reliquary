@@ -148,7 +148,7 @@ def parse_embedder_dims(env_dims: str | None, fallback: int) -> int:
     try:
         return int(env_dims)
     except ValueError as exc:
-        raise SystemExit("MEM0_EMBEDDER_DIMS must be an integer.") from exc
+        raise SystemExit("RELIQUARY_EMBEDDER_DIMS must be an integer.") from exc
 
 
 def non_negative_int(value: str) -> int:
@@ -181,11 +181,11 @@ def synthesize_embedder_config(config: dict) -> dict:
     vector_store = config.get("vector_store") or {}
     vector_config = vector_store.get("config") or {}
 
-    env_provider = os.getenv("MEM0_EMBEDDER_PROVIDER")
-    env_model = os.getenv("MEM0_EMBEDDER_MODEL")
-    env_base_url = os.getenv("MEM0_EMBEDDER_BASE_URL")
-    env_api_key = os.getenv("MEM0_EMBEDDER_API_KEY")
-    env_dims = os.getenv("MEM0_EMBEDDER_DIMS")
+    env_provider = os.getenv("RELIQUARY_EMBEDDER_PROVIDER")
+    env_model = os.getenv("RELIQUARY_EMBEDDER_MODEL")
+    env_base_url = os.getenv("RELIQUARY_EMBEDDER_BASE_URL")
+    env_api_key = os.getenv("RELIQUARY_EMBEDDER_API_KEY")
+    env_dims = os.getenv("RELIQUARY_EMBEDDER_DIMS")
 
     if env_provider:
         dims = parse_embedder_dims(env_dims, vector_config.get("embedding_model_dims", 1536))
@@ -226,7 +226,7 @@ def synthesize_embedder_config(config: dict) -> dict:
 
     raise SystemExit(
         "Mem0 config is missing an `embedder` section. "
-        "Add one to your config file, or set MEM0_EMBEDDER_PROVIDER/MODEL/BASE_URL/API_KEY env vars before running."
+        "Add one to your config file, or set RELIQUARY_EMBEDDER_PROVIDER/MODEL/BASE_URL/API_KEY env vars before running."
     )
 
 
@@ -324,15 +324,15 @@ def main() -> None:
     config = load_config(args.config)
     memory = Memory.from_config(config)
     page_registry = None
-    # Mirror the server's default-on behavior: an empty MEM0_COMPILED_COLLECTION
+    # Mirror the server's default-on behavior: an empty RELIQUARY_COMPILED_COLLECTION
     # disables the layer; unset uses the same default the server uses.
-    if os.getenv("MEM0_COMPILED_COLLECTION", "reliquary_compiled"):
+    if os.getenv("RELIQUARY_COMPILED_COLLECTION", "reliquary_compiled"):
         try:
             from blobs import BlobStore
             from compiled import PageRegistry
             page_registry = PageRegistry(
-                registry_dir=os.getenv("MEM0_COMPILED_DIR", "/data/compiled"),
-                blobs=BlobStore(blob_dir=os.getenv("MEM0_BLOB_DIR", "/data/blobs"), signing_key=b"ingest", max_bytes=0),
+                registry_dir=os.getenv("RELIQUARY_COMPILED_DIR", "/data/compiled"),
+                blobs=BlobStore(blob_dir=os.getenv("RELIQUARY_BLOB_DIR", "/data/blobs"), signing_key=b"ingest", max_bytes=0),
             )
         except Exception as exc:
             print(f"[ingest] compiled page registry unavailable: {exc}", file=sys.stderr)

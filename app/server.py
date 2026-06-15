@@ -77,6 +77,39 @@ _EXACT_ID_RE = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+){2,}")
 # 0.0 = lead whenever a current synthesis matches at all (simple MVP; tunable).
 COMPILED_LEAD_MIN_SCORE = 0.0
 
+# Former MEM0_* env var names -> their RELIQUARY_* replacements. Used only to warn
+# operators who still have stale vars set; the old names are no longer read.
+_RENAMED_ENV_SUFFIXES = (
+    "AUDIT_LOG", "BLOB_DIR", "BLOB_MAX_BYTES", "BLOB_SIGNING_KEY", "BLOB_URL_TTL",
+    "CLAUDE_MCP_PATH", "CLAUDE_MCP_TOKEN", "COMPILED_COLLECTION", "COMPILED_DIR",
+    "DATASET_PATH", "EMBEDDER_API_KEY", "EMBEDDER_BASE_URL", "EMBEDDER_DIMS",
+    "EMBEDDER_MODEL", "EMBEDDER_PROVIDER", "IMAGE_URL_INGEST", "LINT_COVERAGE_MIN",
+    "MEMORY_CONCURRENT_READS", "METRICS_PUBLIC", "OAUTH_ACCESS_TOKEN_TTL",
+    "OAUTH_ALLOW_REGISTRATION", "OAUTH_CLIENT_ID", "OAUTH_REFRESH_TOKEN_TTL",
+    "OAUTH_VERBATIM_TOKEN", "OPENAI_ALLOW_NOAUTH", "OPENAI_ALLOW_WRITE",
+    "OPENAI_MCP_PATH", "OPENAI_MCP_TOKEN", "RATE_LIMIT_SEARCHES", "RATE_LIMIT_WRITES",
+    "SCHEMA_PATH", "STATE_DIR", "STATIC_TOKENS", "WRITEBACK_PATH",
+)
+LEGACY_ENV_RENAMES = {f"MEM0_{s}": f"RELIQUARY_{s}" for s in _RENAMED_ENV_SUFFIXES}
+# The dropped alias has no suffix-symmetric successor; point operators at the canonical name:
+LEGACY_ENV_RENAMES["MEM0_MCP_TOKEN"] = "RELIQUARY_CLAUDE_MCP_TOKEN"
+
+
+def warn_legacy_env_vars(env=None) -> dict[str, str]:
+    """Warn about any stale MEM0_* env vars still set. Returns the {old: new} map of
+    those found. Non-fatal; the old names are NOT read by Reliquary anymore."""
+    import os as _os
+    env = _os.environ if env is None else env
+    found = {old: new for old, new in LEGACY_ENV_RENAMES.items() if old in env}
+    if found:
+        lines = "\n".join(f"  {old} -> {new}" for old, new in sorted(found.items()))
+        LOG.warning(
+            "Ignoring %d legacy MEM0_* env var(s) - Reliquary now reads RELIQUARY_* "
+            "names. Rename in your environment:\n%s", len(found), lines
+        )
+    return found
+
+
 SERVER_TITLE = "Reliquary"
 SERVER_WEBSITE_URL = "https://github.com/c0ze/reliquary"
 
@@ -179,7 +212,7 @@ tidy up — syntheses cite them.
 - Stable **slug** (lowercase, hyphenated) + revision history.
 - Cite the raw memory ids a page is built from in **derived_from**.
 - When new raw memories land for a page's sources/topic, the page is flagged
-  **stale**; refresh it by re-filing with `mem0_compile_page`. A human decides
+  **stale**; refresh it by re-filing with `reliquary_compile_page`. A human decides
   what to believe; Reliquary only does the bookkeeping.
 """
 
@@ -373,7 +406,7 @@ class Mem0ChatProxy:
         self._load_pending_uploads()
         if not settings.blob_signing_key:
             LOG.warning(
-                "MEM0_BLOB_SIGNING_KEY is unset; using a random per-process key. "
+                "RELIQUARY_BLOB_SIGNING_KEY is unset; using a random per-process key. "
                 "Signed blob URLs will invalidate on restart."
             )
 
@@ -548,7 +581,7 @@ class Mem0ChatProxy:
                 await self.handle_mcp(profile, scope, receive, send)
                 return
 
-            if path == "/mem0/search":
+            if path == "/reliquary/search":
                 # Debug search returns raw memories; never expose it unauthenticated.
                 if not self._require_claude_auth(decode_headers(scope)):
                     await self._send_unauthorized(send)
@@ -659,8 +692,8 @@ class Mem0ChatProxy:
             return
 
         user_id = (
-            payload.get("mem0_user_id")
-            or request_headers.get("x-mem0-user-id")
+            payload.get("reliquary_user_id")
+            or request_headers.get("x-reliquary-user-id")
             or (query_string.get("user_id", [""])[0] if query_string.get("user_id") else "")
             or self.settings.user_id
         )
@@ -704,7 +737,7 @@ class Mem0ChatProxy:
                 )
             base = self.oauth.base_url(headers)
             metadata_url = f"{base}/.well-known/oauth-protected-resource{profile.path}"
-            www_auth = f'Bearer realm="mem0", resource_metadata="{metadata_url}"'
+            www_auth = f'Bearer realm="reliquary", resource_metadata="{metadata_url}"'
             await self.send_json(
                 send,
                 401,
@@ -924,12 +957,25 @@ class Mem0ChatProxy:
 
     @staticmethod
     def _tool_category(tool_name: str) -> str:
-        writes = {"mem0_add_memory", "add_memory", "mem0_delete", "delete",
-                  "mem0_update", "update", "add_image", "delete_image",
-                  "create_image_upload", "commit_image_upload", "mem0_compile_page",
-                  "propose_update"}
-        reads = {"mem0_search", "search", "mem0_fetch", "fetch", "fetch_image", "list_domains",
-                 "mem0_list_pages", "mem0_page_history", "mem0_capabilities", "capabilities"}
+        # Claude endpoint names (reliquary_*) + OpenAI lean endpoint names (bare).
+        writes = {
+            # Claude
+            "reliquary_add_memory", "reliquary_delete", "reliquary_update",
+            "reliquary_add_image", "reliquary_delete_image",
+            "reliquary_create_image_upload", "reliquary_commit_image_upload",
+            "reliquary_compile_page", "reliquary_propose_update",
+            # OpenAI lean endpoint (carve-out — must stay bare)
+            "add_memory", "delete", "update", "add_image", "delete_image",
+            "create_image_upload", "commit_image_upload", "propose_update",
+        }
+        reads = {
+            # Claude
+            "reliquary_search", "reliquary_fetch", "reliquary_fetch_image",
+            "reliquary_list_domains", "reliquary_list_pages", "reliquary_page_history",
+            "reliquary_capabilities",
+            # OpenAI lean endpoint (carve-out — must stay bare)
+            "search", "fetch", "fetch_image", "list_domains", "capabilities",
+        }
         if tool_name in writes:
             return "write"
         if tool_name in reads:
@@ -970,47 +1016,47 @@ class Mem0ChatProxy:
 
     def mcp_resources(self) -> list[dict[str, Any]]:
         resources = [{
-            "uri": "mem0://taxonomy",
+            "uri": "reliquary://taxonomy",
             "name": "Corpus taxonomy",
             "description": "Routeable domains and approximate corpus size.",
             "mimeType": "application/json",
         }]
         resources.append({
-            "uri": "mem0://schema",
+            "uri": "reliquary://schema",
             "name": "Memory constitution",
             "description": "Taxonomy, kinds, and conventions to follow (soft guidance).",
             "mimeType": "text/markdown",
         })
         if self.pages is not None:
             resources.append({
-                "uri": "mem0://recent",
+                "uri": "reliquary://recent",
                 "name": "Recently updated pages",
                 "description": "Most recently updated synthesis pages.",
                 "mimeType": "application/json",
             })
             resources.append({
-                "uri": "mem0://needs-review",
+                "uri": "reliquary://needs-review",
                 "name": "Pages needing review",
                 "description": "Synthesis pages flagged stale (plus coverage gaps).",
                 "mimeType": "application/json",
             })
         if self.catalog:
             resources.append({
-                "uri": "mem0://sources",
+                "uri": "reliquary://sources",
                 "name": "Source registry",
                 "description": "Provenance of imported corpora and user writes (grouped by source).",
                 "mimeType": "application/json",
             })
             for domain in self.catalog.routeable_domains:
                 resources.append({
-                    "uri": f"mem0://domain/{domain}",
+                    "uri": f"reliquary://domain/{domain}",
                     "name": f"Domain: {domain}",
                     "description": f"Rooms and topics that route to the {domain!r} domain.",
                     "mimeType": "application/json",
                 })
                 if self.pages is not None:
                     resources.append({
-                        "uri": f"mem0://domain/{domain}/index",
+                        "uri": f"reliquary://domain/{domain}/index",
                         "name": f"Domain index: {domain}",
                         "description": f"Synthesis pages compiled under the {domain!r} domain.",
                         "mimeType": "application/json",
@@ -1018,12 +1064,12 @@ class Mem0ChatProxy:
         return resources
 
     def read_resource(self, uri: str) -> dict[str, Any] | None:
-        if uri == "mem0://schema":
+        if uri == "reliquary://schema":
             return {"contents": [{"uri": uri, "mimeType": "text/markdown", "text": self._read_schema_doc()}]}
-        if uri == "mem0://recent" and self.pages is not None:
+        if uri == "reliquary://recent" and self.pages is not None:
             payload = {"pages": [self._page_summary(p) for p in self.pages.list()[:20]]}
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
-        if uri == "mem0://needs-review" and self.pages is not None:
+        if uri == "reliquary://needs-review" and self.pages is not None:
             pages = self.pages.list()
             raw_counts = dict(self.catalog.value_counts["domain"]) if self.catalog else {}
             payload = {
@@ -1031,18 +1077,18 @@ class Mem0ChatProxy:
                 "coverage_gaps": health.coverage_gaps(pages, raw_counts, min_count=self.settings.lint_coverage_min),
             }
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
-        domain_prefix = "mem0://domain/"
+        domain_prefix = "reliquary://domain/"
         if uri.startswith(domain_prefix) and uri.endswith("/index") and self.pages is not None:
             domain = uri[len(domain_prefix):-len("/index")]
             payload = {"domain": domain, "pages": [self._page_summary(p) for p in self.pages.list(domain=domain)]}
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
-        if uri == "mem0://taxonomy":
+        if uri == "reliquary://taxonomy":
             payload = {
                 "domains": self.catalog.routeable_domains if self.catalog else [],
                 "records": len(self.catalog.records_by_id) if self.catalog else 0,
             }
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
-        if uri == "mem0://sources" and self.catalog:
+        if uri == "reliquary://sources" and self.catalog:
             groups: dict[tuple[str, str], dict[str, Any]] = {}
             for rec in self.catalog.records_by_id.values():
                 md = rec.metadata or {}
@@ -1060,7 +1106,7 @@ class Mem0ChatProxy:
             payload = {"sources": sorted(groups.values(), key=lambda e: (-e["count"], e["source"])),
                        "total": len(self.catalog.records_by_id)}
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
-        prefix = "mem0://domain/"
+        prefix = "reliquary://domain/"
         if uri.startswith(prefix) and self.catalog:
             domain = uri[len(prefix):]
             if domain not in self.catalog.routeable_domains:
@@ -1160,6 +1206,7 @@ class Mem0ChatProxy:
 
     def handle_capabilities_tool(self, profile: "EndpointProfile", context=None, can_write: bool = False) -> dict[str, Any]:
         is_openai = profile.name == "openai"
+        tp = "" if is_openai else "reliquary_"
         # Reflect the request's ACTUAL scope: a read-only token must not see write
         # tools advertised as available (that would contradict tools/list and any
         # call would return insufficient_scope). Write tools surface only with write.
@@ -1172,12 +1219,12 @@ class Mem0ChatProxy:
             "write_tools_when_authorized": write_only,
             "rules": {
                 "imported_records": "read-only (protected); user-written records are mutable",
-                "corrections": "propose changes to imported records with propose_update (never mutates the import)",
+                "corrections": f"propose changes to imported records with {tp}propose_update (never mutates the import)",
                 "write_scope": "write tools require a write-scoped token" + (
-                    "; this endpoint also requires MEM0_OPENAI_ALLOW_WRITE" if is_openai else ""),
+                    "; this endpoint also requires RELIQUARY_OPENAI_ALLOW_WRITE" if is_openai else ""),
                 "user_id": "not accepted on the OpenAI endpoint" if is_openai else "optional override accepted",
             },
-            "images": "store/fetch binary blobs with add_image / fetch_image (+ upload flow)",
+            "images": f"store/fetch binary blobs with {tp}add_image / {tp}fetch_image (+ upload flow)",
             "taxonomy": {
                 "fields": ["domain", "hall", "room", "topic"],
                 "routeable_domains": self.catalog.routeable_domains if self.catalog else [],
@@ -1385,15 +1432,15 @@ class Mem0ChatProxy:
 
         claude_tools = [
             {
-                "name": "mem0_status",
-                "title": "Mem0 Status",
+                "name": "reliquary_status",
+                "title": "Reliquary Status",
                 "description": "Inspect the local Mem0 store, endpoints, and approximate memory count.",
                 "annotations": read_only,
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             },
             {
-                "name": "mem0_search",
-                "title": "Mem0 Search",
+                "name": "reliquary_search",
+                "title": "Reliquary Search",
                 "description": "Search the Mem0 store with optional domain/hall/room-aware routing." + routing_hint,
                 "annotations": read_only,
                 "inputSchema": {
@@ -1414,53 +1461,53 @@ class Mem0ChatProxy:
                 },
             },
             {
-                "name": "mem0_fetch",
-                "title": "Mem0 Fetch",
+                "name": "reliquary_fetch",
+                "title": "Reliquary Fetch",
                 "description": "Fetch the full document behind a search result by id.",
                 "annotations": read_only,
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"id": {"type": "string", "description": "Document id returned by mem0_search."}},
+                    "properties": {"id": {"type": "string", "description": "Document id returned by reliquary_search."}},
                     "required": ["id"],
                     "additionalProperties": False,
                 },
             },
             {
-                "name": "list_domains",
+                "name": "reliquary_list_domains",
                 "title": "List Domains",
                 "description": "List the routeable retrieval domains available for filtering search.",
                 "annotations": {"readOnlyHint": True, "openWorldHint": False},
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             },
             {
-                "name": "fetch_image",
+                "name": "reliquary_fetch_image",
                 "title": "Fetch Image",
                 "description": "Fetch a stored binary file by blob_id. Returns the image inline plus a "
                 "signed url for direct download of large files.",
                 "annotations": {"readOnlyHint": True, "openWorldHint": False},
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"id": {"type": "string", "description": "blob_id from add_image or mem0_search."}},
+                    "properties": {"id": {"type": "string", "description": "blob_id from reliquary_add_image or reliquary_search."}},
                     "required": ["id"],
                     "additionalProperties": False,
                 },
             },
             {
-                "name": "mem0_list_pages",
+                "name": "reliquary_list_pages",
                 "title": "List Synthesis Pages",
                 "description": "List compiled synthesis pages, optionally filtered by domain and/or status.",
                 "annotations": read_only,
                 "inputSchema": {"type": "object", "properties": {"domain": {"type": "string"}, "status": {"type": "string"}}, "additionalProperties": False},
             },
             {
-                "name": "mem0_page_history",
+                "name": "reliquary_page_history",
                 "title": "Synthesis Page History",
                 "description": "List the revision history (blob ids) of a compiled page by slug.",
                 "annotations": read_only,
                 "inputSchema": {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"], "additionalProperties": False},
             },
             {
-                "name": "mem0_capabilities",
+                "name": "reliquary_capabilities",
                 "title": "Capabilities",
                 "description": "Orient yourself: what Reliquary is, the tools available, read/write and protection rules, taxonomy, and how to supply project context. Call this first.",
                 "annotations": {"readOnlyHint": True, "openWorldHint": False},
@@ -1470,8 +1517,8 @@ class Mem0ChatProxy:
         if can_write:
             claude_tools.extend([
                 {
-                    "name": "mem0_add_memory",
-                    "title": "Mem0 Add Memory",
+                    "name": "reliquary_add_memory",
+                    "title": "Reliquary Add Memory",
                     "description": "Store a new memory in the local Mem0 collection.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
                     "inputSchema": {
@@ -1495,15 +1542,15 @@ class Mem0ChatProxy:
                     },
                 },
                 {
-                    "name": "mem0_delete",
-                    "title": "Mem0 Delete Memory",
-                    "description": "Delete a memory previously stored via mem0_add_memory, by id. "
+                    "name": "reliquary_delete",
+                    "title": "Reliquary Delete Memory",
+                    "description": "Delete a memory previously stored via reliquary_add_memory, by id. "
                     "Only user-written memories can be deleted; imported corpus records are protected.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Memory id from mem0_search or mem0_add_memory."},
+                            "id": {"type": "string", "description": "Memory id from reliquary_search or reliquary_add_memory."},
                             "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
                         },
                         "required": ["id"],
@@ -1511,16 +1558,16 @@ class Mem0ChatProxy:
                     },
                 },
                 {
-                    "name": "mem0_update",
-                    "title": "Mem0 Update Memory",
+                    "name": "reliquary_update",
+                    "title": "Reliquary Update Memory",
                     "description": "Update the text (and optionally merge metadata) of a memory you previously "
-                    "stored via mem0_add_memory, by id. Only user-written memories can be updated; imported "
+                    "stored via reliquary_add_memory, by id. Only user-written memories can be updated; imported "
                     "corpus records are protected.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Memory id from mem0_search or mem0_add_memory."},
+                            "id": {"type": "string", "description": "Memory id from reliquary_search or reliquary_add_memory."},
                             "text": {"type": "string", "description": "The new memory text."},
                             "metadata": {"type": "object", "description": "Optional metadata fields to merge into the record."},
                             "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
@@ -1530,12 +1577,12 @@ class Mem0ChatProxy:
                     },
                 },
                 {
-                    "name": "add_image",
+                    "name": "reliquary_add_image",
                     "title": "Add Image",
                     "description": "Store a binary file (usually an image) and a searchable caption. "
                     "Provide image_base64 OR source_url (not both). "
-                    "Returns blob_id, memory_id and a signed url. Find it later via mem0_search on the "
-                    "caption, or fetch_image with the blob_id.",
+                    "Returns blob_id, memory_id and a signed url. Find it later via reliquary_search on the "
+                    "caption, or reliquary_fetch_image with the blob_id.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
                     "inputSchema": {
                         "type": "object",
@@ -1557,24 +1604,65 @@ class Mem0ChatProxy:
                     },
                 },
                 {
-                    "name": "delete_image",
+                    "name": "reliquary_delete_image",
                     "title": "Delete Image",
-                    "description": "Delete an image you stored via add_image, by its memory_id. Removes the "
+                    "description": "Delete an image you stored via reliquary_add_image, by its memory_id. Removes the "
                     "caption memory and unlinks the blob when no other memory references it.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "memory_id": {"type": "string", "description": "memory_id returned by add_image."},
+                            "memory_id": {"type": "string", "description": "memory_id returned by reliquary_add_image."},
                             "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
                         },
                         "required": ["memory_id"],
                         "additionalProperties": False,
                     },
                 },
-                *self._upload_flow_tools(),
                 {
-                    "name": "mem0_compile_page",
+                    "name": "reliquary_create_image_upload",
+                    "title": "Create Image Upload",
+                    "description": "Create a short-lived, one-time HTTP upload slot for raw image bytes. "
+                    "Use this instead of reliquary_add_image.image_base64 when you have local binary bytes and can "
+                    "make HTTP requests. POST the raw bytes to the returned upload_url, sending the SAME "
+                    "`Authorization: Bearer` token you use for this MCP endpoint (anonymous uploads are "
+                    "rejected with 401), then call reliquary_commit_image_upload with the upload_id and caption.",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "mimetype": {"type": "string", "description": "Expected content type, e.g. image/png."},
+                            "size": {"type": "integer", "minimum": 1, "description": "Expected byte size, if known."},
+                            "filename": {"type": "string", "description": "Optional client filename for display/debugging."},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "reliquary_commit_image_upload",
+                    "title": "Commit Image Upload",
+                    "description": "Finalize a successful reliquary_create_image_upload + HTTP POST by creating the "
+                    "searchable image caption memory. Returns the same blob_id, memory_id and signed url "
+                    "shape as reliquary_add_image.",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "upload_id": {"type": "string", "description": "upload_id returned by reliquary_create_image_upload."},
+                            "caption": {"type": "string", "description": "Searchable text describing the image."},
+                            "title": {"type": "string"},
+                            "domain": {"type": "string"},
+                            "hall": {"type": "string"},
+                            "room": {"type": "string"},
+                            "topic": {"type": "string"},
+                            "metadata": {"type": "object", "description": "Extra metadata fields to merge into the record."},
+                        },
+                        "required": ["upload_id", "caption"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "reliquary_compile_page",
                     "title": "Compile Synthesis Page",
                     "description": "File a synthesized, human-readable page into the compiled layer. YOU author the "
                     "markdown (Reliquary never generates prose); it is versioned, indexed for recall, and linked to its "
@@ -1596,7 +1684,7 @@ class Mem0ChatProxy:
                     },
                 },
                 {
-                    "name": "propose_update",
+                    "name": "reliquary_propose_update",
                     "title": "Propose Correction",
                     "description": "File a correction for a protected/imported record without mutating it. Stores a linked user-write record (kind=correction, status=proposed).",
                     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
@@ -1675,9 +1763,9 @@ class Mem0ChatProxy:
                     is_error=True,
                 )
 
-            if tool_name == "mem0_capabilities":
+            if tool_name == "reliquary_capabilities":
                 return self.handle_capabilities_tool(profile, context=context, can_write=can_write)
-            if tool_name == "mem0_status":
+            if tool_name == "reliquary_status":
                 status = {
                     "user_id": self.settings.user_id,
                     "approx_memory_count": await self.get_memory_count(),
@@ -1691,57 +1779,57 @@ class Mem0ChatProxy:
                     text=f"Mem0 is available. Approximate memory count: {status['approx_memory_count']}.",
                     structured=status,
                 )
-            if tool_name == "list_domains":
+            if tool_name == "reliquary_list_domains":
                 domains = self.catalog.routeable_domains if self.catalog else []
                 return self.mcp_tool_result(
                     text=f"{len(domains)} routeable domain(s): {', '.join(domains) or '(none)'}",
                     structured={"domains": domains},
                 )
-            if tool_name == "mem0_search":
+            if tool_name == "reliquary_search":
                 return await self.handle_search_tool(arguments, context=context)
-            if tool_name == "mem0_fetch":
+            if tool_name == "reliquary_fetch":
                 return await self.handle_fetch_tool(arguments)
-            if tool_name == "mem0_list_pages":
+            if tool_name == "reliquary_list_pages":
                 return await self.handle_list_pages_tool(arguments)
-            if tool_name == "mem0_page_history":
+            if tool_name == "reliquary_page_history":
                 return await self.handle_page_history_tool(arguments)
-            if tool_name == "fetch_image":
+            if tool_name == "reliquary_fetch_image":
                 return await self.handle_fetch_image_tool(arguments)
-            if tool_name == "mem0_add_memory":
+            if tool_name == "reliquary_add_memory":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_add_memory_tool(arguments)
-            if tool_name == "mem0_delete":
+            if tool_name == "reliquary_delete":
                 if not can_write:
                     return self._scope_error(tool_name)
-                return await self.handle_delete_tool(arguments, allow_user_id=True)
-            if tool_name == "mem0_update":
+                return await self.handle_delete_tool(arguments, allow_user_id=True, tool_prefix="reliquary_")
+            if tool_name == "reliquary_update":
                 if not can_write:
                     return self._scope_error(tool_name)
-                return await self.handle_update_tool(arguments, allow_user_id=True)
-            if tool_name == "mem0_compile_page":
+                return await self.handle_update_tool(arguments, allow_user_id=True, tool_prefix="reliquary_")
+            if tool_name == "reliquary_compile_page":
                 if not can_write:
                     return self._scope_error(tool_name)
                 # Pages are a single global registry keyed by slug (not namespaced by
                 # user_id), so file them under the server user only — never a caller id.
                 return await self.handle_compile_page_tool(arguments, allow_user_id=False)
-            if tool_name == "add_image":
+            if tool_name == "reliquary_add_image":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_add_image_tool(arguments)
-            if tool_name == "delete_image":
+            if tool_name == "reliquary_delete_image":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_delete_image_tool(arguments, allow_user_id=True)
-            if tool_name == "create_image_upload":
+            if tool_name == "reliquary_create_image_upload":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return self.handle_create_image_upload_tool(arguments, profile=profile)
-            if tool_name == "commit_image_upload":
+            if tool_name == "reliquary_commit_image_upload":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_commit_image_upload_tool(arguments, allow_user_id=True, profile=profile)
-            if tool_name == "propose_update":
+            if tool_name == "reliquary_propose_update":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_propose_update_tool(arguments, allow_user_id=True)
@@ -1765,7 +1853,7 @@ class Mem0ChatProxy:
         *,
         allow_threshold: bool = True,
         allow_user_id: bool = True,
-        fetch_tool_name: str = "mem0_fetch",
+        fetch_tool_name: str = "reliquary_fetch",
         body_char_cap: int = SEARCH_PREVIEW_CHAR_CAP,
         lean_results: bool = False,
         context=None,
@@ -2701,7 +2789,7 @@ class Mem0ChatProxy:
             },
         )
 
-    async def handle_delete_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
+    async def handle_delete_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False, tool_prefix: str = "") -> dict[str, Any]:
         record_id = str(arguments.get("id") or "").strip()
         if not record_id:
             return self.mcp_tool_result(
@@ -2722,7 +2810,7 @@ class Mem0ChatProxy:
         if existing is None:
             return self.mcp_tool_result(
                 text=f"No deletable memory found for id={record_id}. "
-                "Only memories created via add_memory can be deleted; imported corpus records cannot.",
+                f"Only memories created via {tool_prefix}add_memory can be deleted; imported corpus records cannot.",
                 structured={"error": "not_found", "id": record_id},
                 is_error=True,
             )
@@ -2739,7 +2827,7 @@ class Mem0ChatProxy:
                 text=f"Refusing to delete id={record_id}: it is not a user-written memory "
                 "(imported corpus records are protected).",
                 structured={"error": "protected_record", "id": record_id,
-                            "suggested_action": "Imported records are read-only — file a correction with propose_update (target_id=<id>)."},
+                            "suggested_action": f"Imported records are read-only — file a correction with {tool_prefix}propose_update (target_id=<id>)."},
                 is_error=True,
             )
         await self.delete_memory(record_id)
@@ -2748,7 +2836,7 @@ class Mem0ChatProxy:
             structured={"deleted": True, "id": record_id, "title": existing.get("title")},
         )
 
-    async def handle_update_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
+    async def handle_update_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False, tool_prefix: str = "") -> dict[str, Any]:
         record_id = str(arguments.get("id") or "").strip()
         if not record_id:
             return self.mcp_tool_result(
@@ -2777,7 +2865,7 @@ class Mem0ChatProxy:
         if existing is None:
             return self.mcp_tool_result(
                 text=f"No updatable memory found for id={record_id}. "
-                "Only memories created via add_memory can be updated; imported corpus records cannot.",
+                f"Only memories created via {tool_prefix}add_memory can be updated; imported corpus records cannot.",
                 structured={"error": "not_found", "id": record_id},
                 is_error=True,
             )
@@ -2792,7 +2880,7 @@ class Mem0ChatProxy:
                 text=f"Refusing to update id={record_id}: it is not a user-written memory "
                 "(imported corpus records are protected).",
                 structured={"error": "protected_record", "id": record_id,
-                            "suggested_action": "Imported records are read-only — file a correction with propose_update (target_id=<id>)."},
+                            "suggested_action": f"Imported records are read-only — file a correction with {tool_prefix}propose_update (target_id=<id>)."},
                 is_error=True,
             )
         # Preserve existing metadata and merge any caller-provided fields, but
@@ -2844,7 +2932,7 @@ class Mem0ChatProxy:
         source_ref = metadata.get("source_ref")
         if isinstance(source_ref, str) and source_ref.startswith(("http://", "https://")):
             return source_ref
-        return f"mem0://record/{record_id}"
+        return f"reliquary://record/{record_id}"
 
     async def fetch_live_memory(self, record_id: str) -> dict[str, Any] | None:
         try:
@@ -2884,16 +2972,16 @@ class Mem0ChatProxy:
             return
 
         original_messages = [message for message in messages if isinstance(message, dict)]
-        user_id = payload.pop("mem0_user_id", None) or request_headers.get("x-mem0-user-id") or self.settings.user_id
-        mem0_limit = self._coerce_int(
-            payload.pop("mem0_limit", self.settings.memory_limit),
+        user_id = payload.pop("reliquary_user_id", None) or request_headers.get("x-reliquary-user-id") or self.settings.user_id
+        reliquary_limit = self._coerce_int(
+            payload.pop("reliquary_limit", self.settings.memory_limit),
             default=self.settings.memory_limit,
             minimum=1,
             maximum=20,
         )
-        mem0_threshold = coerce_threshold(payload.pop("mem0_threshold", self.settings.memory_threshold))
-        mem0_query = payload.pop("mem0_query", None) or latest_user_text(original_messages)
-        mem0_disabled = bool(payload.pop("mem0_disable", False))
+        reliquary_threshold = coerce_threshold(payload.pop("reliquary_threshold", self.settings.memory_threshold))
+        reliquary_query = payload.pop("reliquary_query", None) or latest_user_text(original_messages)
+        reliquary_disabled = bool(payload.pop("reliquary_disable", False))
         stream = bool(payload.get("stream"))
 
         if not self.settings.upstream_base_url:
@@ -2901,24 +2989,24 @@ class Mem0ChatProxy:
             return
 
         memory_hits: list[dict[str, Any]] = []
-        if not mem0_disabled and mem0_query:
+        if not reliquary_disabled and reliquary_query:
             memory_hits = await self.search_memories(
-                mem0_query, user_id=user_id, limit=mem0_limit, threshold=mem0_threshold, filters=None
+                reliquary_query, user_id=user_id, limit=reliquary_limit, threshold=reliquary_threshold, filters=None
             )
 
         if memory_hits:
-            payload["messages"] = self.inject_memory_message(original_messages, mem0_query, memory_hits)
+            payload["messages"] = self.inject_memory_message(original_messages, reliquary_query, memory_hits)
         else:
             payload["messages"] = original_messages
 
         upstream_url = self.url_for(scope, self.settings.upstream_base_url)
         forward_headers = self.forward_headers(request_headers)
         extra_headers = {
-            "x-mem0-hit-count": str(len(memory_hits)),
-            "x-mem0-user-id": user_id,
+            "x-reliquary-hit-count": str(len(memory_hits)),
+            "x-reliquary-user-id": user_id,
         }
-        if mem0_query:
-            extra_headers["x-mem0-query"] = trim_text(mem0_query, 140)
+        if reliquary_query:
+            extra_headers["x-reliquary-query"] = trim_text(reliquary_query, 140)
 
         if stream:
             assistant_text = await self.stream_upstream_request(
@@ -2929,7 +3017,7 @@ class Mem0ChatProxy:
                 content=json_dumps(payload),
                 response_extra_headers=extra_headers,
             )
-            if self.settings.writeback and assistant_text and mem0_query:
+            if self.settings.writeback and assistant_text and reliquary_query:
                 await self.writeback_turn(
                     user_id=user_id,
                     user_text=latest_user_text(original_messages),
@@ -2954,7 +3042,7 @@ class Mem0ChatProxy:
         )
         await send({"type": "http.response.body", "body": response_body, "more_body": False})
 
-        if self.settings.writeback and response.is_success and mem0_query:
+        if self.settings.writeback and response.is_success and reliquary_query:
             try:
                 response_json = response.json()
             except json.JSONDecodeError:
@@ -3302,7 +3390,7 @@ class Mem0ChatProxy:
     def _require_claude_auth(self, headers: dict[str, str]) -> bool:
         """True only when the request carries the Claude endpoint's bearer (or a
         valid derived OAuth token for it). Used to gate the privileged HTTP
-        helpers (/status, /mem0/search) with the same auth as /claude/mcp."""
+        helpers (/status, /reliquary/search) with the same auth as /claude/mcp."""
         profile = self.endpoint_profiles.get(self.settings.claude_mcp_path)
         return bool(profile and self.is_allowed_token(profile, headers))
 
@@ -3432,7 +3520,7 @@ class Mem0ChatProxy:
             return
 
         metadata = {
-            "source": "mem0_chat_proxy",
+            "source": "reliquary_chat_proxy",
             "kind": "live_chat_turn",
             "source_group": "user-write",
         }
@@ -3808,7 +3896,7 @@ def parse_static_tokens(raw: str | None) -> tuple[tuple[str, str, str], ...]:
             continue
         parts = chunk.split(":", 2)
         if len(parts) != 3:
-            LOG.warning("Ignoring malformed MEM0_STATIC_TOKENS entry (need label:scope:token).")
+            LOG.warning("Ignoring malformed RELIQUARY_STATIC_TOKENS entry (need label:scope:token).")
             continue
         label, scope, token = (p.strip() for p in parts)
         scope = "write" if scope_is_write(scope) else "read"
@@ -3833,7 +3921,7 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         args.embedder_base_url or embedder_config.get("lmstudio_base_url") or embedder_config.get("openai_base_url")
     )
 
-    claude_token = normalize_token(args.claude_mcp_token or args.mcp_token)
+    claude_token = normalize_token(args.claude_mcp_token)
     openai_token = normalize_token(args.openai_mcp_token)
 
     return ProxySettings(
@@ -3892,7 +3980,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-threshold", default=None, type=float, help="Optional minimum similarity score for memory hits.")
     parser.add_argument("--memory-max-chars", default=500, type=int, help="Maximum characters per injected memory snippet.")
     parser.add_argument("--request-timeout", default=600.0, type=float, help="Read timeout in seconds for upstream model responses.")
-    _concurrent_reads_env = os.getenv("MEM0_MEMORY_CONCURRENT_READS")
+    _concurrent_reads_env = os.getenv("RELIQUARY_MEMORY_CONCURRENT_READS")
     parser.add_argument(
         "--memory-concurrent-reads",
         action=argparse.BooleanOptionalAction,
@@ -3910,50 +3998,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--writeback", action="store_true", help="Write the latest user+assistant turn back into Mem0 after each successful completion.")
     parser.add_argument(
         "--writeback-path",
-        default=os.getenv("MEM0_WRITEBACK_PATH"),
+        default=os.getenv("RELIQUARY_WRITEBACK_PATH"),
         help="Optional Markdown file to append writeback turns to, e.g. an Obsidian note.",
     )
     parser.add_argument("--system-instruction", default=DEFAULT_MEMORY_INSTRUCTION, help="Instruction text injected ahead of the retrieved memory block.")
-    parser.add_argument("--claude-mcp-path", default=os.getenv("MEM0_CLAUDE_MCP_PATH", "/claude/mcp"), help="Path for the bearer-protected Claude MCP endpoint.")
-    parser.add_argument("--openai-mcp-path", default=os.getenv("MEM0_OPENAI_MCP_PATH", "/openai/mcp"), help="Path for the read-only OpenAI/ChatGPT MCP endpoint.")
-    parser.add_argument("--claude-mcp-token", default=os.getenv("MEM0_CLAUDE_MCP_TOKEN"), help="Bearer token required for the Claude MCP endpoint.")
-    parser.add_argument("--openai-mcp-token", default=os.getenv("MEM0_OPENAI_MCP_TOKEN"), help="Optional bearer token for the OpenAI MCP endpoint.")
-    parser.add_argument("--mcp-token", default=os.getenv("MEM0_MCP_TOKEN"), help="Back-compat alias for --claude-mcp-token.")
+    parser.add_argument("--claude-mcp-path", default=os.getenv("RELIQUARY_CLAUDE_MCP_PATH", "/claude/mcp"), help="Path for the bearer-protected Claude MCP endpoint.")
+    parser.add_argument("--openai-mcp-path", default=os.getenv("RELIQUARY_OPENAI_MCP_PATH", "/openai/mcp"), help="Path for the read-only OpenAI/ChatGPT MCP endpoint.")
+    parser.add_argument("--claude-mcp-token", default=os.getenv("RELIQUARY_CLAUDE_MCP_TOKEN"), help="Bearer token required for the Claude MCP endpoint.")
+    parser.add_argument("--openai-mcp-token", default=os.getenv("RELIQUARY_OPENAI_MCP_TOKEN"), help="Optional bearer token for the OpenAI MCP endpoint.")
     parser.add_argument(
         "--openai-allow-noauth",
         action=argparse.BooleanOptionalAction,
-        default=os.getenv("MEM0_OPENAI_ALLOW_NOAUTH", "false").lower() in {"1", "true", "yes"},
+        default=os.getenv("RELIQUARY_OPENAI_ALLOW_NOAUTH", "false").lower() in {"1", "true", "yes"},
         help="Allow unauthenticated requests to the OpenAI MCP endpoint (default false). "
         "Opt in only when the endpoint is not reachable from untrusted networks.",
     )
     parser.add_argument(
         "--openai-allow-write",
         action=argparse.BooleanOptionalAction,
-        default=os.getenv("MEM0_OPENAI_ALLOW_WRITE", "false").lower() in {"1", "true", "yes"},
+        default=os.getenv("RELIQUARY_OPENAI_ALLOW_WRITE", "false").lower() in {"1", "true", "yes"},
         help="Expose the add_memory write tool on the OpenAI MCP endpoint (default false: read-only). "
         "Only enable when the endpoint's bearer token is trusted to write to the corpus.",
     )
-    parser.add_argument("--oauth-client-id", default=os.getenv("MEM0_OAUTH_CLIENT_ID"), help="Pre-shared OAuth client_id. When set, only this id is accepted.")
+    parser.add_argument("--oauth-client-id", default=os.getenv("RELIQUARY_OAUTH_CLIENT_ID"), help="Pre-shared OAuth client_id. When set, only this id is accepted.")
     parser.add_argument(
         "--oauth-allow-registration",
         action=argparse.BooleanOptionalAction,
-        default=os.getenv("MEM0_OAUTH_ALLOW_REGISTRATION", "true").lower() in {"1", "true", "yes"},
+        default=os.getenv("RELIQUARY_OAUTH_ALLOW_REGISTRATION", "true").lower() in {"1", "true", "yes"},
         help="Allow POST /oauth/register. Disable after the legitimate client has registered once.",
     )
     parser.add_argument(
         "--oauth-verbatim-token",
         action=argparse.BooleanOptionalAction,
-        default=os.getenv("MEM0_OAUTH_VERBATIM_TOKEN", "false").lower() in {"1", "true", "yes"},
+        default=os.getenv("RELIQUARY_OAUTH_VERBATIM_TOKEN", "false").lower() in {"1", "true", "yes"},
         help="Return the master bearer itself as the OAuth access_token (old behavior) instead of a "
         "derived, revocable token. Default false.",
     )
-    parser.add_argument("--oauth-access-token-ttl", type=int, default=int(os.getenv("MEM0_OAUTH_ACCESS_TOKEN_TTL", "432000")),
+    parser.add_argument("--oauth-access-token-ttl", type=int, default=int(os.getenv("RELIQUARY_OAUTH_ACCESS_TOKEN_TTL", "432000")),
                         help="Access-token lifetime in seconds (default 5 days). Refresh rotation renews it.")
-    parser.add_argument("--oauth-refresh-token-ttl", type=int, default=int(os.getenv("MEM0_OAUTH_REFRESH_TOKEN_TTL", "0")),
+    parser.add_argument("--oauth-refresh-token-ttl", type=int, default=int(os.getenv("RELIQUARY_OAUTH_REFRESH_TOKEN_TTL", "0")),
                         help="Refresh-token lifetime in seconds (0 = non-expiring).")
     parser.add_argument(
         "--dataset",
-        default=os.getenv("MEM0_DATASET_PATH"),
+        default=os.getenv("RELIQUARY_DATASET_PATH"),
         help="Optional corpus JSONL (or directory) for domain/hall/room-aware retrieval routing.",
     )
     parser.add_argument(
@@ -3964,59 +4051,59 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--blob-dir",
-        default=os.getenv("MEM0_BLOB_DIR", "/data/blobs"),
+        default=os.getenv("RELIQUARY_BLOB_DIR", "/data/blobs"),
         help="Directory for stored binary blobs (images, etc.). Bind-mount this for host access.",
     )
     parser.add_argument(
         "--blob-signing-key",
-        default=os.getenv("MEM0_BLOB_SIGNING_KEY"),
+        default=os.getenv("RELIQUARY_BLOB_SIGNING_KEY"),
         help="HMAC key for signed blob URLs. Unset = random per-process key (URLs break on restart).",
     )
     parser.add_argument(
         "--blob-max-bytes",
         type=int,
-        default=int(os.getenv("MEM0_BLOB_MAX_BYTES", str(30 * 1024 * 1024))),
+        default=int(os.getenv("RELIQUARY_BLOB_MAX_BYTES", str(30 * 1024 * 1024))),
         help="Max blob size in bytes (0 disables the cap). Default 30 MB.",
     )
     parser.add_argument(
         "--blob-url-ttl",
         type=int,
-        default=int(os.getenv("MEM0_BLOB_URL_TTL", "3600")),
+        default=int(os.getenv("RELIQUARY_BLOB_URL_TTL", "3600")),
         help="Lifetime in seconds of signed blob URLs. Default 3600.",
     )
     parser.add_argument(
         "--state-dir",
-        default=os.getenv("MEM0_STATE_DIR"),
+        default=os.getenv("RELIQUARY_STATE_DIR"),
         help="Directory to persist OAuth tokens + MCP sessions across restarts. "
         "Unset = in-memory only (tokens/sessions reset on restart).",
     )
     parser.add_argument(
         "--static-tokens",
-        default=os.getenv("MEM0_STATIC_TOKENS"),
+        default=os.getenv("RELIQUARY_STATIC_TOKENS"),
         help="Named static bearer tokens with per-token scope, beyond the master token. "
         "Format: 'label:scope:token' entries separated by ';'. scope is 'read' or 'write'. "
         "Example: 'readonly:read:abc123;editor:write:def456'.",
     )
-    parser.add_argument("--audit-log", default=os.getenv("MEM0_AUDIT_LOG"),
+    parser.add_argument("--audit-log", default=os.getenv("RELIQUARY_AUDIT_LOG"),
         help="Append a JSONL audit line per write (add/update/delete) to this path. Unset = disabled.")
-    parser.add_argument("--rate-limit-writes", type=int, default=int(os.getenv("MEM0_RATE_LIMIT_WRITES", "0")),
+    parser.add_argument("--rate-limit-writes", type=int, default=int(os.getenv("RELIQUARY_RATE_LIMIT_WRITES", "0")),
         help="Max write tool calls per token per minute (0 = unlimited).")
-    parser.add_argument("--rate-limit-searches", type=int, default=int(os.getenv("MEM0_RATE_LIMIT_SEARCHES", "0")),
+    parser.add_argument("--rate-limit-searches", type=int, default=int(os.getenv("RELIQUARY_RATE_LIMIT_SEARCHES", "0")),
         help="Max search/fetch tool calls per token per minute (0 = unlimited).")
     parser.add_argument("--metrics-public", action=argparse.BooleanOptionalAction,
-        default=os.getenv("MEM0_METRICS_PUBLIC", "false").lower() in {"1", "true", "yes"},
+        default=os.getenv("RELIQUARY_METRICS_PUBLIC", "false").lower() in {"1", "true", "yes"},
         help="Expose GET /metrics without auth (default false: requires the Claude bearer).")
     parser.add_argument("--log-level", default="info", help="Logging level, for example info or debug.")
     parser.add_argument("--image-url-ingest", action=argparse.BooleanOptionalAction,
-        default=os.getenv("MEM0_IMAGE_URL_INGEST", "true").lower() in {"1", "true", "yes"},
+        default=os.getenv("RELIQUARY_IMAGE_URL_INGEST", "true").lower() in {"1", "true", "yes"},
         help="Allow add_image to fetch images from a source_url server-side (default true).")
-    parser.add_argument("--compiled-collection", default=os.getenv("MEM0_COMPILED_COLLECTION", "reliquary_compiled"),
+    parser.add_argument("--compiled-collection", default=os.getenv("RELIQUARY_COMPILED_COLLECTION", "reliquary_compiled"),
                         help="Qdrant collection for the compiled synthesis layer. Empty disables the layer.")
-    parser.add_argument("--compiled-dir", default=os.getenv("MEM0_COMPILED_DIR", "/data/compiled"),
+    parser.add_argument("--compiled-dir", default=os.getenv("RELIQUARY_COMPILED_DIR", "/data/compiled"),
                         help="Host directory for the page registry + vault export.")
-    parser.add_argument("--schema-path", default=os.getenv("MEM0_SCHEMA_PATH"),
-                        help="Path to the editable memory constitution (mem0://schema). Unset uses a built-in default.")
-    parser.add_argument("--lint-coverage-min", type=int, default=int(os.getenv("MEM0_LINT_COVERAGE_MIN", "8")),
+    parser.add_argument("--schema-path", default=os.getenv("RELIQUARY_SCHEMA_PATH"),
+                        help="Path to the editable memory constitution (reliquary://schema). Unset uses a built-in default.")
+    parser.add_argument("--lint-coverage-min", type=int, default=int(os.getenv("RELIQUARY_LINT_COVERAGE_MIN", "8")),
                         help="Min raw records in a domain/topic with no synthesis before lint flags a coverage gap.")
     return parser.parse_args()
 
@@ -4027,6 +4114,7 @@ def main() -> None:
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    warn_legacy_env_vars()
     settings = build_settings(args)
     if settings.openai_allow_write and settings.openai_allow_noauth:
         # No-auth lets tokenless requests through regardless of any configured
@@ -4034,28 +4122,28 @@ def main() -> None:
         raise SystemExit(
             "Refusing to start: --openai-allow-write together with --openai-allow-noauth would "
             "expose PUBLIC WRITE access to the memory store on /openai/mcp. Require a bearer first: "
-            "set MEM0_OPENAI_ALLOW_NOAUTH=false (and a MEM0_OPENAI_MCP_TOKEN) before enabling writes."
+            "set RELIQUARY_OPENAI_ALLOW_NOAUTH=false (and a RELIQUARY_OPENAI_MCP_TOKEN) before enabling writes."
         )
     if settings.oauth_access_token_ttl <= 0:
         raise SystemExit(
-            "Refusing to start: MEM0_OAUTH_ACCESS_TOKEN_TTL must be > 0 "
+            "Refusing to start: RELIQUARY_OAUTH_ACCESS_TOKEN_TTL must be > 0 "
             f"(got {settings.oauth_access_token_ttl}); access tokens would be unusable on issue."
         )
     if settings.oauth_refresh_token_ttl < 0:
         raise SystemExit(
-            "Refusing to start: MEM0_OAUTH_REFRESH_TOKEN_TTL must be >= 0 "
+            "Refusing to start: RELIQUARY_OAUTH_REFRESH_TOKEN_TTL must be >= 0 "
             f"(0 = non-expiring; got {settings.oauth_refresh_token_ttl})."
         )
     if not settings.claude_token:
         LOG.warning(
             "Claude MCP endpoint has no bearer token configured. "
-            "Set MEM0_CLAUDE_MCP_TOKEN (or --claude-mcp-token) to require auth."
+            "Set RELIQUARY_CLAUDE_MCP_TOKEN (or --claude-mcp-token) to require auth."
         )
     if settings.openai_allow_noauth and settings.host not in {"127.0.0.1", "localhost", "::1"}:
         LOG.warning(
             "OpenAI MCP endpoint allows unauthenticated access AND is bound to %s "
             "(not loopback). The entire memory corpus is readable without a token. "
-            "Set --no-openai-allow-noauth (or MEM0_OPENAI_ALLOW_NOAUTH=false) unless this "
+            "Set --no-openai-allow-noauth (or RELIQUARY_OPENAI_ALLOW_NOAUTH=false) unless this "
             "host is on a trusted network.",
             settings.host,
         )

@@ -19,12 +19,12 @@ def _profile(proxy, name):
 
 def test_capabilities_claude(proxy):
     profile = _profile(proxy, "claude")
-    result = run(proxy.call_mcp_tool(profile, "mem0_capabilities", {}, can_write=True))
+    result = run(proxy.call_mcp_tool(profile, "reliquary_capabilities", {}, can_write=True))
     assert result.get("isError") is not True
     sc = result["structuredContent"]
     for key in ("what", "endpoint", "tools", "rules", "taxonomy", "project_context"):
         assert key in sc
-    assert "mem0_capabilities" in sc["tools"]
+    assert "reliquary_capabilities" in sc["tools"]
 
 
 def test_capabilities_openai(proxy):
@@ -41,7 +41,7 @@ def test_capabilities_listed_on_both_endpoints(proxy):
     openai = _profile(proxy, "openai")
     claude_names = {t["name"] for t in proxy.mcp_tools_for(claude, can_write=True)}
     openai_names = {t["name"] for t in proxy.mcp_tools_for(openai, can_write=True)}
-    assert "mem0_capabilities" in claude_names
+    assert "reliquary_capabilities" in claude_names
     assert "capabilities" in openai_names
 
 
@@ -49,13 +49,13 @@ def test_capabilities_reflects_write_scope(proxy):
     # A read-only request must not advertise write tools as available; they belong
     # under write_tools_when_authorized instead (matches tools/list for that scope).
     profile = _profile(proxy, "claude")
-    ro = run(proxy.call_mcp_tool(profile, "mem0_capabilities", {}, can_write=False))["structuredContent"]
-    assert "mem0_add_memory" not in ro["tools"] and "propose_update" not in ro["tools"]
-    assert "mem0_add_memory" in ro["write_tools_when_authorized"]
-    assert "propose_update" in ro["write_tools_when_authorized"]
-    assert "mem0_capabilities" in ro["tools"] and "mem0_search" in ro["tools"]  # reads always available
-    rw = run(proxy.call_mcp_tool(profile, "mem0_capabilities", {}, can_write=True))["structuredContent"]
-    assert "mem0_add_memory" in rw["tools"] and rw["write_tools_when_authorized"] == []
+    ro = run(proxy.call_mcp_tool(profile, "reliquary_capabilities", {}, can_write=False))["structuredContent"]
+    assert "reliquary_add_memory" not in ro["tools"] and "reliquary_propose_update" not in ro["tools"]
+    assert "reliquary_add_memory" in ro["write_tools_when_authorized"]
+    assert "reliquary_propose_update" in ro["write_tools_when_authorized"]
+    assert "reliquary_capabilities" in ro["tools"] and "reliquary_search" in ro["tools"]  # reads always available
+    rw = run(proxy.call_mcp_tool(profile, "reliquary_capabilities", {}, can_write=True))["structuredContent"]
+    assert "reliquary_add_memory" in rw["tools"] and rw["write_tools_when_authorized"] == []
 
 
 def test_propose_update_stores_correction(proxy):
@@ -77,7 +77,7 @@ def test_propose_update_missing_target(proxy):
 
 def test_propose_update_write_gated(proxy):
     profile = _profile(proxy, "claude")
-    result = run(proxy.call_mcp_tool(profile, "propose_update", {"target_id": "imp-1"}, can_write=False))
+    result = run(proxy.call_mcp_tool(profile, "reliquary_propose_update", {"target_id": "imp-1"}, can_write=False))
     assert result.get("isError") is True
     sc = result["structuredContent"]
     assert sc["error"] == "insufficient_scope" and "suggested_action" in sc
@@ -86,10 +86,19 @@ def test_propose_update_write_gated(proxy):
 def test_protected_delete_suggests_propose_update(proxy):
     proxy.memory._store["imp-1"] = {"id": "imp-1", "memory": "imported", "metadata": {"source_group": "imported"}, "user_id": "my_lord"}
     profile = _profile(proxy, "claude")
-    result = run(proxy.call_mcp_tool(profile, "mem0_delete", {"id": "imp-1"}, can_write=True))
+    result = run(proxy.call_mcp_tool(profile, "reliquary_delete", {"id": "imp-1"}, can_write=True))
     assert result.get("isError") is True
     sc = result["structuredContent"]
-    assert sc["error"] == "protected_record" and "propose_update" in sc["suggested_action"]
+    assert sc["error"] == "protected_record" and "reliquary_propose_update" in sc["suggested_action"]
+
+
+def test_protected_update_suggests_propose_update(proxy):
+    proxy.memory._store["imp-1"] = {"id": "imp-1", "memory": "imported", "metadata": {"source_group": "imported"}, "user_id": "my_lord"}
+    profile = _profile(proxy, "claude")
+    result = run(proxy.call_mcp_tool(profile, "reliquary_update", {"id": "imp-1", "text": "new text"}, can_write=True))
+    assert result.get("isError") is True
+    sc = result["structuredContent"]
+    assert sc["error"] == "protected_record" and "reliquary_propose_update" in sc["suggested_action"]
 
 
 def test_propose_update_openai_ignores_caller_user_id(proxy):
@@ -135,7 +144,7 @@ def test_context_threaded_through_call_mcp_tool(proxy):
     _seed_two(proxy)
     profile = _profile(proxy, "claude")
     ctx = resolve_context({"context": {"repo": "c0ze/reliquary"}}, {})
-    result = run(proxy.call_mcp_tool(profile, "mem0_search", {"query": "alpha"}, can_write=False, context=ctx))
+    result = run(proxy.call_mcp_tool(profile, "reliquary_search", {"query": "alpha"}, can_write=False, context=ctx))
     assert result["structuredContent"]["results"][0]["id"] == "zzz-note"
 
 
@@ -153,7 +162,7 @@ def test_context_bias_prefers_this_repo_over_other_dev(proxy):
 
 
 # ---------------------------------------------------------------------------
-# Phase 5: mem0://sources provenance registry (#46)
+# Phase 5: reliquary://sources provenance registry (#46)
 # ---------------------------------------------------------------------------
 
 def test_sources_resource_groups_by_source(proxy):
@@ -167,7 +176,7 @@ def test_sources_resource_groups_by_source(proxy):
             "u1": SimpleNamespace(import_record_id="u1", metadata={"source_group": "user-write"}),
         },
     )
-    res = proxy.read_resource("mem0://sources")
+    res = proxy.read_resource("reliquary://sources")
     payload = json.loads(res["contents"][0]["text"])
     assert payload["total"] == 3
     vault = next(s for s in payload["sources"] if s["source"] == "vault")
@@ -181,11 +190,11 @@ def test_sources_resource_listed_with_catalog(proxy):
     from types import SimpleNamespace
     proxy.catalog = SimpleNamespace(routeable_domains=[], records_by_id={})
     uris = {r["uri"] for r in proxy.mcp_resources()}
-    assert "mem0://sources" in uris
+    assert "reliquary://sources" in uris
 
 
 def test_sources_absent_without_catalog(proxy):
     proxy.catalog = None
     uris = {r["uri"] for r in proxy.mcp_resources()}
-    assert "mem0://sources" not in uris
-    assert proxy.read_resource("mem0://sources") is None
+    assert "reliquary://sources" not in uris
+    assert proxy.read_resource("reliquary://sources") is None

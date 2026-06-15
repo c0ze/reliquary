@@ -49,10 +49,10 @@ explicitly configured):
 
 | Environment variable | Purpose |
 |---|---|
-| `MEM0_AUDIT_LOG` | Append-only JSONL log of every successful write (add/update/delete). Path to file; unset = disabled. |
-| `MEM0_RATE_LIMIT_WRITES` | Max write tool calls per token per minute (`0` = unlimited). |
-| `MEM0_RATE_LIMIT_SEARCHES` | Max search/fetch calls per token per minute (`0` = unlimited). |
-| `MEM0_METRICS_PUBLIC` | Set to `true` to expose `GET /metrics` without auth. Default `false` = requires the Claude bearer token. |
+| `RELIQUARY_AUDIT_LOG` | Append-only JSONL log of every successful write (add/update/delete). Path to file; unset = disabled. |
+| `RELIQUARY_RATE_LIMIT_WRITES` | Max write tool calls per token per minute (`0` = unlimited). |
+| `RELIQUARY_RATE_LIMIT_SEARCHES` | Max search/fetch calls per token per minute (`0` = unlimited). |
+| `RELIQUARY_METRICS_PUBLIC` | Set to `true` to expose `GET /metrics` without auth. Default `false` = requires the Claude bearer token. |
 
 `GET /metrics` emits Prometheus text format with per-tool call counters,
 rate-limit rejection counts, process uptime, and (when the vector store supports
@@ -61,7 +61,7 @@ it) an approximate memory count gauge.
 ## Quick start (Docker)
 
 ```bash
-cp .env.example .env                  # set MEM0_CLAUDE_MCP_TOKEN etc.
+cp .env.example .env                  # set RELIQUARY_CLAUDE_MCP_TOKEN etc.
 cp config.example.yaml config.yaml    # point at the qdrant + embedder services
 docker compose up -d
 curl -s http://127.0.0.1:8787/healthz
@@ -80,16 +80,29 @@ Caddy, or Traefik.
 > keep `embedding_model_dims` in sync with the model. Changing the embedder
 > changes the vector space — re-ingest your corpus afterwards.
 
+## Upgrading to v0.3.0 (breaking)
+
+v0.3.0 renames Reliquary's own surface: Claude-endpoint tool names (old `mem0_*` prefix → `reliquary_*`),
+resource URIs (old scheme → `reliquary://`), and env vars (old prefix → `RELIQUARY_`).
+
+**What you need to do:**
+1. Rename your `.env` variables to the `RELIQUARY_` prefix (e.g. `RELIQUARY_CLAUDE_MCP_TOKEN`).
+   The server logs a warning naming every stale legacy var still set, so it's easy to spot stragglers.
+2. Reconnect the Claude.ai connector once so it re-reads the updated tool list.
+3. No data migration — your vectors and compiled pages are untouched.
+
+The Mem0 library brand (prose, links, `config.yaml` library keys) is unchanged; only Reliquary's own artifacts were renamed.
+
 ## MCP endpoints & tools
 
 | Endpoint | For | Auth | Tools |
 |----------|-----|------|-------|
-| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_capabilities`, `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_update`, `mem0_delete`, `propose_update`, `mem0_compile_page`, `mem0_list_pages`, `mem0_page_history`, `list_domains`, `add_image`, `fetch_image`, `delete_image`, `create_image_upload`, `commit_image_upload` |
-| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `capabilities`, `search`, `fetch`, `fetch_image` (lean snippet shape); write tools `add_memory`, `update`, `delete`, `add_image`, `delete_image`, `propose_update`, and the image-upload flow if `MEM0_OPENAI_ALLOW_WRITE=true` |
+| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `reliquary_capabilities`, `reliquary_status`, `reliquary_search`, `reliquary_fetch`, `reliquary_add_memory`, `reliquary_update`, `reliquary_delete`, `reliquary_propose_update`, `reliquary_compile_page`, `reliquary_list_pages`, `reliquary_page_history`, `reliquary_list_domains`, `reliquary_add_image`, `reliquary_fetch_image`, `reliquary_delete_image`, `reliquary_create_image_upload`, `reliquary_commit_image_upload` |
+| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `capabilities`, `search`, `fetch`, `fetch_image` (lean snippet shape); write tools `add_memory`, `update`, `delete`, `add_image`, `delete_image`, `propose_update`, and the image-upload flow if `RELIQUARY_OPENAI_ALLOW_WRITE=true` |
 
-**Binary blobs.** `add_image` stores a file (base64) plus a searchable caption;
+**Binary blobs.** `reliquary_add_image` stores a file (base64) plus a searchable caption;
 it returns a `blob_id`, a `memory_id`, and a signed `url`. Find images later with
-`mem0_search` on the caption or `fetch_image` by `blob_id`; `delete_image` removes
+`reliquary_search` on the caption or `reliquary_fetch_image` by `blob_id`; `reliquary_delete_image` removes
 the caption memory and ref-counted blob. Files live under `BLOB_HOST_DIR` on the
 host (default `./data/blobs`) so you can browse and back them up. `GET /blobs/{id}`
 serves bytes to anyone holding a valid signed URL or the Claude bearer.
@@ -97,15 +110,15 @@ serves bytes to anyone holding a valid signed URL or the Claude bearer.
 **Compilation layer.** Beyond raw recall, Reliquary maintains an optional
 **compiled synthesis layer** — a versioned, domain-neutral set of markdown pages
 that sit above the raw corpus so memory compounds over time. The agent authors a
-page with `mem0_compile_page` (Reliquary never generates prose); it is stored as a
+page with `reliquary_compile_page` (Reliquary never generates prose); it is stored as a
 revision in the blob store, indexed into a **separate Qdrant collection**, and
 cited back to its source memories via `derived_from`. Search then leads with a
 relevant *current* synthesis and surfaces raw memories as its evidence. New raw
 writes flag dependent pages `stale` (a queued suggestion, never an auto-rewrite).
-Inspect pages with `mem0_list_pages` / `mem0_page_history`, and read the
-`mem0://schema`, `mem0://recent`, `mem0://needs-review`, and
-`mem0://domain/<d>/index` resources. It is on by default; set
-`MEM0_COMPILED_COLLECTION=` (empty) to disable (an empty layer is a query-time
+Inspect pages with `reliquary_list_pages` / `reliquary_page_history`, and read the
+`reliquary://schema`, `reliquary://recent`, `reliquary://needs-review`, and
+`reliquary://domain/<d>/index` resources. It is on by default; set
+`RELIQUARY_COMPILED_COLLECTION=` (empty) to disable (an empty layer is a query-time
 no-op). Two cron-friendly CLIs support it: `python app/lint.py` proposes refreshes
 (never applies them) and `python app/export_vault.py --out vault/` exports pages to
 an Obsidian-style vault. See [`docs/GUIDE.md`](docs/GUIDE.md#compilation-layer).
@@ -115,14 +128,14 @@ default, but a coding agent can opt into light, *soft* project-awareness. Pass a
 `context` object (`{client, cwd, git_root, repo}`) in a `search` call — or set the
 `X-Reliquary-Repo` / `X-Reliquary-Git-Root` headers — and Reliquary biases results
 toward that repo's memory (room match) and dev-domain memory, with **no change** when
-context is absent. Call `mem0_capabilities` (`capabilities` on the lean endpoint)
+context is absent. Call `reliquary_capabilities` (`capabilities` on the lean endpoint)
 first for orientation. Imported corpus records stay read-only; to correct one,
-`propose_update` files a linked `kind=correction` record (the import is never
-mutated), and rejection messages point you there. `mem0://sources` reports
+`reliquary_propose_update` files a linked `kind=correction` record (the import is never
+mutated), and rejection messages point you there. `reliquary://sources` reports
 provenance — where each memory came from. All of it is opt-in and soft: no session
 gating, no hard write-blocks.
 
-Also: `GET /healthz` (minimal, public), `GET /status` and `GET /mem0/search?q=...`
+Also: `GET /healthz` (minimal, public), `GET /status` and `GET /reliquary/search?q=...`
 (both **require the Claude bearer** — they return config/taxonomy and raw
 memories respectively), and the OAuth 2.1 discovery/authorize/token/revoke routes
 under `/.well-known/*` and `/oauth/*`.
@@ -130,18 +143,18 @@ under `/.well-known/*` and `/oauth/*`.
 ### Connecting Claude.ai
 
 Add a Custom Connector pointing at `https://your-host/claude/mcp`. Claude runs
-the OAuth flow; you authorize once by pasting your `MEM0_CLAUDE_MCP_TOKEN` into
+the OAuth flow; you authorize once by pasting your `RELIQUARY_CLAUDE_MCP_TOKEN` into
 the `/oauth/authorize` page, and the connector receives a derived, revocable
 access token (not the master) **plus a refresh token**, so it renews silently
-instead of re-authorizing. After it registers, pin `MEM0_OAUTH_CLIENT_ID` and set
-`MEM0_OAUTH_ALLOW_REGISTRATION=false`. **Set `MEM0_STATE_DIR`** so tokens survive
+instead of re-authorizing. After it registers, pin `RELIQUARY_OAUTH_CLIENT_ID` and set
+`RELIQUARY_OAUTH_ALLOW_REGISTRATION=false`. **Set `RELIQUARY_STATE_DIR`** so tokens survive
 restarts — without it, every restart (e.g. a deploy) signs the connector out.
 
 ### Connecting ChatGPT
 
 Add an MCP server at `https://your-host/openai/mcp` with **API key** auth
-(`Bearer` scheme) using `MEM0_OPENAI_MCP_TOKEN`. Keep
-`MEM0_OPENAI_ALLOW_NOAUTH=false` so the token is required.
+(`Bearer` scheme) using `RELIQUARY_OPENAI_MCP_TOKEN`. Keep
+`RELIQUARY_OPENAI_ALLOW_NOAUTH=false` so the token is required.
 
 ## Configuration
 
@@ -150,14 +163,14 @@ config file (see [config.example.yaml](config.example.yaml)). Highlights:
 
 | Variable | Purpose |
 |----------|---------|
-| `MEM0_CLAUDE_MCP_TOKEN` | bearer for `/claude/mcp` (required for write + OAuth) |
-| `MEM0_OPENAI_MCP_TOKEN` | bearer for `/openai/mcp` |
-| `MEM0_OPENAI_ALLOW_NOAUTH` | `true` to allow unauthenticated `/openai/mcp` (default `false`) |
-| `MEM0_OPENAI_ALLOW_WRITE` | expose `add_memory` + `delete` on `/openai/mcp` (default `false`). **Refuses to start** with `ALLOW_NOAUTH=true`, to avoid public write. |
-| `MEM0_OAUTH_CLIENT_ID` / `MEM0_OAUTH_ALLOW_REGISTRATION` | lock the OAuth shim to one known client |
-| `MEM0_STATE_DIR` | dir that persists OAuth tokens + MCP sessions across restarts (**set this to stay signed in**) |
-| `MEM0_OAUTH_ACCESS_TOKEN_TTL` / `MEM0_OAUTH_REFRESH_TOKEN_TTL` | access-token lifetime (default 5 days) / refresh-token lifetime (default `0` = non-expiring) |
-| `MEM0_DATASET_PATH` | curated JSONL enabling taxonomy routing + `fetch` bootstrap docs |
+| `RELIQUARY_CLAUDE_MCP_TOKEN` | bearer for `/claude/mcp` (required for write + OAuth) |
+| `RELIQUARY_OPENAI_MCP_TOKEN` | bearer for `/openai/mcp` |
+| `RELIQUARY_OPENAI_ALLOW_NOAUTH` | `true` to allow unauthenticated `/openai/mcp` (default `false`) |
+| `RELIQUARY_OPENAI_ALLOW_WRITE` | expose `add_memory` + `delete` on `/openai/mcp` (default `false`). **Refuses to start** with `ALLOW_NOAUTH=true`, to avoid public write. |
+| `RELIQUARY_OAUTH_CLIENT_ID` / `RELIQUARY_OAUTH_ALLOW_REGISTRATION` | lock the OAuth shim to one known client |
+| `RELIQUARY_STATE_DIR` | dir that persists OAuth tokens + MCP sessions across restarts (**set this to stay signed in**) |
+| `RELIQUARY_OAUTH_ACCESS_TOKEN_TTL` / `RELIQUARY_OAUTH_REFRESH_TOKEN_TTL` | access-token lifetime (default 5 days) / refresh-token lifetime (default `0` = non-expiring) |
+| `RELIQUARY_DATASET_PATH` | curated JSONL enabling taxonomy routing + `fetch` bootstrap docs |
 
 Run `python app/server.py --help` for the full flag list.
 
@@ -168,7 +181,7 @@ Run `python app/server.py --help` for the full flag list.
 - **OAuth tokens are derived & revocable.** The connector gets a short-lived,
   resource-scoped access token (default 5 days) plus a **rotating refresh token**
   (non-expiring by default, with reuse detection) so it renews silently. Set
-  `MEM0_STATE_DIR` to persist tokens across restarts — without it, a restart signs
+  `RELIQUARY_STATE_DIR` to persist tokens across restarts — without it, a restart signs
   connectors out. Revoking a *refresh* token via `/oauth/revoke` drops the whole
   rotation family; revoking an access token removes just that token.
 - **Embedded vs server Qdrant.** Reads run concurrently only against a Qdrant
@@ -199,7 +212,7 @@ texts at query time so repeated facts from multiple sources do not crowd out
 the result budget.
 
 Agent write-back is opt-in. `--writeback` stores successful chat turns in Mem0;
-add `--writeback-path /path/to/Agent.md` (or `MEM0_WRITEBACK_PATH`) to also
+add `--writeback-path /path/to/Agent.md` (or `RELIQUARY_WRITEBACK_PATH`) to also
 append those turns to a Markdown note, such as an Obsidian inbox.
 
 Building the JSONL from your own notes is up to you.

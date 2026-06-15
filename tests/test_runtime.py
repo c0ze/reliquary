@@ -203,6 +203,30 @@ def test_sessions_survive_restart(tmp_path):
     assert s2.touch("sess-def") == "openai"
 
 
+# --------------------------- warn_legacy_env_vars ---------------------------
+
+
+def test_warn_legacy_env_vars_flags_known_stale_var(caplog):
+    from server import warn_legacy_env_vars
+    import logging
+    env = {"MEM0_CLAUDE_MCP_TOKEN": "x", "PATH": "/usr/bin"}
+    with caplog.at_level(logging.WARNING):
+        flagged = warn_legacy_env_vars(env)
+    assert flagged == {"MEM0_CLAUDE_MCP_TOKEN": "RELIQUARY_CLAUDE_MCP_TOKEN"}
+    assert "MEM0_CLAUDE_MCP_TOKEN" in caplog.text
+    assert "RELIQUARY_CLAUDE_MCP_TOKEN" in caplog.text
+
+
+def test_warn_legacy_env_vars_silent_when_clean():
+    from server import warn_legacy_env_vars
+    assert warn_legacy_env_vars({"PATH": "/usr/bin", "RELIQUARY_STATE_DIR": "/d"}) == {}
+
+
+def test_legacy_mcp_token_maps_to_claude_token():
+    from server import LEGACY_ENV_RENAMES
+    assert LEGACY_ENV_RENAMES["MEM0_MCP_TOKEN"] == "RELIQUARY_CLAUDE_MCP_TOKEN"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

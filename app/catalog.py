@@ -256,7 +256,7 @@ class CorpusCatalog:
         source_ref = metadata.get("source_ref")
         if isinstance(source_ref, str) and source_ref.startswith(("http://", "https://")):
             return source_ref
-        return f"mem0://record/{record_id}"
+        return f"reliquary://record/{record_id}"
 
     def fetch_document(self, record_id: str) -> dict[str, Any] | None:
         record = self.records_by_id.get(record_id)

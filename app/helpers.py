@@ -1,6 +1,6 @@
-"""Stateless helpers for the Mem0 chat/MCP proxy.
+"""Stateless helpers for the Reliquary chat/MCP proxy.
 
-Pure request/response/text utilities split out of ``mem0_chat_proxy`` so the
+Pure request/response/text utilities split out of ``reliquary_chat_proxy`` so the
 ASGI app module stays focused on routing and orchestration. ``httpx`` is the
 only third-party dependency here; everything else is stdlib, so these are
 straightforward to unit-test in isolation.
@@ -279,7 +279,7 @@ def response_headers_from_httpx(
             (b"access-control-allow-origin", b"*"),
             (
                 b"access-control-allow-headers",
-                b"authorization, content-type, x-mem0-user-id, mcp-session-id, mcp-protocol-version, origin",
+                b"authorization, content-type, x-reliquary-user-id, mcp-session-id, mcp-protocol-version, origin",
             ),
             (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"),
         ]

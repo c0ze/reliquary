@@ -1,7 +1,7 @@
 """Pure health-check functions for the compiled (synthesis) layer.
 
 Dependency-light: stdlib + plain data (PageInfo lists, count dicts, record
-iterables). Shared by the mem0://needs-review resource and the lint CLI. Every
+iterables). Shared by the reliquary://needs-review resource and the lint CLI. Every
 check is read-only and only *proposes* — a human decides; nothing auto-applies.
 """
 
