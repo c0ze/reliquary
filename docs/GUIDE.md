@@ -542,6 +542,46 @@ Key environment variables:
 
 ---
 
+## Project context & governance
+
+Reliquary stays a generic, domain-neutral memory tool by default. A coding agent
+can *opt into* light project-awareness — soft, never enforced.
+
+**Supplying context.** Pass a `context` object in a search call, or set headers:
+
+```json
+{ "query": "...", "context": { "client": "codex", "git_root": "/home/arda/projects/reliquary", "repo": "c0ze/reliquary" } }
+```
+
+| Header | Purpose |
+|---|---|
+| `X-Reliquary-Repo` | `owner/name`; biases toward that repo's memory |
+| `X-Reliquary-Git-Root` | absolute repo path (basename used when no `repo`) |
+| `X-Reliquary-Cwd` | working directory (informational only) |
+| `X-Reliquary-Client` | informational client id |
+
+Args take precedence over headers. With no repo/git-root signal, behavior is
+identical to a non-repo session. `cwd`/`git_root` are opaque strings — Reliquary
+never reads the filesystem at those paths.
+
+**What context does.** Search applies a soft score bonus so this repo's memory
+(records with `room=<repo-slug>`) leads, with dev-domain memory a weaker second.
+Nothing is filtered out.
+
+**Orientation.** `mem0_capabilities` (`capabilities` on the lean endpoint) returns a
+concise summary — what Reliquary is, the tools, read/write + protection rules,
+taxonomy, and whether project context is active. Call it first.
+
+**Corrections.** Imported corpus records are read-only. To fix one without mutating
+it, `propose_update` files a linked user record (`kind=correction`, `status=proposed`,
+`target_id`); the original stays immutable. Protected-record and scope errors return
+a `suggested_action` telling the agent what to do next.
+
+**Provenance.** The `mem0://sources` resource reports where memories came from,
+grouped by source and import vs. user-write, with private/public status.
+
+---
+
 ## Operations
 
 ```bash

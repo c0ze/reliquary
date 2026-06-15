@@ -66,6 +66,9 @@ MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
 LIVE_LEXICAL_SCAN_LIMIT = 5000
+# Soft score bonus that floats project-matching memory up when caller context is
+# supplied (#42). Additive, excludes nothing; a no-op when context is absent.
+CONTEXT_MATCH_BONUS = 0.1
 # A hyphenated identifier token (>= 3 segments, e.g. ARDA-RELIQUARY-IMAGE-20260605-01)
 # is the exact-recall case the live lexical fallback was built for (#28); used to
 # gate that fallback so healthy searches avoid the broad get_all scroll (#30).
@@ -885,7 +888,9 @@ class Mem0ChatProxy:
                     is_error=True,
                 )
             else:
-                result = await self.call_mcp_tool(profile, tool_name, tool_arguments, can_write=can_write)
+                from context import resolve_context
+                ctx = resolve_context(tool_arguments, headers)
+                result = await self.call_mcp_tool(profile, tool_name, tool_arguments, can_write=can_write, context=ctx)
                 self.metrics.record_tool(tool_name, ok=not result.get("isError"))
                 if category == "write" and not result.get("isError"):
                     structured = result.get("structuredContent") or {}
@@ -914,9 +919,10 @@ class Mem0ChatProxy:
     def _tool_category(tool_name: str) -> str:
         writes = {"mem0_add_memory", "add_memory", "mem0_delete", "delete",
                   "mem0_update", "update", "add_image", "delete_image",
-                  "create_image_upload", "commit_image_upload", "mem0_compile_page"}
+                  "create_image_upload", "commit_image_upload", "mem0_compile_page",
+                  "propose_update"}
         reads = {"mem0_search", "search", "mem0_fetch", "fetch", "fetch_image", "list_domains",
-                 "mem0_list_pages", "mem0_page_history"}
+                 "mem0_list_pages", "mem0_page_history", "mem0_capabilities", "capabilities"}
         if tool_name in writes:
             return "write"
         if tool_name in reads:
@@ -982,6 +988,12 @@ class Mem0ChatProxy:
                 "mimeType": "application/json",
             })
         if self.catalog:
+            resources.append({
+                "uri": "mem0://sources",
+                "name": "Source registry",
+                "description": "Provenance of imported corpora and user writes (grouped by source).",
+                "mimeType": "application/json",
+            })
             for domain in self.catalog.routeable_domains:
                 resources.append({
                     "uri": f"mem0://domain/{domain}",
@@ -1022,6 +1034,24 @@ class Mem0ChatProxy:
                 "domains": self.catalog.routeable_domains if self.catalog else [],
                 "records": len(self.catalog.records_by_id) if self.catalog else 0,
             }
+            return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
+        if uri == "mem0://sources" and self.catalog:
+            groups: dict[tuple[str, str], dict[str, Any]] = {}
+            for rec in self.catalog.records_by_id.values():
+                md = rec.metadata or {}
+                group = str(md.get("source_group") or "imported")
+                src = str(md.get("source") or md.get("source_url") or md.get("source_ref") or "(unknown)")
+                key = (group, src)
+                entry = groups.setdefault(key, {"source_group": group, "source": src, "count": 0,
+                                                 "private": False, "sample_refs": []})
+                entry["count"] += 1
+                if md.get("private"):
+                    entry["private"] = True  # private if ANY record in the group is private
+                ref = md.get("source_ref")
+                if ref and len(entry["sample_refs"]) < 3 and str(ref) not in entry["sample_refs"]:
+                    entry["sample_refs"].append(str(ref))
+            payload = {"sources": sorted(groups.values(), key=lambda e: (-e["count"], e["source"])),
+                       "total": len(self.catalog.records_by_id)}
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
         prefix = "mem0://domain/"
         if uri.startswith(prefix) and self.catalog:
@@ -1121,6 +1151,51 @@ class Mem0ChatProxy:
             },
         ]
 
+    def handle_capabilities_tool(self, profile: "EndpointProfile", context=None, can_write: bool = False) -> dict[str, Any]:
+        is_openai = profile.name == "openai"
+        # Reflect the request's ACTUAL scope: a read-only token must not see write
+        # tools advertised as available (that would contradict tools/list and any
+        # call would return insufficient_scope). Write tools surface only with write.
+        available = [t["name"] for t in self.mcp_tools_for(profile, can_write=can_write)]
+        write_only = [t["name"] for t in self.mcp_tools_for(profile, can_write=True) if t["name"] not in available]
+        payload = {
+            "what": "Reliquary: domain-neutral semantic memory over Mem0 + Qdrant, served over MCP.",
+            "endpoint": profile.name,
+            "tools": available,
+            "write_tools_when_authorized": write_only,
+            "rules": {
+                "imported_records": "read-only (protected); user-written records are mutable",
+                "corrections": "propose changes to imported records with propose_update (never mutates the import)",
+                "write_scope": "write tools require a write-scoped token" + (
+                    "; this endpoint also requires MEM0_OPENAI_ALLOW_WRITE" if is_openai else ""),
+                "user_id": "not accepted on the OpenAI endpoint" if is_openai else "optional override accepted",
+            },
+            "images": "store/fetch binary blobs with add_image / fetch_image (+ upload flow)",
+            "taxonomy": {
+                "fields": ["domain", "hall", "room", "topic"],
+                "routeable_domains": self.catalog.routeable_domains if self.catalog else [],
+            },
+            "compiled_layer": self.pages is not None,
+            "project_context": {
+                "active": context is not None,
+                "repo": getattr(context, "repo", None),
+                "how": "pass a `context` object ({client,cwd,git_root,repo}) in tool args, or X-Reliquary-Repo header",
+            },
+            "when_to_write": "store durable facts/decisions the user will want recalled later; don't store transient chatter",
+        }
+        return self.mcp_tool_result(
+            text="Reliquary capabilities (orientation). See structuredContent for details.",
+            structured=payload,
+        )
+
+    def _scope_error(self, tool_name: str) -> dict[str, Any]:
+        return self.mcp_tool_result(
+            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
+            structured={"error": "insufficient_scope",
+                        "suggested_action": "Reconnect with a write-scoped token; this token or endpoint is read-only."},
+            is_error=True,
+        )
+
     def mcp_tools_for(self, profile: EndpointProfile, *, can_write: bool = False) -> list[dict[str, Any]]:
         read_only = {"readOnlyHint": True, "openWorldHint": False}
         routing_hint = self._routing_hint()
@@ -1142,6 +1217,7 @@ class Mem0ChatProxy:
                                 "type": "string",
                                 "description": "Opaque pagination cursor from a previous response's nextCursor.",
                             },
+                            "context": {"type": "object", "description": "Optional caller context (client, cwd, git_root, repo) for project-aware routing."},
                         },
                         "required": ["query"],
                         "additionalProperties": False,
@@ -1177,6 +1253,13 @@ class Mem0ChatProxy:
                         "required": ["id"],
                         "additionalProperties": False,
                     },
+                },
+                {
+                    "name": "capabilities",
+                    "title": "Capabilities",
+                    "description": "Orient yourself: what Reliquary is, the tools available, read/write and protection rules, taxonomy, and how to supply project context. Call this first.",
+                    "annotations": {"readOnlyHint": True, "openWorldHint": False},
+                    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
                 },
             ]
             if can_write:
@@ -1279,6 +1362,18 @@ class Mem0ChatProxy:
                     }
                 )
                 tools.extend(self._upload_flow_tools())
+                tools.append(
+                    {
+                        "name": "propose_update",
+                        "title": "Propose Correction",
+                        "description": "File a correction for a protected/imported record without mutating it. Stores a linked user-write record (kind=correction, status=proposed).",
+                        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                        "inputSchema": {"type": "object", "properties": {
+                            "target_id": {"type": "string", "description": "Id of the record to correct."},
+                            "reason": {"type": "string"}, "replacement_text": {"type": "string"}, "source": {"type": "string"},
+                        }, "required": ["target_id"], "additionalProperties": False},
+                    }
+                )
             return tools
 
         claude_tools = [
@@ -1305,6 +1400,7 @@ class Mem0ChatProxy:
                         },
                         "threshold": {"type": "number", "description": "Optional minimum similarity threshold."},
                         "user_id": {"type": "string", "description": "Optional Mem0 user_id override."},
+                        "context": {"type": "object", "description": "Optional caller context (client, cwd, git_root, repo) for project-aware routing."},
                     },
                     "required": ["query"],
                     "additionalProperties": False,
@@ -1355,6 +1451,13 @@ class Mem0ChatProxy:
                 "description": "List the revision history (blob ids) of a compiled page by slug.",
                 "annotations": read_only,
                 "inputSchema": {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"], "additionalProperties": False},
+            },
+            {
+                "name": "mem0_capabilities",
+                "title": "Capabilities",
+                "description": "Orient yourself: what Reliquary is, the tools available, read/write and protection rules, taxonomy, and how to supply project context. Call this first.",
+                "annotations": {"readOnlyHint": True, "openWorldHint": False},
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             },
         ]
         if can_write:
@@ -1485,12 +1588,25 @@ class Mem0ChatProxy:
                         "additionalProperties": False,
                     },
                 },
+                {
+                    "name": "propose_update",
+                    "title": "Propose Correction",
+                    "description": "File a correction for a protected/imported record without mutating it. Stores a linked user-write record (kind=correction, status=proposed).",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                    "inputSchema": {"type": "object", "properties": {
+                        "target_id": {"type": "string", "description": "Id of the record to correct."},
+                        "reason": {"type": "string"}, "replacement_text": {"type": "string"}, "source": {"type": "string"},
+                        "user_id": {"type": "string"},
+                    }, "required": ["target_id"], "additionalProperties": False},
+                },
             ])
         return claude_tools
 
-    async def call_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any], *, can_write: bool = False) -> dict[str, Any]:
+    async def call_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any], *, can_write: bool = False, context=None) -> dict[str, Any]:
         try:
             if profile.name == "openai":
+                if tool_name == "capabilities":
+                    return self.handle_capabilities_tool(profile, context=context, can_write=can_write)
                 if tool_name == "search":
                     return await self.handle_search_tool(
                         arguments,
@@ -1499,6 +1615,7 @@ class Mem0ChatProxy:
                         fetch_tool_name="fetch",
                         body_char_cap=OPENAI_SNIPPET_CHAR_CAP,
                         lean_results=True,
+                        context=context,
                     )
                 if tool_name == "list_domains":
                     domains = self.catalog.routeable_domains if self.catalog else []
@@ -1512,69 +1629,47 @@ class Mem0ChatProxy:
                     return await self.handle_fetch_image_tool(arguments)
                 if tool_name == "add_memory":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     # Enforce the lean schema: no caller-supplied user_id / metadata /
                     # routing fields. Writes always land under the default user_id.
                     return await self.handle_add_memory_tool(lean_add_memory_args(arguments))
                 if tool_name == "delete":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     return await self.handle_delete_tool(arguments, allow_user_id=False)
                 if tool_name == "update":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     return await self.handle_update_tool(lean_update_args(arguments), allow_user_id=False)
                 if tool_name == "add_image":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     return await self.handle_add_image_tool(lean_add_image_args(arguments))
                 if tool_name == "delete_image":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     # allow_user_id=False: deletes are always scoped to the default user_id.
                     return await self.handle_delete_image_tool(arguments, allow_user_id=False)
                 if tool_name == "create_image_upload":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     return self.handle_create_image_upload_tool(arguments, profile=profile)
                 if tool_name == "commit_image_upload":
                     if not can_write:
-                        return self.mcp_tool_result(
-                            text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                            structured={"error": "insufficient_scope"},
-                            is_error=True,
-                        )
+                        return self._scope_error(tool_name)
                     return await self.handle_commit_image_upload_tool(arguments, allow_user_id=False, profile=profile)
+                if tool_name == "propose_update":
+                    if not can_write:
+                        return self._scope_error(tool_name)
+                    return await self.handle_propose_update_tool(arguments, allow_user_id=False)
                 return self.mcp_tool_result(
                     text=f"Unknown tool: {tool_name}",
                     structured={"error": "unknown_tool"},
                     is_error=True,
                 )
 
+            if tool_name == "mem0_capabilities":
+                return self.handle_capabilities_tool(profile, context=context, can_write=can_write)
             if tool_name == "mem0_status":
                 status = {
                     "user_id": self.settings.user_id,
@@ -1596,7 +1691,7 @@ class Mem0ChatProxy:
                     structured={"domains": domains},
                 )
             if tool_name == "mem0_search":
-                return await self.handle_search_tool(arguments)
+                return await self.handle_search_tool(arguments, context=context)
             if tool_name == "mem0_fetch":
                 return await self.handle_fetch_tool(arguments)
             if tool_name == "mem0_list_pages":
@@ -1607,70 +1702,42 @@ class Mem0ChatProxy:
                 return await self.handle_fetch_image_tool(arguments)
             if tool_name == "mem0_add_memory":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return await self.handle_add_memory_tool(arguments)
             if tool_name == "mem0_delete":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return await self.handle_delete_tool(arguments, allow_user_id=True)
             if tool_name == "mem0_update":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return await self.handle_update_tool(arguments, allow_user_id=True)
             if tool_name == "mem0_compile_page":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 # Pages are a single global registry keyed by slug (not namespaced by
                 # user_id), so file them under the server user only — never a caller id.
                 return await self.handle_compile_page_tool(arguments, allow_user_id=False)
             if tool_name == "add_image":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return await self.handle_add_image_tool(arguments)
             if tool_name == "delete_image":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return await self.handle_delete_image_tool(arguments, allow_user_id=True)
             if tool_name == "create_image_upload":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return self.handle_create_image_upload_tool(arguments, profile=profile)
             if tool_name == "commit_image_upload":
                 if not can_write:
-                    return self.mcp_tool_result(
-                        text=f"Tool {tool_name} requires write access (read-only token or endpoint).",
-                        structured={"error": "insufficient_scope"},
-                        is_error=True,
-                    )
+                    return self._scope_error(tool_name)
                 return await self.handle_commit_image_upload_tool(arguments, allow_user_id=True, profile=profile)
+            if tool_name == "propose_update":
+                if not can_write:
+                    return self._scope_error(tool_name)
+                return await self.handle_propose_update_tool(arguments, allow_user_id=True)
         except Exception as exc:
             LOG.exception("MCP tool failed: %s", tool_name)
             return self.mcp_tool_result(
@@ -1694,6 +1761,7 @@ class Mem0ChatProxy:
         fetch_tool_name: str = "mem0_fetch",
         body_char_cap: int = SEARCH_PREVIEW_CHAR_CAP,
         lean_results: bool = False,
+        context=None,
     ) -> dict[str, Any]:
         query = str(arguments.get("query") or "").strip()
         if not query:
@@ -1737,9 +1805,12 @@ class Mem0ChatProxy:
 
         # Order by relevance score across ALL routes, not by route priority, so the
         # best hit (e.g. an exact lexical match) ranks first wherever it came from.
+        # _context_bonus adds CONTEXT_MATCH_BONUS for project-matching hits when caller
+        # context is present; it is 0.0 (no-op) when context is absent (#42).
         raw_results = sorted(
             by_key.values(),
-            key=lambda item: (-self._numeric_score(item.get("score")), str(item.get("id") or "")),
+            key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)),
+                              str(item.get("id") or "")),
         )
         # Synthesis-first (#50): a current synthesis leads; raw hits follow as evidence.
         # Use result_cap (not limit) so paginated pages past the first still see syntheses.
@@ -2000,6 +2071,35 @@ class Mem0ChatProxy:
         return self.mcp_tool_result(text=f"{len(revisions)} revision(s) for {slug}.",
                                     structured={"slug": slug, "current": info.current_blob,
                                                 "revisions": revisions})
+
+    async def handle_propose_update_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
+        target_id = str(arguments.get("target_id") or "").strip()
+        if not target_id:
+            return self.mcp_tool_result(
+                text="A non-empty `target_id` is required.",
+                structured={"error": "missing_target",
+                            "suggested_action": "Pass target_id = the id of the record you want to correct."},
+                is_error=True)
+        user_id = str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
+        reason = str(arguments.get("reason") or "").strip()
+        replacement = str(arguments.get("replacement_text") or "").strip()
+        text = replacement or reason or f"Proposed correction for {target_id}"
+        metadata: dict[str, Any] = {
+            "kind": "correction", "target_id": target_id, "status": "proposed",
+            "source": str(arguments.get("source") or "mcp"), "source_group": "user-write",
+        }
+        if reason:
+            metadata["reason"] = reason
+        # A correction is a fresh user-write record; it derives from no compiled page,
+        # so there is no staleness fan-out (unlike handle_add_memory_tool).
+        result = await self.add_memory(text, user_id=user_id, metadata=metadata, infer=False)
+        new_ids = added_memory_ids(result)
+        # Expose the full ids list (mirrors add_memory) so an empty result is
+        # distinguishable from a stored id rather than an ambiguous null.
+        return self.mcp_tool_result(
+            text=f"Filed correction for {target_id} (status=proposed).",
+            structured={"id": new_ids[0] if new_ids else None, "ids": new_ids,
+                        "target_id": target_id, "status": "proposed"})
 
     def _load_pending_uploads(self) -> None:
         """Restore persisted upload slots (if a state_dir is configured) and reap
@@ -2571,7 +2671,8 @@ class Mem0ChatProxy:
         if metadata.get("source_group") != "user-write":
             return self.mcp_tool_result(
                 text=f"Refusing to delete memory_id={memory_id}: not a user-written memory.",
-                structured={"error": "protected_record", "id": memory_id},
+                structured={"error": "protected_record", "id": memory_id,
+                            "suggested_action": "Only the memory that owns this blob can delete it."},
                 is_error=True,
             )
         blob_ref = metadata.get("blob_ref")
@@ -2630,7 +2731,8 @@ class Mem0ChatProxy:
             return self.mcp_tool_result(
                 text=f"Refusing to delete id={record_id}: it is not a user-written memory "
                 "(imported corpus records are protected).",
-                structured={"error": "protected_record", "id": record_id},
+                structured={"error": "protected_record", "id": record_id,
+                            "suggested_action": "Imported records are read-only — file a correction with propose_update (target_id=<id>)."},
                 is_error=True,
             )
         await self.delete_memory(record_id)
@@ -2682,7 +2784,8 @@ class Mem0ChatProxy:
             return self.mcp_tool_result(
                 text=f"Refusing to update id={record_id}: it is not a user-written memory "
                 "(imported corpus records are protected).",
-                structured={"error": "protected_record", "id": record_id},
+                structured={"error": "protected_record", "id": record_id,
+                            "suggested_action": "Imported records are read-only — file a correction with propose_update (target_id=<id>)."},
                 is_error=True,
             )
         # Preserve existing metadata and merge any caller-provided fields, but
@@ -3136,6 +3239,19 @@ class Mem0ChatProxy:
             return float(value)
         except (TypeError, ValueError):
             return 0.0
+
+    @staticmethod
+    def _context_bonus(hit: dict[str, Any], context) -> float:
+        if context is None or not getattr(context, "repo_slug", None):
+            return 0.0
+        md = hit.get("metadata") or {}
+        # Tiered: this repo's memory (room match) outranks generic dev-domain memory
+        # (a coarser "you're in a coding session" signal that also covers other repos).
+        if md.get("room") == context.repo_slug:
+            return CONTEXT_MATCH_BONUS
+        if md.get("domain") == "dev":
+            return CONTEXT_MATCH_BONUS / 2
+        return 0.0
 
     async def add_memory(
         self,

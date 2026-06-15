@@ -84,8 +84,8 @@ Caddy, or Traefik.
 
 | Endpoint | For | Auth | Tools |
 |----------|-----|------|-------|
-| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_update`, `mem0_delete`, `mem0_compile_page`, `mem0_list_pages`, `mem0_page_history`, `list_domains`, `add_image`, `fetch_image`, `delete_image`, `create_image_upload`, `commit_image_upload` |
-| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `search`, `fetch`, `fetch_image` (lean snippet shape); `add_memory` + `delete` + `add_image` if `MEM0_OPENAI_ALLOW_WRITE=true` |
+| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_capabilities`, `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_update`, `mem0_delete`, `propose_update`, `mem0_compile_page`, `mem0_list_pages`, `mem0_page_history`, `list_domains`, `add_image`, `fetch_image`, `delete_image`, `create_image_upload`, `commit_image_upload` |
+| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `capabilities`, `search`, `fetch`, `fetch_image` (lean snippet shape); write tools `add_memory`, `update`, `delete`, `add_image`, `delete_image`, `propose_update`, and the image-upload flow if `MEM0_OPENAI_ALLOW_WRITE=true` |
 
 **Binary blobs.** `add_image` stores a file (base64) plus a searchable caption;
 it returns a `blob_id`, a `memory_id`, and a signed `url`. Find images later with
@@ -109,6 +109,18 @@ Inspect pages with `mem0_list_pages` / `mem0_page_history`, and read the
 no-op). Two cron-friendly CLIs support it: `python app/lint.py` proposes refreshes
 (never applies them) and `python app/export_vault.py --out vault/` exports pages to
 an Obsidian-style vault. See [`docs/GUIDE.md`](docs/GUIDE.md#compilation-layer).
+
+**Project context & governance.** Reliquary is a generic personal-memory tool by
+default, but a coding agent can opt into light, *soft* project-awareness. Pass a
+`context` object (`{client, cwd, git_root, repo}`) in a `search` call — or set the
+`X-Reliquary-Repo` / `X-Reliquary-Git-Root` headers — and Reliquary biases results
+toward that repo's memory (room match) and dev-domain memory, with **no change** when
+context is absent. Call `mem0_capabilities` (`capabilities` on the lean endpoint)
+first for orientation. Imported corpus records stay read-only; to correct one,
+`propose_update` files a linked `kind=correction` record (the import is never
+mutated), and rejection messages point you there. `mem0://sources` reports
+provenance — where each memory came from. All of it is opt-in and soft: no session
+gating, no hard write-blocks.
 
 Also: `GET /healthz` (minimal, public), `GET /status` and `GET /mem0/search?q=...`
 (both **require the Claude bearer** — they return config/taxonomy and raw
