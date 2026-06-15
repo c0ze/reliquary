@@ -179,7 +179,7 @@ tidy up — syntheses cite them.
 - Stable **slug** (lowercase, hyphenated) + revision history.
 - Cite the raw memory ids a page is built from in **derived_from**.
 - When new raw memories land for a page's sources/topic, the page is flagged
-  **stale**; refresh it by re-filing with `mem0_compile_page`. A human decides
+  **stale**; refresh it by re-filing with `reliquary_compile_page`. A human decides
   what to believe; Reliquary only does the bookkeeping.
 """
 

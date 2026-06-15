@@ -89,7 +89,16 @@ def test_protected_delete_suggests_propose_update(proxy):
     result = run(proxy.call_mcp_tool(profile, "reliquary_delete", {"id": "imp-1"}, can_write=True))
     assert result.get("isError") is True
     sc = result["structuredContent"]
-    assert sc["error"] == "protected_record" and "propose_update" in sc["suggested_action"]
+    assert sc["error"] == "protected_record" and "reliquary_propose_update" in sc["suggested_action"]
+
+
+def test_protected_update_suggests_propose_update(proxy):
+    proxy.memory._store["imp-1"] = {"id": "imp-1", "memory": "imported", "metadata": {"source_group": "imported"}, "user_id": "my_lord"}
+    profile = _profile(proxy, "claude")
+    result = run(proxy.call_mcp_tool(profile, "reliquary_update", {"id": "imp-1", "text": "new text"}, can_write=True))
+    assert result.get("isError") is True
+    sc = result["structuredContent"]
+    assert sc["error"] == "protected_record" and "reliquary_propose_update" in sc["suggested_action"]
 
 
 def test_propose_update_openai_ignores_caller_user_id(proxy):
