@@ -2568,7 +2568,8 @@ class Mem0ChatProxy:
         if metadata.get("source_group") != "user-write":
             return self.mcp_tool_result(
                 text=f"Refusing to delete memory_id={memory_id}: not a user-written memory.",
-                structured={"error": "protected_record", "id": memory_id},
+                structured={"error": "protected_record", "id": memory_id,
+                            "suggested_action": "Only the memory that owns this blob can delete it."},
                 is_error=True,
             )
         blob_ref = metadata.get("blob_ref")
@@ -2627,7 +2628,8 @@ class Mem0ChatProxy:
             return self.mcp_tool_result(
                 text=f"Refusing to delete id={record_id}: it is not a user-written memory "
                 "(imported corpus records are protected).",
-                structured={"error": "protected_record", "id": record_id},
+                structured={"error": "protected_record", "id": record_id,
+                            "suggested_action": "Imported records are read-only — file a correction with propose_update (target_id=<id>)."},
                 is_error=True,
             )
         await self.delete_memory(record_id)
@@ -2679,7 +2681,8 @@ class Mem0ChatProxy:
             return self.mcp_tool_result(
                 text=f"Refusing to update id={record_id}: it is not a user-written memory "
                 "(imported corpus records are protected).",
-                structured={"error": "protected_record", "id": record_id},
+                structured={"error": "protected_record", "id": record_id,
+                            "suggested_action": "Imported records are read-only — file a correction with propose_update (target_id=<id>)."},
                 is_error=True,
             )
         # Preserve existing metadata and merge any caller-provided fields, but
