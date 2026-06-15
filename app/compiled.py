@@ -94,7 +94,7 @@ class PageRegistry:
     # --- read ---
     def get(self, slug: str) -> "PageInfo | None":
         # Path-traversal guard: only an already-clean slug maps to a file. Callers
-        # pass arbitrary strings here (e.g. mem0_fetch forwards the raw MCP `id`),
+        # pass arbitrary strings here (e.g. reliquary_fetch forwards the raw MCP `id`),
         # so reject anything that isn't its own slugify() output before touching the
         # filesystem. This is the read root for read_body/history too.
         if not slug or slugify(slug) != slug:

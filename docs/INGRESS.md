@@ -98,13 +98,13 @@ server {
 ## Hardening checklist
 
 - [ ] Reverse proxy blocks all paths not on the allowlist above.
-- [ ] `MEM0_CLAUDE_MCP_TOKEN` is set to a strong random secret.
-- [ ] `MEM0_BLOB_SIGNING_KEY` is set so blob URLs survive restarts.
-- [ ] `MEM0_OAUTH_ALLOW_REGISTRATION` is set to `false` after the client has
+- [ ] `RELIQUARY_CLAUDE_MCP_TOKEN` is set to a strong random secret.
+- [ ] `RELIQUARY_BLOB_SIGNING_KEY` is set so blob URLs survive restarts.
+- [ ] `RELIQUARY_OAUTH_ALLOW_REGISTRATION` is set to `false` after the client has
       registered once.
 - [ ] `/metrics` is only scraped from an internal network
       (Prometheus scrape job points at the internal address, not the public one).
-- [ ] `MEM0_OPENAI_ALLOW_NOAUTH` is `false` unless the OpenAI endpoint is on a
+- [ ] `RELIQUARY_OPENAI_ALLOW_NOAUTH` is `false` unless the OpenAI endpoint is on a
       trusted network with no untrusted callers.
 
 ## Environment variables for operational features
@@ -113,7 +113,7 @@ See the main README for full documentation. Summary:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `MEM0_AUDIT_LOG` | unset | Path for the append-only JSONL write-audit log. Disabled when unset. |
-| `MEM0_RATE_LIMIT_WRITES` | `0` | Max write tool calls per token per minute. `0` = unlimited. |
-| `MEM0_RATE_LIMIT_SEARCHES` | `0` | Max search/fetch calls per token per minute. `0` = unlimited. |
-| `MEM0_METRICS_PUBLIC` | `false` | Expose `/metrics` without auth. Default: requires Claude bearer. |
+| `RELIQUARY_AUDIT_LOG` | unset | Path for the append-only JSONL write-audit log. Disabled when unset. |
+| `RELIQUARY_RATE_LIMIT_WRITES` | `0` | Max write tool calls per token per minute. `0` = unlimited. |
+| `RELIQUARY_RATE_LIMIT_SEARCHES` | `0` | Max search/fetch calls per token per minute. `0` = unlimited. |
+| `RELIQUARY_METRICS_PUBLIC` | `false` | Expose `/metrics` without auth. Default: requires Claude bearer. |

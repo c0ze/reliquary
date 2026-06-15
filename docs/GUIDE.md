@@ -79,7 +79,7 @@ server — MCP + OAuth + the Mem0 client). No chat LLM is involved in retrieval.
 
 ### A search request, end to end
 
-1. The MCP client calls the `search` / `mem0_search` tool with a query.
+1. The MCP client calls the `search` / `reliquary_search` tool with a query.
 2. The app embeds the query via the embedder, and (if a dataset is loaded)
    checks the **taxonomy catalog** to see whether the query mentions a known
    domain/room/topic — if so it adds a filter to narrow the pool.
@@ -91,7 +91,7 @@ server — MCP + OAuth + the Mem0 client). No chat LLM is involved in retrieval.
 
 | Path | Method | Auth | Purpose |
 |------|--------|------|---------|
-| `/claude/mcp` | POST | Bearer or OAuth | Full MCP: `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_delete`, image/blob tools |
+| `/claude/mcp` | POST | Bearer or OAuth | Full MCP: `reliquary_status`, `reliquary_search`, `reliquary_fetch`, `reliquary_add_memory`, `reliquary_delete`, image/blob tools |
 | `/openai/mcp` | POST | Bearer (or no-auth) | Lean MCP: `search`, `fetch`, + write/image tools if writes enabled |
 | `/uploads/{upload_id}` | POST | Same MCP bearer (write) | Raw binary upload endpoint returned by `create_image_upload`; finalize with `commit_image_upload` |
 | `/healthz` | GET | none | Liveness check |
@@ -100,7 +100,7 @@ server — MCP + OAuth + the Mem0 client). No chat LLM is involved in retrieval.
 | `/.well-known/oauth-*`, `/oauth/*` | — | — | OAuth 2.1 discovery / authorize / token / revoke |
 | `/favicon.ico`, `/icon[-<size>].png` | GET | none | Brand assets (also embedded in MCP `serverInfo`) |
 
-> `delete`/`mem0_delete` (write-gated, same as `add_memory`) removes a memory by
+> `delete`/`reliquary_delete` (write-gated, same as `add_memory`) removes a memory by
 > id. It only deletes memories **written through this server** — imported corpus
 > records are protected, so an agent can't erase your curated corpus. `add_memory`
 > returns the new id so a write can be undone without a search.
@@ -157,7 +157,7 @@ result shape matches `add_image`: `blob_id`, `memory_id`, signed `url`,
 git clone https://github.com/c0ze/reliquary.git
 cd reliquary
 
-cp .env.example .env                 # set MEM0_CLAUDE_MCP_TOKEN etc.
+cp .env.example .env                 # set RELIQUARY_CLAUDE_MCP_TOKEN etc.
 cp config.example.yaml config.yaml   # points at the qdrant + embedder services
 
 docker compose up -d                 # qdrant + embedder (+ model pull) + app
@@ -197,16 +197,16 @@ file** (`config.yaml`). Run `python app/server.py --help` for every flag.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `MEM0_CLAUDE_MCP_TOKEN` | — | Bearer for `/claude/mcp` (required for write + OAuth) |
-| `MEM0_OPENAI_MCP_TOKEN` | — | Bearer for `/openai/mcp` |
-| `MEM0_OPENAI_ALLOW_NOAUTH` | `false` | `true` lets anyone reaching `/openai/mcp` read with no token |
-| `MEM0_OPENAI_ALLOW_WRITE` | `false` | Expose `add_memory` + `delete` on `/openai/mcp`. **Refuses to start** together with `ALLOW_NOAUTH=true` (no public write) |
-| `MEM0_OAUTH_CLIENT_ID` | — | Pin the OAuth client id; only this id is accepted |
-| `MEM0_OAUTH_ALLOW_REGISTRATION` | `true` | Allow `POST /oauth/register` (DCR). Disable after the connector registers once |
-| `MEM0_OAUTH_VERBATIM_TOKEN` | `false` | Return the master bearer verbatim instead of a derived, revocable token |
-| `MEM0_DATASET_PATH` | — | Curated JSONL (or dir) enabling taxonomy routing + `fetch` bootstrap docs |
-| `MEM0_EMBEDDER_PROVIDER` / `_MODEL` / `_BASE_URL` / `_API_KEY` / `_DIMS` | — | Synthesize an embedder block without editing `config.yaml` |
-| `MEM0_CLAUDE_MCP_PATH` / `MEM0_OPENAI_MCP_PATH` | `/claude/mcp` / `/openai/mcp` | Override endpoint paths |
+| `RELIQUARY_CLAUDE_MCP_TOKEN` | — | Bearer for `/claude/mcp` (required for write + OAuth) |
+| `RELIQUARY_OPENAI_MCP_TOKEN` | — | Bearer for `/openai/mcp` |
+| `RELIQUARY_OPENAI_ALLOW_NOAUTH` | `false` | `true` lets anyone reaching `/openai/mcp` read with no token |
+| `RELIQUARY_OPENAI_ALLOW_WRITE` | `false` | Expose `add_memory` + `delete` on `/openai/mcp`. **Refuses to start** together with `ALLOW_NOAUTH=true` (no public write) |
+| `RELIQUARY_OAUTH_CLIENT_ID` | — | Pin the OAuth client id; only this id is accepted |
+| `RELIQUARY_OAUTH_ALLOW_REGISTRATION` | `true` | Allow `POST /oauth/register` (DCR). Disable after the connector registers once |
+| `RELIQUARY_OAUTH_VERBATIM_TOKEN` | `false` | Return the master bearer verbatim instead of a derived, revocable token |
+| `RELIQUARY_DATASET_PATH` | — | Curated JSONL (or dir) enabling taxonomy routing + `fetch` bootstrap docs |
+| `RELIQUARY_EMBEDDER_PROVIDER` / `_MODEL` / `_BASE_URL` / `_API_KEY` / `_DIMS` | — | Synthesize an embedder block without editing `config.yaml` |
+| `RELIQUARY_CLAUDE_MCP_PATH` / `RELIQUARY_OPENAI_MCP_PATH` | `/claude/mcp` / `/openai/mcp` | Override endpoint paths |
 
 ### Key CLI flags
 
@@ -350,10 +350,10 @@ There are **two** auth surfaces, one per connector.
 
 ChatGPT connectors use a static API key. Add an MCP server at
 `https://your-host/openai/mcp` with **API key / Bearer** auth, using
-`MEM0_OPENAI_MCP_TOKEN`. Keep `MEM0_OPENAI_ALLOW_NOAUTH=false` so the token is
+`RELIQUARY_OPENAI_MCP_TOKEN`. Keep `RELIQUARY_OPENAI_ALLOW_NOAUTH=false` so the token is
 required.
 
-To let ChatGPT **write**, set `MEM0_OPENAI_ALLOW_WRITE=true` (exposes
+To let ChatGPT **write**, set `RELIQUARY_OPENAI_ALLOW_WRITE=true` (exposes
 `add_memory`). The server **refuses to start** if write is enabled together with
 no-auth, to avoid an unauthenticated public write surface.
 
@@ -375,15 +375,15 @@ Claude.ai Custom Connectors speak OAuth. Reliquary ships a small OAuth 2.1 shim:
    `https://your-host/claude/mcp`. **Leave OAuth Client ID and Secret blank** —
    Claude registers itself via DCR.
 2. Claude opens a browser authorize page (`/oauth/authorize`). **Paste your
-   `MEM0_CLAUDE_MCP_TOKEN`** there and authorize. The connector receives a
+   `RELIQUARY_CLAUDE_MCP_TOKEN`** there and authorize. The connector receives a
    **derived, revocable** token (not the master).
 3. Once it works, pin the client and lock down registration:
    ```bash
-   MEM0_OAUTH_CLIENT_ID=<the client_id Claude registered>
-   MEM0_OAUTH_ALLOW_REGISTRATION=false
+   RELIQUARY_OAUTH_CLIENT_ID=<the client_id Claude registered>
+   RELIQUARY_OAUTH_ALLOW_REGISTRATION=false
    ```
 
-> If a field *forces* a value, the pinned `MEM0_OAUTH_CLIENT_ID` works as the
+> If a field *forces* a value, the pinned `RELIQUARY_OAUTH_CLIENT_ID` works as the
 > Client ID and any string works as the Secret (it's a public client; the secret
 > isn't validated). The real credential is the token you paste on the authorize
 > page.
@@ -425,7 +425,7 @@ whichever embedding model you choose. You only ever set the **model** and its
 ## Embedder alternatives
 
 mem0 supports several embedder providers. Reliquary's `ingest.py` can also
-synthesize a provider from `MEM0_EMBEDDER_*` env vars. Common choices:
+synthesize a provider from `RELIQUARY_EMBEDDER_*` env vars. Common choices:
 
 | Option | Provider in config | Pros | Cons / notes |
 |--------|--------------------|------|--------------|
@@ -521,24 +521,24 @@ The compiled layer is **on by default** and is kept in its own collection
 on disk at `/data/compiled` (bind-mounted via `COMPILED_HOST_DIR` in Compose).
 
 To **disable** the compiled layer — for lightweight or read-only deployments — set
-`MEM0_COMPILED_COLLECTION` to an empty string in your `.env`. When the collection
+`RELIQUARY_COMPILED_COLLECTION` to an empty string in your `.env`. When the collection
 name is empty the compiled layer is fully inactive — a complete query-time no-op:
 no reads, no writes, no second collection required.
 
 ```env
 # disable compiled layer
-MEM0_COMPILED_COLLECTION=
+RELIQUARY_COMPILED_COLLECTION=
 ```
 
 Key environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MEM0_COMPILED_COLLECTION` | `reliquary_compiled` | Qdrant collection name. Empty = disabled. |
+| `RELIQUARY_COMPILED_COLLECTION` | `reliquary_compiled` | Qdrant collection name. Empty = disabled. |
 | `COMPILED_HOST_DIR` | `./data/compiled` | Compose only: host path bind-mounted to `/data/compiled`. |
-| `MEM0_COMPILED_DIR` | `/data/compiled` | Container path for the page registry + vault export. |
-| `MEM0_SCHEMA_PATH` | *(built-in)* | Path to an editable memory constitution file. |
-| `MEM0_LINT_COVERAGE_MIN` | `8` | Raw record threshold before lint flags a gap. |
+| `RELIQUARY_COMPILED_DIR` | `/data/compiled` | Container path for the page registry + vault export. |
+| `RELIQUARY_SCHEMA_PATH` | *(built-in)* | Path to an editable memory constitution file. |
+| `RELIQUARY_LINT_COVERAGE_MIN` | `8` | Raw record threshold before lint flags a gap. |
 
 ---
 
@@ -568,7 +568,7 @@ never reads the filesystem at those paths.
 (records with `room=<repo-slug>`) leads, with dev-domain memory a weaker second.
 Nothing is filtered out.
 
-**Orientation.** `mem0_capabilities` (`capabilities` on the lean endpoint) returns a
+**Orientation.** `reliquary_capabilities` (`capabilities` on the lean endpoint) returns a
 concise summary — what Reliquary is, the tools, read/write + protection rules,
 taxonomy, and whether project context is active. Call it first.
 
@@ -577,7 +577,7 @@ it, `propose_update` files a linked user record (`kind=correction`, `status=prop
 `target_id`); the original stays immutable. Protected-record and scope errors return
 a `suggested_action` telling the agent what to do next.
 
-**Provenance.** The `mem0://sources` resource reports where memories came from,
+**Provenance.** The `reliquary://sources` resource reports where memories came from,
 grouped by source and import vs. user-write, with private/public status.
 
 ---
@@ -591,10 +591,10 @@ docker compose logs -f app
 curl -s http://127.0.0.1:8787/healthz
 
 # Authed status (config + taxonomy)
-curl -s -H "Authorization: Bearer $MEM0_CLAUDE_MCP_TOKEN" http://127.0.0.1:8787/status
+curl -s -H "Authorization: Bearer $RELIQUARY_CLAUDE_MCP_TOKEN" http://127.0.0.1:8787/status
 
 # Memory count (point count in Qdrant)
-#   shown as approx_memory_count in /status and the mem0_status tool
+#   shown as approx_memory_count in /status and the reliquary_status tool
 
 # Upgrade the app image
 docker compose pull app && docker compose up -d app
