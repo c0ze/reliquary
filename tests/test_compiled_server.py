@@ -375,6 +375,15 @@ def test_mem0_fetch_page_with_missing_blob_errors(proxy):
     assert result["structuredContent"]["error"] == "blob_missing"
 
 
+def test_mem0_fetch_rejects_path_traversal_id(proxy):
+    """A traversal/absolute id must not read outside the registry; it falls through
+    to the normal not_found path rather than leaking an arbitrary file."""
+    for bad in ("../../etc/passwd", "/etc/passwd", "a/../../b"):
+        result = run(proxy.handle_fetch_tool({"id": bad}))
+        assert result.get("isError") is True
+        assert result["structuredContent"]["error"] == "not_found"
+
+
 # ---------------------------------------------------------------------------
 # Phase 4 (#50) — synthesis-first retrieval
 # ---------------------------------------------------------------------------

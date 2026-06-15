@@ -48,6 +48,16 @@ def test_get_unknown_returns_none(tmp_path):
     assert reg.read_body("missing") is None
 
 
+def test_get_rejects_path_traversal(tmp_path):
+    reg = _registry(tmp_path)
+    reg.put_revision("real", "body", {"title": "Real"})
+    # Traversal / absolute / non-slug ids must never map to a filesystem read.
+    for bad in ("../real", "/etc/passwd", "a/../../b", "..", "Real"):
+        assert reg.get(bad) is None
+        assert reg.read_body(bad) is None
+    assert reg.get("real") is not None  # the genuine slug still resolves
+
+
 def test_update_creates_revision_and_history(tmp_path, monkeypatch):
     reg = _registry(tmp_path)
     import compiled
