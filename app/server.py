@@ -988,6 +988,12 @@ class Mem0ChatProxy:
                 "mimeType": "application/json",
             })
         if self.catalog:
+            resources.append({
+                "uri": "mem0://sources",
+                "name": "Source registry",
+                "description": "Provenance of imported corpora and user writes (grouped by source).",
+                "mimeType": "application/json",
+            })
             for domain in self.catalog.routeable_domains:
                 resources.append({
                     "uri": f"mem0://domain/{domain}",
@@ -1028,6 +1034,21 @@ class Mem0ChatProxy:
                 "domains": self.catalog.routeable_domains if self.catalog else [],
                 "records": len(self.catalog.records_by_id) if self.catalog else 0,
             }
+            return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
+        if uri == "mem0://sources" and self.catalog:
+            groups: dict[tuple[str, str], dict[str, Any]] = {}
+            for rec in self.catalog.records_by_id.values():
+                md = rec.metadata or {}
+                group = str(md.get("source_group") or "imported")
+                src = str(md.get("source") or md.get("source_url") or md.get("source_ref") or "(unknown)")
+                key = (group, src)
+                entry = groups.setdefault(key, {"source_group": group, "source": src, "count": 0,
+                                                 "private": bool(md.get("private")), "sample_refs": []})
+                entry["count"] += 1
+                if md.get("source_ref") and len(entry["sample_refs"]) < 3:
+                    entry["sample_refs"].append(str(md.get("source_ref")))
+            payload = {"sources": sorted(groups.values(), key=lambda e: (-e["count"], e["source"])),
+                       "total": len(self.catalog.records_by_id)}
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
         prefix = "mem0://domain/"
         if uri.startswith(prefix) and self.catalog:

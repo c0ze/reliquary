@@ -137,3 +137,40 @@ def test_context_bias_prefers_this_repo_over_other_dev(proxy):
     ctx = resolve_context({"context": {"repo": "c0ze/reliquary"}}, {})
     result = run(proxy.handle_search_tool({"query": "alpha"}, context=ctx))
     assert result["structuredContent"]["results"][0]["id"] == "zzz-mine"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: mem0://sources provenance registry (#46)
+# ---------------------------------------------------------------------------
+
+def test_sources_resource_groups_by_source(proxy):
+    import json
+    from types import SimpleNamespace
+    proxy.catalog = SimpleNamespace(
+        routeable_domains=[],
+        records_by_id={
+            "r1": SimpleNamespace(import_record_id="r1", metadata={"source_group": "imported", "source": "vault", "source_ref": "a.md"}),
+            "r2": SimpleNamespace(import_record_id="r2", metadata={"source_group": "imported", "source": "vault", "source_ref": "b.md"}),
+            "u1": SimpleNamespace(import_record_id="u1", metadata={"source_group": "user-write"}),
+        },
+    )
+    res = proxy.read_resource("mem0://sources")
+    payload = json.loads(res["contents"][0]["text"])
+    assert payload["total"] == 3
+    vault = next(s for s in payload["sources"] if s["source"] == "vault")
+    assert vault["count"] == 2 and vault["source_group"] == "imported"
+    assert set(vault["sample_refs"]) == {"a.md", "b.md"}
+
+
+def test_sources_resource_listed_with_catalog(proxy):
+    from types import SimpleNamespace
+    proxy.catalog = SimpleNamespace(routeable_domains=[], records_by_id={})
+    uris = {r["uri"] for r in proxy.mcp_resources()}
+    assert "mem0://sources" in uris
+
+
+def test_sources_absent_without_catalog(proxy):
+    proxy.catalog = None
+    uris = {r["uri"] for r in proxy.mcp_resources()}
+    assert "mem0://sources" not in uris
+    assert proxy.read_resource("mem0://sources") is None
