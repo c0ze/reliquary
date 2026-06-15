@@ -7,7 +7,7 @@ the vault back. Run:
 
     python app/export_vault.py --out vault/
 
-Reads MEM0_COMPILED_DIR / MEM0_BLOB_DIR (overridable by flags), like app/lint.py.
+Reads RELIQUARY_COMPILED_DIR / RELIQUARY_BLOB_DIR (overridable by flags), like app/lint.py.
 """
 
 from __future__ import annotations
@@ -52,8 +52,8 @@ def main(argv: list[str] | None = None) -> int:
         description="Export the compiled synthesis layer to a browsable vault (one-way)."
     )
     parser.add_argument("--out", required=True, help="Output vault directory.")
-    parser.add_argument("--compiled-dir", default=os.getenv("MEM0_COMPILED_DIR", "/data/compiled"))
-    parser.add_argument("--blob-dir", default=os.getenv("MEM0_BLOB_DIR", "/data/blobs"))
+    parser.add_argument("--compiled-dir", default=os.getenv("RELIQUARY_COMPILED_DIR", "/data/compiled"))
+    parser.add_argument("--blob-dir", default=os.getenv("RELIQUARY_BLOB_DIR", "/data/blobs"))
     args = parser.parse_args(argv)
 
     blobs = BlobStore(blob_dir=args.blob_dir, signing_key=b"export", max_bytes=0)

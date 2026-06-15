@@ -7,7 +7,7 @@ internal scheduler; invoke this from external cron:
 
     python app/lint.py [--json] [--strict]
 
-Reads MEM0_COMPILED_DIR, MEM0_BLOB_DIR, MEM0_DATASET_PATH, MEM0_LINT_COVERAGE_MIN
+Reads RELIQUARY_COMPILED_DIR, RELIQUARY_BLOB_DIR, RELIQUARY_DATASET_PATH, RELIQUARY_LINT_COVERAGE_MIN
 (overridable by the matching flags).
 """
 from __future__ import annotations
@@ -64,10 +64,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Lint the compiled synthesis layer (proposes refreshes; never rewrites).")
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
     parser.add_argument("--strict", action="store_true", help="Exit non-zero if any proposals exist (cron/CI alerting).")
-    parser.add_argument("--compiled-dir", default=os.getenv("MEM0_COMPILED_DIR", "/data/compiled"))
-    parser.add_argument("--blob-dir", default=os.getenv("MEM0_BLOB_DIR", "/data/blobs"))
-    parser.add_argument("--dataset-path", default=os.getenv("MEM0_DATASET_PATH"))
-    parser.add_argument("--coverage-min", type=int, default=int(os.getenv("MEM0_LINT_COVERAGE_MIN", "8")))
+    parser.add_argument("--compiled-dir", default=os.getenv("RELIQUARY_COMPILED_DIR", "/data/compiled"))
+    parser.add_argument("--blob-dir", default=os.getenv("RELIQUARY_BLOB_DIR", "/data/blobs"))
+    parser.add_argument("--dataset-path", default=os.getenv("RELIQUARY_DATASET_PATH"))
+    parser.add_argument("--coverage-min", type=int, default=int(os.getenv("RELIQUARY_LINT_COVERAGE_MIN", "8")))
     args = parser.parse_args(argv)
 
     report = build_report(compiled_dir=args.compiled_dir, blob_dir=args.blob_dir,

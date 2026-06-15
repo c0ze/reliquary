@@ -373,7 +373,7 @@ class Mem0ChatProxy:
         self._load_pending_uploads()
         if not settings.blob_signing_key:
             LOG.warning(
-                "MEM0_BLOB_SIGNING_KEY is unset; using a random per-process key. "
+                "RELIQUARY_BLOB_SIGNING_KEY is unset; using a random per-process key. "
                 "Signed blob URLs will invalidate on restart."
             )
 
@@ -1188,7 +1188,7 @@ class Mem0ChatProxy:
                 "imported_records": "read-only (protected); user-written records are mutable",
                 "corrections": f"propose changes to imported records with {tp}propose_update (never mutates the import)",
                 "write_scope": "write tools require a write-scoped token" + (
-                    "; this endpoint also requires MEM0_OPENAI_ALLOW_WRITE" if is_openai else ""),
+                    "; this endpoint also requires RELIQUARY_OPENAI_ALLOW_WRITE" if is_openai else ""),
                 "user_id": "not accepted on the OpenAI endpoint" if is_openai else "optional override accepted",
             },
             "images": f"store/fetch binary blobs with {tp}add_image / {tp}fetch_image (+ upload flow)",
@@ -3863,7 +3863,7 @@ def parse_static_tokens(raw: str | None) -> tuple[tuple[str, str, str], ...]:
             continue
         parts = chunk.split(":", 2)
         if len(parts) != 3:
-            LOG.warning("Ignoring malformed MEM0_STATIC_TOKENS entry (need label:scope:token).")
+            LOG.warning("Ignoring malformed RELIQUARY_STATIC_TOKENS entry (need label:scope:token).")
             continue
         label, scope, token = (p.strip() for p in parts)
         scope = "write" if scope_is_write(scope) else "read"
@@ -3888,7 +3888,7 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         args.embedder_base_url or embedder_config.get("lmstudio_base_url") or embedder_config.get("openai_base_url")
     )
 
-    claude_token = normalize_token(args.claude_mcp_token or args.mcp_token)
+    claude_token = normalize_token(args.claude_mcp_token)
     openai_token = normalize_token(args.openai_mcp_token)
 
     return ProxySettings(
@@ -3947,7 +3947,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-threshold", default=None, type=float, help="Optional minimum similarity score for memory hits.")
     parser.add_argument("--memory-max-chars", default=500, type=int, help="Maximum characters per injected memory snippet.")
     parser.add_argument("--request-timeout", default=600.0, type=float, help="Read timeout in seconds for upstream model responses.")
-    _concurrent_reads_env = os.getenv("MEM0_MEMORY_CONCURRENT_READS")
+    _concurrent_reads_env = os.getenv("RELIQUARY_MEMORY_CONCURRENT_READS")
     parser.add_argument(
         "--memory-concurrent-reads",
         action=argparse.BooleanOptionalAction,
@@ -3965,50 +3965,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--writeback", action="store_true", help="Write the latest user+assistant turn back into Mem0 after each successful completion.")
     parser.add_argument(
         "--writeback-path",
-        default=os.getenv("MEM0_WRITEBACK_PATH"),
+        default=os.getenv("RELIQUARY_WRITEBACK_PATH"),
         help="Optional Markdown file to append writeback turns to, e.g. an Obsidian note.",
     )
     parser.add_argument("--system-instruction", default=DEFAULT_MEMORY_INSTRUCTION, help="Instruction text injected ahead of the retrieved memory block.")
-    parser.add_argument("--claude-mcp-path", default=os.getenv("MEM0_CLAUDE_MCP_PATH", "/claude/mcp"), help="Path for the bearer-protected Claude MCP endpoint.")
-    parser.add_argument("--openai-mcp-path", default=os.getenv("MEM0_OPENAI_MCP_PATH", "/openai/mcp"), help="Path for the read-only OpenAI/ChatGPT MCP endpoint.")
-    parser.add_argument("--claude-mcp-token", default=os.getenv("MEM0_CLAUDE_MCP_TOKEN"), help="Bearer token required for the Claude MCP endpoint.")
-    parser.add_argument("--openai-mcp-token", default=os.getenv("MEM0_OPENAI_MCP_TOKEN"), help="Optional bearer token for the OpenAI MCP endpoint.")
-    parser.add_argument("--mcp-token", default=os.getenv("MEM0_MCP_TOKEN"), help="Back-compat alias for --claude-mcp-token.")
+    parser.add_argument("--claude-mcp-path", default=os.getenv("RELIQUARY_CLAUDE_MCP_PATH", "/claude/mcp"), help="Path for the bearer-protected Claude MCP endpoint.")
+    parser.add_argument("--openai-mcp-path", default=os.getenv("RELIQUARY_OPENAI_MCP_PATH", "/openai/mcp"), help="Path for the read-only OpenAI/ChatGPT MCP endpoint.")
+    parser.add_argument("--claude-mcp-token", default=os.getenv("RELIQUARY_CLAUDE_MCP_TOKEN"), help="Bearer token required for the Claude MCP endpoint.")
+    parser.add_argument("--openai-mcp-token", default=os.getenv("RELIQUARY_OPENAI_MCP_TOKEN"), help="Optional bearer token for the OpenAI MCP endpoint.")
     parser.add_argument(
         "--openai-allow-noauth",
         action=argparse.BooleanOptionalAction,
-        default=os.getenv("MEM0_OPENAI_ALLOW_NOAUTH", "false").lower() in {"1", "true", "yes"},
+        default=os.getenv("RELIQUARY_OPENAI_ALLOW_NOAUTH", "false").lower() in {"1", "true", "yes"},
         help="Allow unauthenticated requests to the OpenAI MCP endpoint (default false). "
         "Opt in only when the endpoint is not reachable from untrusted networks.",
     )
     parser.add_argument(
         "--openai-allow-write",
         action=argparse.BooleanOptionalAction,
-        default=os.getenv("MEM0_OPENAI_ALLOW_WRITE", "false").lower() in {"1", "true", "yes"},
+        default=os.getenv("RELIQUARY_OPENAI_ALLOW_WRITE", "false").lower() in {"1", "true", "yes"},
         help="Expose the add_memory write tool on the OpenAI MCP endpoint (default false: read-only). "
         "Only enable when the endpoint's bearer token is trusted to write to the corpus.",
     )
-    parser.add_argument("--oauth-client-id", default=os.getenv("MEM0_OAUTH_CLIENT_ID"), help="Pre-shared OAuth client_id. When set, only this id is accepted.")
+    parser.add_argument("--oauth-client-id", default=os.getenv("RELIQUARY_OAUTH_CLIENT_ID"), help="Pre-shared OAuth client_id. When set, only this id is accepted.")
     parser.add_argument(
         "--oauth-allow-registration",
         action=argparse.BooleanOptionalAction,
-        default=os.getenv("MEM0_OAUTH_ALLOW_REGISTRATION", "true").lower() in {"1", "true", "yes"},
+        default=os.getenv("RELIQUARY_OAUTH_ALLOW_REGISTRATION", "true").lower() in {"1", "true", "yes"},
         help="Allow POST /oauth/register. Disable after the legitimate client has registered once.",
     )
     parser.add_argument(
         "--oauth-verbatim-token",
         action=argparse.BooleanOptionalAction,
-        default=os.getenv("MEM0_OAUTH_VERBATIM_TOKEN", "false").lower() in {"1", "true", "yes"},
+        default=os.getenv("RELIQUARY_OAUTH_VERBATIM_TOKEN", "false").lower() in {"1", "true", "yes"},
         help="Return the master bearer itself as the OAuth access_token (old behavior) instead of a "
         "derived, revocable token. Default false.",
     )
-    parser.add_argument("--oauth-access-token-ttl", type=int, default=int(os.getenv("MEM0_OAUTH_ACCESS_TOKEN_TTL", "432000")),
+    parser.add_argument("--oauth-access-token-ttl", type=int, default=int(os.getenv("RELIQUARY_OAUTH_ACCESS_TOKEN_TTL", "432000")),
                         help="Access-token lifetime in seconds (default 5 days). Refresh rotation renews it.")
-    parser.add_argument("--oauth-refresh-token-ttl", type=int, default=int(os.getenv("MEM0_OAUTH_REFRESH_TOKEN_TTL", "0")),
+    parser.add_argument("--oauth-refresh-token-ttl", type=int, default=int(os.getenv("RELIQUARY_OAUTH_REFRESH_TOKEN_TTL", "0")),
                         help="Refresh-token lifetime in seconds (0 = non-expiring).")
     parser.add_argument(
         "--dataset",
-        default=os.getenv("MEM0_DATASET_PATH"),
+        default=os.getenv("RELIQUARY_DATASET_PATH"),
         help="Optional corpus JSONL (or directory) for domain/hall/room-aware retrieval routing.",
     )
     parser.add_argument(
@@ -4019,59 +4018,59 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--blob-dir",
-        default=os.getenv("MEM0_BLOB_DIR", "/data/blobs"),
+        default=os.getenv("RELIQUARY_BLOB_DIR", "/data/blobs"),
         help="Directory for stored binary blobs (images, etc.). Bind-mount this for host access.",
     )
     parser.add_argument(
         "--blob-signing-key",
-        default=os.getenv("MEM0_BLOB_SIGNING_KEY"),
+        default=os.getenv("RELIQUARY_BLOB_SIGNING_KEY"),
         help="HMAC key for signed blob URLs. Unset = random per-process key (URLs break on restart).",
     )
     parser.add_argument(
         "--blob-max-bytes",
         type=int,
-        default=int(os.getenv("MEM0_BLOB_MAX_BYTES", str(30 * 1024 * 1024))),
+        default=int(os.getenv("RELIQUARY_BLOB_MAX_BYTES", str(30 * 1024 * 1024))),
         help="Max blob size in bytes (0 disables the cap). Default 30 MB.",
     )
     parser.add_argument(
         "--blob-url-ttl",
         type=int,
-        default=int(os.getenv("MEM0_BLOB_URL_TTL", "3600")),
+        default=int(os.getenv("RELIQUARY_BLOB_URL_TTL", "3600")),
         help="Lifetime in seconds of signed blob URLs. Default 3600.",
     )
     parser.add_argument(
         "--state-dir",
-        default=os.getenv("MEM0_STATE_DIR"),
+        default=os.getenv("RELIQUARY_STATE_DIR"),
         help="Directory to persist OAuth tokens + MCP sessions across restarts. "
         "Unset = in-memory only (tokens/sessions reset on restart).",
     )
     parser.add_argument(
         "--static-tokens",
-        default=os.getenv("MEM0_STATIC_TOKENS"),
+        default=os.getenv("RELIQUARY_STATIC_TOKENS"),
         help="Named static bearer tokens with per-token scope, beyond the master token. "
         "Format: 'label:scope:token' entries separated by ';'. scope is 'read' or 'write'. "
         "Example: 'readonly:read:abc123;editor:write:def456'.",
     )
-    parser.add_argument("--audit-log", default=os.getenv("MEM0_AUDIT_LOG"),
+    parser.add_argument("--audit-log", default=os.getenv("RELIQUARY_AUDIT_LOG"),
         help="Append a JSONL audit line per write (add/update/delete) to this path. Unset = disabled.")
-    parser.add_argument("--rate-limit-writes", type=int, default=int(os.getenv("MEM0_RATE_LIMIT_WRITES", "0")),
+    parser.add_argument("--rate-limit-writes", type=int, default=int(os.getenv("RELIQUARY_RATE_LIMIT_WRITES", "0")),
         help="Max write tool calls per token per minute (0 = unlimited).")
-    parser.add_argument("--rate-limit-searches", type=int, default=int(os.getenv("MEM0_RATE_LIMIT_SEARCHES", "0")),
+    parser.add_argument("--rate-limit-searches", type=int, default=int(os.getenv("RELIQUARY_RATE_LIMIT_SEARCHES", "0")),
         help="Max search/fetch tool calls per token per minute (0 = unlimited).")
     parser.add_argument("--metrics-public", action=argparse.BooleanOptionalAction,
-        default=os.getenv("MEM0_METRICS_PUBLIC", "false").lower() in {"1", "true", "yes"},
+        default=os.getenv("RELIQUARY_METRICS_PUBLIC", "false").lower() in {"1", "true", "yes"},
         help="Expose GET /metrics without auth (default false: requires the Claude bearer).")
     parser.add_argument("--log-level", default="info", help="Logging level, for example info or debug.")
     parser.add_argument("--image-url-ingest", action=argparse.BooleanOptionalAction,
-        default=os.getenv("MEM0_IMAGE_URL_INGEST", "true").lower() in {"1", "true", "yes"},
+        default=os.getenv("RELIQUARY_IMAGE_URL_INGEST", "true").lower() in {"1", "true", "yes"},
         help="Allow add_image to fetch images from a source_url server-side (default true).")
-    parser.add_argument("--compiled-collection", default=os.getenv("MEM0_COMPILED_COLLECTION", "reliquary_compiled"),
+    parser.add_argument("--compiled-collection", default=os.getenv("RELIQUARY_COMPILED_COLLECTION", "reliquary_compiled"),
                         help="Qdrant collection for the compiled synthesis layer. Empty disables the layer.")
-    parser.add_argument("--compiled-dir", default=os.getenv("MEM0_COMPILED_DIR", "/data/compiled"),
+    parser.add_argument("--compiled-dir", default=os.getenv("RELIQUARY_COMPILED_DIR", "/data/compiled"),
                         help="Host directory for the page registry + vault export.")
-    parser.add_argument("--schema-path", default=os.getenv("MEM0_SCHEMA_PATH"),
+    parser.add_argument("--schema-path", default=os.getenv("RELIQUARY_SCHEMA_PATH"),
                         help="Path to the editable memory constitution (reliquary://schema). Unset uses a built-in default.")
-    parser.add_argument("--lint-coverage-min", type=int, default=int(os.getenv("MEM0_LINT_COVERAGE_MIN", "8")),
+    parser.add_argument("--lint-coverage-min", type=int, default=int(os.getenv("RELIQUARY_LINT_COVERAGE_MIN", "8")),
                         help="Min raw records in a domain/topic with no synthesis before lint flags a coverage gap.")
     return parser.parse_args()
 
@@ -4089,28 +4088,28 @@ def main() -> None:
         raise SystemExit(
             "Refusing to start: --openai-allow-write together with --openai-allow-noauth would "
             "expose PUBLIC WRITE access to the memory store on /openai/mcp. Require a bearer first: "
-            "set MEM0_OPENAI_ALLOW_NOAUTH=false (and a MEM0_OPENAI_MCP_TOKEN) before enabling writes."
+            "set RELIQUARY_OPENAI_ALLOW_NOAUTH=false (and a RELIQUARY_OPENAI_MCP_TOKEN) before enabling writes."
         )
     if settings.oauth_access_token_ttl <= 0:
         raise SystemExit(
-            "Refusing to start: MEM0_OAUTH_ACCESS_TOKEN_TTL must be > 0 "
+            "Refusing to start: RELIQUARY_OAUTH_ACCESS_TOKEN_TTL must be > 0 "
             f"(got {settings.oauth_access_token_ttl}); access tokens would be unusable on issue."
         )
     if settings.oauth_refresh_token_ttl < 0:
         raise SystemExit(
-            "Refusing to start: MEM0_OAUTH_REFRESH_TOKEN_TTL must be >= 0 "
+            "Refusing to start: RELIQUARY_OAUTH_REFRESH_TOKEN_TTL must be >= 0 "
             f"(0 = non-expiring; got {settings.oauth_refresh_token_ttl})."
         )
     if not settings.claude_token:
         LOG.warning(
             "Claude MCP endpoint has no bearer token configured. "
-            "Set MEM0_CLAUDE_MCP_TOKEN (or --claude-mcp-token) to require auth."
+            "Set RELIQUARY_CLAUDE_MCP_TOKEN (or --claude-mcp-token) to require auth."
         )
     if settings.openai_allow_noauth and settings.host not in {"127.0.0.1", "localhost", "::1"}:
         LOG.warning(
             "OpenAI MCP endpoint allows unauthenticated access AND is bound to %s "
             "(not loopback). The entire memory corpus is readable without a token. "
-            "Set --no-openai-allow-noauth (or MEM0_OPENAI_ALLOW_NOAUTH=false) unless this "
+            "Set --no-openai-allow-noauth (or RELIQUARY_OPENAI_ALLOW_NOAUTH=false) unless this "
             "host is on a trusted network.",
             settings.host,
         )
