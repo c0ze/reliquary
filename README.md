@@ -85,7 +85,7 @@ Caddy, or Traefik.
 | Endpoint | For | Auth | Tools |
 |----------|-----|------|-------|
 | `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `mem0_capabilities`, `mem0_status`, `mem0_search`, `mem0_fetch`, `mem0_add_memory`, `mem0_update`, `mem0_delete`, `propose_update`, `mem0_compile_page`, `mem0_list_pages`, `mem0_page_history`, `list_domains`, `add_image`, `fetch_image`, `delete_image`, `create_image_upload`, `commit_image_upload` |
-| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `capabilities`, `search`, `fetch`, `fetch_image` (lean snippet shape); `add_memory` + `delete` + `add_image` + `propose_update` if `MEM0_OPENAI_ALLOW_WRITE=true` |
+| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `capabilities`, `search`, `fetch`, `fetch_image` (lean snippet shape); write tools `add_memory`, `update`, `delete`, `add_image`, `delete_image`, `propose_update`, and the image-upload flow if `MEM0_OPENAI_ALLOW_WRITE=true` |
 
 **Binary blobs.** `add_image` stores a file (base64) plus a searchable caption;
 it returns a `blob_id`, a `memory_id`, and a signed `url`. Find images later with

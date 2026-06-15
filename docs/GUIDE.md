@@ -557,6 +557,7 @@ can *opt into* light project-awareness — soft, never enforced.
 |---|---|
 | `X-Reliquary-Repo` | `owner/name`; biases toward that repo's memory |
 | `X-Reliquary-Git-Root` | absolute repo path (basename used when no `repo`) |
+| `X-Reliquary-Cwd` | working directory (informational only) |
 | `X-Reliquary-Client` | informational client id |
 
 Args take precedence over headers. With no repo/git-root signal, behavior is
