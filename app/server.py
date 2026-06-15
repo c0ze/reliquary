@@ -1433,14 +1433,14 @@ class Mem0ChatProxy:
         claude_tools = [
             {
                 "name": "reliquary_status",
-                "title": "Mem0 Status",
+                "title": "Reliquary Status",
                 "description": "Inspect the local Mem0 store, endpoints, and approximate memory count.",
                 "annotations": read_only,
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             },
             {
                 "name": "reliquary_search",
-                "title": "Mem0 Search",
+                "title": "Reliquary Search",
                 "description": "Search the Mem0 store with optional domain/hall/room-aware routing." + routing_hint,
                 "annotations": read_only,
                 "inputSchema": {
@@ -1462,7 +1462,7 @@ class Mem0ChatProxy:
             },
             {
                 "name": "reliquary_fetch",
-                "title": "Mem0 Fetch",
+                "title": "Reliquary Fetch",
                 "description": "Fetch the full document behind a search result by id.",
                 "annotations": read_only,
                 "inputSchema": {
@@ -1518,7 +1518,7 @@ class Mem0ChatProxy:
             claude_tools.extend([
                 {
                     "name": "reliquary_add_memory",
-                    "title": "Mem0 Add Memory",
+                    "title": "Reliquary Add Memory",
                     "description": "Store a new memory in the local Mem0 collection.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
                     "inputSchema": {
@@ -1543,7 +1543,7 @@ class Mem0ChatProxy:
                 },
                 {
                     "name": "reliquary_delete",
-                    "title": "Mem0 Delete Memory",
+                    "title": "Reliquary Delete Memory",
                     "description": "Delete a memory previously stored via reliquary_add_memory, by id. "
                     "Only user-written memories can be deleted; imported corpus records are protected.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
@@ -1559,7 +1559,7 @@ class Mem0ChatProxy:
                 },
                 {
                     "name": "reliquary_update",
-                    "title": "Mem0 Update Memory",
+                    "title": "Reliquary Update Memory",
                     "description": "Update the text (and optionally merge metadata) of a memory you previously "
                     "stored via reliquary_add_memory, by id. Only user-written memories can be updated; imported "
                     "corpus records are protected.",
