@@ -132,8 +132,10 @@ under `/.well-known/*` and `/oauth/*`.
 Add a Custom Connector pointing at `https://your-host/claude/mcp`. Claude runs
 the OAuth flow; you authorize once by pasting your `MEM0_CLAUDE_MCP_TOKEN` into
 the `/oauth/authorize` page, and the connector receives a derived, revocable
-token (not the master). After it registers, pin `MEM0_OAUTH_CLIENT_ID` and set
-`MEM0_OAUTH_ALLOW_REGISTRATION=false`.
+access token (not the master) **plus a refresh token**, so it renews silently
+instead of re-authorizing. After it registers, pin `MEM0_OAUTH_CLIENT_ID` and set
+`MEM0_OAUTH_ALLOW_REGISTRATION=false`. **Set `MEM0_STATE_DIR`** so tokens survive
+restarts — without it, every restart (e.g. a deploy) signs the connector out.
 
 ### Connecting ChatGPT
 
@@ -153,6 +155,8 @@ config file (see [config.example.yaml](config.example.yaml)). Highlights:
 | `MEM0_OPENAI_ALLOW_NOAUTH` | `true` to allow unauthenticated `/openai/mcp` (default `false`) |
 | `MEM0_OPENAI_ALLOW_WRITE` | expose `add_memory` + `delete` on `/openai/mcp` (default `false`). **Refuses to start** with `ALLOW_NOAUTH=true`, to avoid public write. |
 | `MEM0_OAUTH_CLIENT_ID` / `MEM0_OAUTH_ALLOW_REGISTRATION` | lock the OAuth shim to one known client |
+| `MEM0_STATE_DIR` | dir that persists OAuth tokens + MCP sessions across restarts (**set this to stay signed in**) |
+| `MEM0_OAUTH_ACCESS_TOKEN_TTL` / `MEM0_OAUTH_REFRESH_TOKEN_TTL` | access-token lifetime (default 5 days) / refresh-token lifetime (default `0` = non-expiring) |
 | `MEM0_DATASET_PATH` | curated JSONL enabling taxonomy routing + `fetch` bootstrap docs |
 
 Run `python app/server.py --help` for the full flag list.
@@ -161,8 +165,12 @@ Run `python app/server.py --help` for the full flag list.
 
 - **Default-closed.** `/openai/mcp` requires a bearer by default; the write tool
   is opt-in and cannot be combined with no-auth.
-- **OAuth tokens are derived & revocable** (resource-scoped, 30-day expiry),
-  held in memory — a restart invalidates them and clients re-authorize.
+- **OAuth tokens are derived & revocable.** The connector gets a short-lived,
+  resource-scoped access token (default 5 days) plus a **rotating refresh token**
+  (non-expiring by default, with reuse detection) so it renews silently. Set
+  `MEM0_STATE_DIR` to persist tokens across restarts — without it, a restart signs
+  connectors out. Revoking a *refresh* token via `/oauth/revoke` drops the whole
+  rotation family; revoking an access token removes just that token.
 - **Embedded vs server Qdrant.** Reads run concurrently only against a Qdrant
   *server*; an embedded on-disk store is auto-detected and serialized (it is not
   read-thread-safe).

@@ -277,6 +277,150 @@ def test_access_token_scope_resource_bound():
     assert provider.access_token_scope(token) is None
 
 
+def test_authorization_code_grant_returns_refresh_token():
+    """exchange_code on the authorization_code grant must include a refresh_token."""
+    provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    response, error = _exchange(provider)
+    assert error is None
+    assert response["access_token"] != "MASTER"
+    assert response["token_type"] == "Bearer"
+    assert "expires_in" in response
+    assert "refresh_token" in response
+    assert response["refresh_token"]  # non-empty string
+
+
+def test_metadata_advertises_refresh_token_grant():
+    """authorization_server_metadata must list 'refresh_token' in grant_types_supported."""
+    provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    meta = provider.authorization_server_metadata({"host": "mem0.example", "x-forwarded-proto": "https"})
+    assert "refresh_token" in meta["grant_types_supported"]
+
+
+def test_refresh_rotates_and_invalidates_old():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    _, refresh = p.issue_token_pair(client_id="c", scope="mcp")
+    resp, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    assert err is None and resp["access_token"] and resp["refresh_token"] != refresh
+    _again, err2 = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    assert err2 is not None and err2[1] == "invalid_grant"  # rotated token rejected
+
+
+def test_refresh_reuse_revokes_family():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    _, refresh = p.issue_token_pair(client_id="c", scope="mcp")
+    resp, _ = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    new_access, new_refresh = resp["access_token"], resp["refresh_token"]
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})  # replay consumed token
+    assert err[1] == "invalid_grant"
+    # family revoked: the rotated-forward tokens are dead too
+    _, err2 = p.exchange_code({"grant_type": "refresh_token", "refresh_token": new_refresh})
+    assert err2[1] == "invalid_grant"
+    assert p.verify_access_token(new_access) is False
+
+
+def test_refresh_reuse_after_grace_is_plain_invalid_grant():
+    # Documented trade-off: once a consumed token ages past REFRESH_REUSE_GRACE it
+    # is pruned, so a later replay reads as an unknown token (invalid_grant) rather
+    # than triggering family revocation — and the live successor keeps working.
+    from oauth import REFRESH_REUSE_GRACE
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    _, refresh = p.issue_token_pair(client_id="c", scope="mcp")
+    resp, _ = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})  # consumes `refresh`
+    live = resp["refresh_token"]
+    p._refresh_tokens[refresh].created_at = time.time() - REFRESH_REUSE_GRACE - 1  # age past grace
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    assert err is not None and err[1] == "invalid_grant"
+    resp2, err2 = p.exchange_code({"grant_type": "refresh_token", "refresh_token": live})
+    assert err2 is None and resp2["refresh_token"] != live  # family NOT revoked; successor still rotates
+
+
+def test_unknown_refresh_token_invalid_grant():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": "nope"})
+    assert err[1] == "invalid_grant"
+
+
+def test_refresh_rejects_wrong_client_when_pinned():
+    # With fixed_client_id set, a refresh carrying a mismatched client_id is rejected.
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", fixed_client_id="right")
+    _, refresh = p.issue_token_pair(client_id="right", scope="mcp")
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh, "client_id": "wrong"})
+    assert err is not None and err[1] == "invalid_client"
+    resp, ok_err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh, "client_id": "right"})
+    assert ok_err is None and resp["refresh_token"] != refresh  # correct client still rotates
+
+
+def test_refresh_accepts_any_client_when_not_pinned():
+    # No fixed_client_id => the client_id on a refresh request is not enforced.
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    _, refresh = p.issue_token_pair(client_id="right", scope="mcp")
+    resp, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh, "client_id": "anything"})
+    assert err is None and resp["refresh_token"] != refresh
+
+
+def test_refresh_expired_invalid_grant():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", refresh_token_ttl=1)
+    _, refresh = p.issue_token_pair(client_id="c", scope="mcp")
+    p._refresh_tokens[refresh].expires_at = time.time() - 1  # backdate past expiry
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    assert err is not None and err[1] == "invalid_grant"
+
+
+def test_revoke_refresh_kills_family_access():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    access, refresh = p.issue_token_pair(client_id="c", scope="mcp")
+    assert p.verify_access_token(access) is True
+    assert p.revoke_token(refresh) is True
+    assert p.verify_access_token(access) is False  # RFC 7009: family access dropped
+
+
+def test_revoke_access_token_still_works():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    access, _ = p.issue_token_pair(client_id="c", scope="mcp")
+    assert p.revoke_token(access) is True
+    assert p.verify_access_token(access) is False
+
+
+def test_revoke_token_handles_empty_and_unknown():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    assert p.revoke_token(None) is False
+    assert p.revoke_token("") is False
+    assert p.revoke_token("   ") is False
+    assert p.revoke_token("never-issued") is False
+
+
+def test_refresh_token_survives_restart(tmp_path):
+    """A refresh token issued by one OAuthProvider survives a simulated restart
+    and can still be used to rotate on the reloaded instance."""
+    rt_store_path = str(tmp_path / "refresh_tokens.json")
+    at_store_path = str(tmp_path / "access_tokens.json")
+    rt_store = JsonFileStore(rt_store_path)
+    at_store = JsonFileStore(at_store_path)
+
+    p1 = OAuthProvider(
+        master_token="MASTER", mcp_resource_path="/claude/mcp",
+        token_store=at_store, refresh_token_store=rt_store,
+    )
+    _access, refresh = p1.issue_token_pair(client_id="c", scope="mcp")
+
+    # Simulate a restart: fresh instance backed by the SAME store files
+    p2 = OAuthProvider(
+        master_token="MASTER", mcp_resource_path="/claude/mcp",
+        token_store=at_store, refresh_token_store=rt_store,
+    )
+    resp, err = p2.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    assert err is None, f"expected rotation to succeed after restart but got {err}"
+    assert resp["refresh_token"] != refresh  # token rotated as expected
+    assert resp["access_token"]
+
+
+def test_proxy_settings_access_token_ttl_default():
+    """ProxySettings.oauth_access_token_ttl must default to 432000 (5 days)."""
+    from server import ProxySettings
+    assert ProxySettings().oauth_access_token_ttl == 432000
+    assert ProxySettings().oauth_refresh_token_ttl == 0
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
