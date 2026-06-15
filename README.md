@@ -97,12 +97,12 @@ The Mem0 library brand (prose, links, `config.yaml` library keys) is unchanged; 
 
 | Endpoint | For | Auth | Tools |
 |----------|-----|------|-------|
-| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `reliquary_capabilities`, `reliquary_status`, `reliquary_search`, `reliquary_fetch`, `reliquary_add_memory`, `reliquary_update`, `reliquary_delete`, `propose_update`, `reliquary_compile_page`, `reliquary_list_pages`, `reliquary_page_history`, `list_domains`, `add_image`, `fetch_image`, `delete_image`, `create_image_upload`, `commit_image_upload` |
+| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `reliquary_capabilities`, `reliquary_status`, `reliquary_search`, `reliquary_fetch`, `reliquary_add_memory`, `reliquary_update`, `reliquary_delete`, `reliquary_propose_update`, `reliquary_compile_page`, `reliquary_list_pages`, `reliquary_page_history`, `reliquary_list_domains`, `reliquary_add_image`, `reliquary_fetch_image`, `reliquary_delete_image`, `reliquary_create_image_upload`, `reliquary_commit_image_upload` |
 | `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `capabilities`, `search`, `fetch`, `fetch_image` (lean snippet shape); write tools `add_memory`, `update`, `delete`, `add_image`, `delete_image`, `propose_update`, and the image-upload flow if `RELIQUARY_OPENAI_ALLOW_WRITE=true` |
 
-**Binary blobs.** `add_image` stores a file (base64) plus a searchable caption;
+**Binary blobs.** `reliquary_add_image` stores a file (base64) plus a searchable caption;
 it returns a `blob_id`, a `memory_id`, and a signed `url`. Find images later with
-`reliquary_search` on the caption or `fetch_image` by `blob_id`; `delete_image` removes
+`reliquary_search` on the caption or `reliquary_fetch_image` by `blob_id`; `reliquary_delete_image` removes
 the caption memory and ref-counted blob. Files live under `BLOB_HOST_DIR` on the
 host (default `./data/blobs`) so you can browse and back them up. `GET /blobs/{id}`
 serves bytes to anyone holding a valid signed URL or the Claude bearer.
@@ -130,7 +130,7 @@ default, but a coding agent can opt into light, *soft* project-awareness. Pass a
 toward that repo's memory (room match) and dev-domain memory, with **no change** when
 context is absent. Call `reliquary_capabilities` (`capabilities` on the lean endpoint)
 first for orientation. Imported corpus records stay read-only; to correct one,
-`propose_update` files a linked `kind=correction` record (the import is never
+`reliquary_propose_update` files a linked `kind=correction` record (the import is never
 mutated), and rejection messages point you there. `reliquary://sources` reports
 provenance — where each memory came from. All of it is opt-in and soft: no session
 gating, no hard write-blocks.
