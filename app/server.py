@@ -692,8 +692,8 @@ class Mem0ChatProxy:
             return
 
         user_id = (
-            payload.get("mem0_user_id")
-            or request_headers.get("x-mem0-user-id")
+            payload.get("reliquary_user_id")
+            or request_headers.get("x-reliquary-user-id")
             or (query_string.get("user_id", [""])[0] if query_string.get("user_id") else "")
             or self.settings.user_id
         )
@@ -2972,16 +2972,16 @@ class Mem0ChatProxy:
             return
 
         original_messages = [message for message in messages if isinstance(message, dict)]
-        user_id = payload.pop("mem0_user_id", None) or request_headers.get("x-mem0-user-id") or self.settings.user_id
-        mem0_limit = self._coerce_int(
-            payload.pop("mem0_limit", self.settings.memory_limit),
+        user_id = payload.pop("reliquary_user_id", None) or request_headers.get("x-reliquary-user-id") or self.settings.user_id
+        reliquary_limit = self._coerce_int(
+            payload.pop("reliquary_limit", self.settings.memory_limit),
             default=self.settings.memory_limit,
             minimum=1,
             maximum=20,
         )
-        mem0_threshold = coerce_threshold(payload.pop("mem0_threshold", self.settings.memory_threshold))
-        mem0_query = payload.pop("mem0_query", None) or latest_user_text(original_messages)
-        mem0_disabled = bool(payload.pop("mem0_disable", False))
+        reliquary_threshold = coerce_threshold(payload.pop("reliquary_threshold", self.settings.memory_threshold))
+        reliquary_query = payload.pop("reliquary_query", None) or latest_user_text(original_messages)
+        reliquary_disabled = bool(payload.pop("reliquary_disable", False))
         stream = bool(payload.get("stream"))
 
         if not self.settings.upstream_base_url:
@@ -2989,24 +2989,24 @@ class Mem0ChatProxy:
             return
 
         memory_hits: list[dict[str, Any]] = []
-        if not mem0_disabled and mem0_query:
+        if not reliquary_disabled and reliquary_query:
             memory_hits = await self.search_memories(
-                mem0_query, user_id=user_id, limit=mem0_limit, threshold=mem0_threshold, filters=None
+                reliquary_query, user_id=user_id, limit=reliquary_limit, threshold=reliquary_threshold, filters=None
             )
 
         if memory_hits:
-            payload["messages"] = self.inject_memory_message(original_messages, mem0_query, memory_hits)
+            payload["messages"] = self.inject_memory_message(original_messages, reliquary_query, memory_hits)
         else:
             payload["messages"] = original_messages
 
         upstream_url = self.url_for(scope, self.settings.upstream_base_url)
         forward_headers = self.forward_headers(request_headers)
         extra_headers = {
-            "x-mem0-hit-count": str(len(memory_hits)),
-            "x-mem0-user-id": user_id,
+            "x-reliquary-hit-count": str(len(memory_hits)),
+            "x-reliquary-user-id": user_id,
         }
-        if mem0_query:
-            extra_headers["x-mem0-query"] = trim_text(mem0_query, 140)
+        if reliquary_query:
+            extra_headers["x-reliquary-query"] = trim_text(reliquary_query, 140)
 
         if stream:
             assistant_text = await self.stream_upstream_request(
@@ -3017,7 +3017,7 @@ class Mem0ChatProxy:
                 content=json_dumps(payload),
                 response_extra_headers=extra_headers,
             )
-            if self.settings.writeback and assistant_text and mem0_query:
+            if self.settings.writeback and assistant_text and reliquary_query:
                 await self.writeback_turn(
                     user_id=user_id,
                     user_text=latest_user_text(original_messages),
@@ -3042,7 +3042,7 @@ class Mem0ChatProxy:
         )
         await send({"type": "http.response.body", "body": response_body, "more_body": False})
 
-        if self.settings.writeback and response.is_success and mem0_query:
+        if self.settings.writeback and response.is_success and reliquary_query:
             try:
                 response_json = response.json()
             except json.JSONDecodeError:
@@ -3520,7 +3520,7 @@ class Mem0ChatProxy:
             return
 
         metadata = {
-            "source": "mem0_chat_proxy",
+            "source": "reliquary_chat_proxy",
             "kind": "live_chat_turn",
             "source_group": "user-write",
         }
