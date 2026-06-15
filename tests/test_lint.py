@@ -72,6 +72,20 @@ def test_main_json_output(tmp_path, capsys):
     assert {item["slug"] for item in parsed["stale_pages"]} == {"old"}
 
 
+def test_build_report_coverage_gaps_from_dataset(tmp_path):
+    # Exercises the dataset_path → CorpusCatalog → coverage_gaps integration path.
+    import json
+    dataset = tmp_path / "corpus.jsonl"
+    with dataset.open("w", encoding="utf-8") as fh:
+        for i in range(10):
+            fh.write(json.dumps({"id": f"r{i}", "text": "t",
+                                 "metadata": {"domain": "pagan", "title": "x"}}) + "\n")
+    compiled_dir, blob_dir = _dirs(tmp_path)  # no pagan synthesis page exists
+    report = lint.build_report(compiled_dir=compiled_dir, blob_dir=blob_dir,
+                               dataset_path=str(dataset), min_count=8)
+    assert "pagan" in {g["domain"] for g in report["coverage_gaps"]}
+
+
 def test_build_report_degrades_when_dirs_unwritable(tmp_path):
     # A cron-invoked lint must not crash when the compiled dirs can't be created
     # (e.g. the layer isn't set up on this host). It should return an empty report.

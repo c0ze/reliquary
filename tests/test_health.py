@@ -54,6 +54,11 @@ def test_coverage_gaps_respects_min_count():
     assert out == []  # below min_count
 
 
+def test_coverage_gaps_includes_exact_min_count():
+    out = health.coverage_gaps([], {"pagan": 8}, min_count=8)
+    assert {item["domain"] for item in out} == {"pagan"}  # boundary is inclusive (>=)
+
+
 def test_coverage_gaps_skips_domain_with_current_page():
     pages = [_page("p", domain="pagan", status="current")]
     out = health.coverage_gaps(pages, {"pagan": 50}, min_count=8)

@@ -66,7 +66,7 @@ def _fan_out_bulk(page_registry, touched_ids: set[str], touched_tax: set) -> Non
     """One-pass staleness fan-out after a bulk import (avoids O(records*pages))."""
     try:
         for page in page_registry.list(status="current"):
-            if (touched_ids & set(page.derived_from)) or (
+            if (touched_ids & set(page.derived_from or [])) or (
                 page.domain and page.topic and (page.domain, page.topic) in touched_tax
             ):
                 page_registry.set_status(page.slug, "stale")
@@ -323,6 +323,8 @@ def main() -> None:
     config = load_config(args.config)
     memory = Memory.from_config(config)
     page_registry = None
+    # Mirror the server's default-on behavior: an empty MEM0_COMPILED_COLLECTION
+    # disables the layer; unset uses the same default the server uses.
     if os.getenv("MEM0_COMPILED_COLLECTION", "reliquary_compiled"):
         try:
             from blobs import BlobStore
