@@ -284,7 +284,7 @@ def test_page_history_disabled_layer(make_proxy):
 def test_compile_page_via_call_mcp_tool_with_write(proxy):
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     result = run(proxy.call_mcp_tool(
-        profile, "mem0_compile_page",
+        profile, "reliquary_compile_page",
         {"markdown": "Hello synthesis", "slug": "dispatch-test"},
         can_write=True,
     ))
@@ -295,7 +295,7 @@ def test_compile_page_via_call_mcp_tool_with_write(proxy):
 def test_compile_page_via_call_mcp_tool_without_write(proxy):
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     result = run(proxy.call_mcp_tool(
-        profile, "mem0_compile_page",
+        profile, "reliquary_compile_page",
         {"markdown": "Hello synthesis", "slug": "dispatch-test"},
         can_write=False,
     ))
@@ -306,7 +306,7 @@ def test_compile_page_via_call_mcp_tool_without_write(proxy):
 def test_list_pages_via_call_mcp_tool(proxy):
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     result = run(proxy.call_mcp_tool(
-        profile, "mem0_list_pages", {}, can_write=False,
+        profile, "reliquary_list_pages", {}, can_write=False,
     ))
     assert result.get("isError") is not True
     assert "pages" in result["structuredContent"]
@@ -316,12 +316,12 @@ def test_page_history_via_call_mcp_tool(proxy):
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     # File a page first
     run(proxy.call_mcp_tool(
-        profile, "mem0_compile_page",
+        profile, "reliquary_compile_page",
         {"markdown": "Content", "slug": "mcp-history-test"},
         can_write=True,
     ))
     result = run(proxy.call_mcp_tool(
-        profile, "mem0_page_history",
+        profile, "reliquary_page_history",
         {"slug": "mcp-history-test"},
         can_write=False,
     ))
@@ -333,19 +333,19 @@ def test_mcp_tools_for_claude_read_includes_list_and_history(proxy):
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     tools = proxy.mcp_tools_for(profile, can_write=False)
     names = {t["name"] for t in tools}
-    assert "mem0_list_pages" in names
-    assert "mem0_page_history" in names
+    assert "reliquary_list_pages" in names
+    assert "reliquary_page_history" in names
     # compile_page must NOT appear in read-only list
-    assert "mem0_compile_page" not in names
+    assert "reliquary_compile_page" not in names
 
 
 def test_mcp_tools_for_claude_write_includes_compile_page(proxy):
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     tools = proxy.mcp_tools_for(profile, can_write=True)
     names = {t["name"] for t in tools}
-    assert "mem0_compile_page" in names
-    assert "mem0_list_pages" in names
-    assert "mem0_page_history" in names
+    assert "reliquary_compile_page" in names
+    assert "reliquary_list_pages" in names
+    assert "reliquary_page_history" in names
 
 
 def test_new_tools_not_on_openai_endpoint(proxy):
@@ -354,9 +354,9 @@ def test_new_tools_not_on_openai_endpoint(proxy):
     for can_write in (False, True):
         tools = proxy.mcp_tools_for(profile, can_write=can_write)
         names = {t["name"] for t in tools}
-        assert "mem0_compile_page" not in names
-        assert "mem0_list_pages" not in names
-        assert "mem0_page_history" not in names
+        assert "reliquary_compile_page" not in names
+        assert "reliquary_list_pages" not in names
+        assert "reliquary_page_history" not in names
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +373,7 @@ def test_mem0_fetch_compiled_page(proxy):
     }))
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     result = run(proxy.call_mcp_tool(
-        profile, "mem0_fetch", {"id": "fetch-me"}, can_write=False,
+        profile, "reliquary_fetch", {"id": "fetch-me"}, can_write=False,
     ))
     assert result.get("isError") is not True
     sc = result["structuredContent"]
@@ -416,7 +416,7 @@ def test_mem0_fetch_rejects_path_traversal_id(proxy):
 
 def _claude_search(proxy, query, limit=5):
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
-    return run(proxy.call_mcp_tool(profile, "mem0_search", {"query": query, "limit": limit}, can_write=False))
+    return run(proxy.call_mcp_tool(profile, "reliquary_search", {"query": query, "limit": limit}, can_write=False))
 
 
 def test_current_synthesis_leads_results(proxy):
@@ -443,7 +443,7 @@ def test_search_unaffected_when_compiled_disabled(make_proxy):
     proxy = make_proxy(compiled_collection="")
     run(proxy.handle_add_memory_tool({"text": "plain raw memory about brigid"}))
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
-    sc = run(proxy.call_mcp_tool(profile, "mem0_search", {"query": "brigid"}, can_write=False))["structuredContent"]
+    sc = run(proxy.call_mcp_tool(profile, "reliquary_search", {"query": "brigid"}, can_write=False))["structuredContent"]
     kinds = [(r.get("metadata") or {}).get("kind") for r in sc["results"]]
     assert "synthesis" not in kinds  # no compiled layer => no synthesis hits, no crash
 
@@ -455,7 +455,7 @@ def test_synthesis_leads_beyond_first_page(proxy):
         _file_page(proxy, f"page-{i}", markdown=f"synthesis number {i}")
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     page2 = run(proxy.call_mcp_tool(
-        profile, "mem0_search", {"query": "synthesis", "limit": 5, "cursor": 5}, can_write=False,
+        profile, "reliquary_search", {"query": "synthesis", "limit": 5, "cursor": 5}, can_write=False,
     ))["structuredContent"]
     kinds = [(r.get("metadata") or {}).get("kind") for r in page2["results"]]
     assert "synthesis" in kinds  # the 6th current synthesis must surface on page 2

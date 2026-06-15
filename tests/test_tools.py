@@ -199,20 +199,33 @@ def test_proxy_has_metrics_audit_limiters(proxy):
 
 def test_tool_category_writes():
     from server import Mem0ChatProxy
-    for tool in ("mem0_add_memory", "add_memory", "mem0_delete", "delete",
-                 "mem0_update", "update", "add_image", "delete_image"):
+    # Claude endpoint (reliquary_*) names
+    for tool in ("reliquary_add_memory", "reliquary_delete", "reliquary_update",
+                 "reliquary_add_image", "reliquary_delete_image",
+                 "reliquary_create_image_upload", "reliquary_commit_image_upload",
+                 "reliquary_compile_page", "reliquary_propose_update"):
+        assert Mem0ChatProxy._tool_category(tool) == "write", f"expected write for {tool}"
+    # OpenAI lean endpoint (bare) names — carve-out preserved
+    for tool in ("add_memory", "delete", "update", "add_image", "delete_image",
+                 "create_image_upload", "commit_image_upload", "propose_update"):
         assert Mem0ChatProxy._tool_category(tool) == "write", f"expected write for {tool}"
 
 
 def test_tool_category_reads():
     from server import Mem0ChatProxy
-    for tool in ("mem0_search", "search", "mem0_fetch", "fetch", "fetch_image", "list_domains"):
+    # Claude endpoint (reliquary_*) names
+    for tool in ("reliquary_search", "reliquary_fetch", "reliquary_fetch_image",
+                 "reliquary_list_domains", "reliquary_list_pages", "reliquary_page_history",
+                 "reliquary_capabilities"):
+        assert Mem0ChatProxy._tool_category(tool) == "read", f"expected read for {tool}"
+    # OpenAI lean endpoint (bare) names — carve-out preserved
+    for tool in ("search", "fetch", "fetch_image", "list_domains", "capabilities"):
         assert Mem0ChatProxy._tool_category(tool) == "read", f"expected read for {tool}"
 
 
 def test_tool_category_other():
     from server import Mem0ChatProxy
-    assert Mem0ChatProxy._tool_category("mem0_status") == "other"
+    assert Mem0ChatProxy._tool_category("reliquary_status") == "other"
     assert Mem0ChatProxy._tool_category("unknown_tool") == "other"
 
 
@@ -307,7 +320,7 @@ def test_exact_marker_ranks_first_across_routes(proxy, fake_memory):
     proxy.catalog = cat
 
     claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
-    res = run(proxy.call_mcp_tool(claude, "mem0_search", {"query": marker, "limit": 5}, can_write=False))
+    res = run(proxy.call_mcp_tool(claude, "reliquary_search", {"query": marker, "limit": 5}, can_write=False))
     results = res["structuredContent"]["results"]
     assert results, "expected search results"
     top = results[0]

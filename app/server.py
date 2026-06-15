@@ -924,12 +924,25 @@ class Mem0ChatProxy:
 
     @staticmethod
     def _tool_category(tool_name: str) -> str:
-        writes = {"mem0_add_memory", "add_memory", "mem0_delete", "delete",
-                  "mem0_update", "update", "add_image", "delete_image",
-                  "create_image_upload", "commit_image_upload", "mem0_compile_page",
-                  "propose_update"}
-        reads = {"mem0_search", "search", "mem0_fetch", "fetch", "fetch_image", "list_domains",
-                 "mem0_list_pages", "mem0_page_history", "mem0_capabilities", "capabilities"}
+        # Claude endpoint names (reliquary_*) + OpenAI lean endpoint names (bare).
+        writes = {
+            # Claude
+            "reliquary_add_memory", "reliquary_delete", "reliquary_update",
+            "reliquary_add_image", "reliquary_delete_image",
+            "reliquary_create_image_upload", "reliquary_commit_image_upload",
+            "reliquary_compile_page", "reliquary_propose_update",
+            # OpenAI lean endpoint (carve-out — must stay bare)
+            "add_memory", "delete", "update", "add_image", "delete_image",
+            "create_image_upload", "commit_image_upload", "propose_update",
+        }
+        reads = {
+            # Claude
+            "reliquary_search", "reliquary_fetch", "reliquary_fetch_image",
+            "reliquary_list_domains", "reliquary_list_pages", "reliquary_page_history",
+            "reliquary_capabilities",
+            # OpenAI lean endpoint (carve-out — must stay bare)
+            "search", "fetch", "fetch_image", "list_domains", "capabilities",
+        }
         if tool_name in writes:
             return "write"
         if tool_name in reads:
@@ -1385,14 +1398,14 @@ class Mem0ChatProxy:
 
         claude_tools = [
             {
-                "name": "mem0_status",
+                "name": "reliquary_status",
                 "title": "Mem0 Status",
                 "description": "Inspect the local Mem0 store, endpoints, and approximate memory count.",
                 "annotations": read_only,
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             },
             {
-                "name": "mem0_search",
+                "name": "reliquary_search",
                 "title": "Mem0 Search",
                 "description": "Search the Mem0 store with optional domain/hall/room-aware routing." + routing_hint,
                 "annotations": read_only,
@@ -1414,53 +1427,53 @@ class Mem0ChatProxy:
                 },
             },
             {
-                "name": "mem0_fetch",
+                "name": "reliquary_fetch",
                 "title": "Mem0 Fetch",
                 "description": "Fetch the full document behind a search result by id.",
                 "annotations": read_only,
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"id": {"type": "string", "description": "Document id returned by mem0_search."}},
+                    "properties": {"id": {"type": "string", "description": "Document id returned by reliquary_search."}},
                     "required": ["id"],
                     "additionalProperties": False,
                 },
             },
             {
-                "name": "list_domains",
+                "name": "reliquary_list_domains",
                 "title": "List Domains",
                 "description": "List the routeable retrieval domains available for filtering search.",
                 "annotations": {"readOnlyHint": True, "openWorldHint": False},
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             },
             {
-                "name": "fetch_image",
+                "name": "reliquary_fetch_image",
                 "title": "Fetch Image",
                 "description": "Fetch a stored binary file by blob_id. Returns the image inline plus a "
                 "signed url for direct download of large files.",
                 "annotations": {"readOnlyHint": True, "openWorldHint": False},
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"id": {"type": "string", "description": "blob_id from add_image or mem0_search."}},
+                    "properties": {"id": {"type": "string", "description": "blob_id from reliquary_add_image or reliquary_search."}},
                     "required": ["id"],
                     "additionalProperties": False,
                 },
             },
             {
-                "name": "mem0_list_pages",
+                "name": "reliquary_list_pages",
                 "title": "List Synthesis Pages",
                 "description": "List compiled synthesis pages, optionally filtered by domain and/or status.",
                 "annotations": read_only,
                 "inputSchema": {"type": "object", "properties": {"domain": {"type": "string"}, "status": {"type": "string"}}, "additionalProperties": False},
             },
             {
-                "name": "mem0_page_history",
+                "name": "reliquary_page_history",
                 "title": "Synthesis Page History",
                 "description": "List the revision history (blob ids) of a compiled page by slug.",
                 "annotations": read_only,
                 "inputSchema": {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"], "additionalProperties": False},
             },
             {
-                "name": "mem0_capabilities",
+                "name": "reliquary_capabilities",
                 "title": "Capabilities",
                 "description": "Orient yourself: what Reliquary is, the tools available, read/write and protection rules, taxonomy, and how to supply project context. Call this first.",
                 "annotations": {"readOnlyHint": True, "openWorldHint": False},
@@ -1470,7 +1483,7 @@ class Mem0ChatProxy:
         if can_write:
             claude_tools.extend([
                 {
-                    "name": "mem0_add_memory",
+                    "name": "reliquary_add_memory",
                     "title": "Mem0 Add Memory",
                     "description": "Store a new memory in the local Mem0 collection.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
@@ -1495,9 +1508,9 @@ class Mem0ChatProxy:
                     },
                 },
                 {
-                    "name": "mem0_delete",
+                    "name": "reliquary_delete",
                     "title": "Mem0 Delete Memory",
-                    "description": "Delete a memory previously stored via mem0_add_memory, by id. "
+                    "description": "Delete a memory previously stored via reliquary_add_memory, by id. "
                     "Only user-written memories can be deleted; imported corpus records are protected.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
                     "inputSchema": {
@@ -1511,16 +1524,16 @@ class Mem0ChatProxy:
                     },
                 },
                 {
-                    "name": "mem0_update",
+                    "name": "reliquary_update",
                     "title": "Mem0 Update Memory",
                     "description": "Update the text (and optionally merge metadata) of a memory you previously "
-                    "stored via mem0_add_memory, by id. Only user-written memories can be updated; imported "
+                    "stored via reliquary_add_memory, by id. Only user-written memories can be updated; imported "
                     "corpus records are protected.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Memory id from mem0_search or mem0_add_memory."},
+                            "id": {"type": "string", "description": "Memory id from reliquary_search or reliquary_add_memory."},
                             "text": {"type": "string", "description": "The new memory text."},
                             "metadata": {"type": "object", "description": "Optional metadata fields to merge into the record."},
                             "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
@@ -1530,12 +1543,12 @@ class Mem0ChatProxy:
                     },
                 },
                 {
-                    "name": "add_image",
+                    "name": "reliquary_add_image",
                     "title": "Add Image",
                     "description": "Store a binary file (usually an image) and a searchable caption. "
                     "Provide image_base64 OR source_url (not both). "
-                    "Returns blob_id, memory_id and a signed url. Find it later via mem0_search on the "
-                    "caption, or fetch_image with the blob_id.",
+                    "Returns blob_id, memory_id and a signed url. Find it later via reliquary_search on the "
+                    "caption, or reliquary_fetch_image with the blob_id.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
                     "inputSchema": {
                         "type": "object",
@@ -1557,9 +1570,9 @@ class Mem0ChatProxy:
                     },
                 },
                 {
-                    "name": "delete_image",
+                    "name": "reliquary_delete_image",
                     "title": "Delete Image",
-                    "description": "Delete an image you stored via add_image, by its memory_id. Removes the "
+                    "description": "Delete an image you stored via reliquary_add_image, by its memory_id. Removes the "
                     "caption memory and unlinks the blob when no other memory references it.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
                     "inputSchema": {
@@ -1572,9 +1585,50 @@ class Mem0ChatProxy:
                         "additionalProperties": False,
                     },
                 },
-                *self._upload_flow_tools(),
                 {
-                    "name": "mem0_compile_page",
+                    "name": "reliquary_create_image_upload",
+                    "title": "Create Image Upload",
+                    "description": "Create a short-lived, one-time HTTP upload slot for raw image bytes. "
+                    "Use this instead of reliquary_add_image.image_base64 when you have local binary bytes and can "
+                    "make HTTP requests. POST the raw bytes to the returned upload_url, sending the SAME "
+                    "`Authorization: Bearer` token you use for this MCP endpoint (anonymous uploads are "
+                    "rejected with 401), then call reliquary_commit_image_upload with the upload_id and caption.",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "mimetype": {"type": "string", "description": "Expected content type, e.g. image/png."},
+                            "size": {"type": "integer", "minimum": 1, "description": "Expected byte size, if known."},
+                            "filename": {"type": "string", "description": "Optional client filename for display/debugging."},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "reliquary_commit_image_upload",
+                    "title": "Commit Image Upload",
+                    "description": "Finalize a successful reliquary_create_image_upload + HTTP POST by creating the "
+                    "searchable image caption memory. Returns the same blob_id, memory_id and signed url "
+                    "shape as reliquary_add_image.",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "upload_id": {"type": "string", "description": "upload_id returned by reliquary_create_image_upload."},
+                            "caption": {"type": "string", "description": "Searchable text describing the image."},
+                            "title": {"type": "string"},
+                            "domain": {"type": "string"},
+                            "hall": {"type": "string"},
+                            "room": {"type": "string"},
+                            "topic": {"type": "string"},
+                            "metadata": {"type": "object", "description": "Extra metadata fields to merge into the record."},
+                        },
+                        "required": ["upload_id", "caption"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "reliquary_compile_page",
                     "title": "Compile Synthesis Page",
                     "description": "File a synthesized, human-readable page into the compiled layer. YOU author the "
                     "markdown (Reliquary never generates prose); it is versioned, indexed for recall, and linked to its "
@@ -1596,7 +1650,7 @@ class Mem0ChatProxy:
                     },
                 },
                 {
-                    "name": "propose_update",
+                    "name": "reliquary_propose_update",
                     "title": "Propose Correction",
                     "description": "File a correction for a protected/imported record without mutating it. Stores a linked user-write record (kind=correction, status=proposed).",
                     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
@@ -1675,9 +1729,9 @@ class Mem0ChatProxy:
                     is_error=True,
                 )
 
-            if tool_name == "mem0_capabilities":
+            if tool_name == "reliquary_capabilities":
                 return self.handle_capabilities_tool(profile, context=context, can_write=can_write)
-            if tool_name == "mem0_status":
+            if tool_name == "reliquary_status":
                 status = {
                     "user_id": self.settings.user_id,
                     "approx_memory_count": await self.get_memory_count(),
@@ -1691,57 +1745,57 @@ class Mem0ChatProxy:
                     text=f"Mem0 is available. Approximate memory count: {status['approx_memory_count']}.",
                     structured=status,
                 )
-            if tool_name == "list_domains":
+            if tool_name == "reliquary_list_domains":
                 domains = self.catalog.routeable_domains if self.catalog else []
                 return self.mcp_tool_result(
                     text=f"{len(domains)} routeable domain(s): {', '.join(domains) or '(none)'}",
                     structured={"domains": domains},
                 )
-            if tool_name == "mem0_search":
+            if tool_name == "reliquary_search":
                 return await self.handle_search_tool(arguments, context=context)
-            if tool_name == "mem0_fetch":
+            if tool_name == "reliquary_fetch":
                 return await self.handle_fetch_tool(arguments)
-            if tool_name == "mem0_list_pages":
+            if tool_name == "reliquary_list_pages":
                 return await self.handle_list_pages_tool(arguments)
-            if tool_name == "mem0_page_history":
+            if tool_name == "reliquary_page_history":
                 return await self.handle_page_history_tool(arguments)
-            if tool_name == "fetch_image":
+            if tool_name == "reliquary_fetch_image":
                 return await self.handle_fetch_image_tool(arguments)
-            if tool_name == "mem0_add_memory":
+            if tool_name == "reliquary_add_memory":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_add_memory_tool(arguments)
-            if tool_name == "mem0_delete":
+            if tool_name == "reliquary_delete":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_delete_tool(arguments, allow_user_id=True)
-            if tool_name == "mem0_update":
+            if tool_name == "reliquary_update":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_update_tool(arguments, allow_user_id=True)
-            if tool_name == "mem0_compile_page":
+            if tool_name == "reliquary_compile_page":
                 if not can_write:
                     return self._scope_error(tool_name)
                 # Pages are a single global registry keyed by slug (not namespaced by
                 # user_id), so file them under the server user only — never a caller id.
                 return await self.handle_compile_page_tool(arguments, allow_user_id=False)
-            if tool_name == "add_image":
+            if tool_name == "reliquary_add_image":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_add_image_tool(arguments)
-            if tool_name == "delete_image":
+            if tool_name == "reliquary_delete_image":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_delete_image_tool(arguments, allow_user_id=True)
-            if tool_name == "create_image_upload":
+            if tool_name == "reliquary_create_image_upload":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return self.handle_create_image_upload_tool(arguments, profile=profile)
-            if tool_name == "commit_image_upload":
+            if tool_name == "reliquary_commit_image_upload":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_commit_image_upload_tool(arguments, allow_user_id=True, profile=profile)
-            if tool_name == "propose_update":
+            if tool_name == "reliquary_propose_update":
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_propose_update_tool(arguments, allow_user_id=True)
@@ -1765,7 +1819,7 @@ class Mem0ChatProxy:
         *,
         allow_threshold: bool = True,
         allow_user_id: bool = True,
-        fetch_tool_name: str = "mem0_fetch",
+        fetch_tool_name: str = "reliquary_fetch",
         body_char_cap: int = SEARCH_PREVIEW_CHAR_CAP,
         lean_results: bool = False,
         context=None,

@@ -56,13 +56,28 @@ def test_list_domains_tool(proxy):
     claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     openai = proxy.endpoint_profiles[proxy.settings.openai_mcp_path]
 
-    res = run(proxy.call_mcp_tool(claude, "list_domains", {}, can_write=False))
+    res = run(proxy.call_mcp_tool(claude, "reliquary_list_domains", {}, can_write=False))
     openai_res = run(proxy.call_mcp_tool(openai, "list_domains", {}, can_write=False))
 
     assert res["structuredContent"]["domains"] == ["pagan", "7thshadow"]
     assert res["isError"] is False
     assert openai_res["structuredContent"]["domains"] == ["pagan", "7thshadow"]
     assert openai_res["isError"] is False
+
+
+def test_claude_tools_all_reliquary_prefixed(proxy):
+    claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    names = [t["name"] for t in proxy.mcp_tools_for(claude, can_write=True)]
+    assert names, "expected a non-empty Claude tool list"
+    offenders = [n for n in names if not n.startswith("reliquary_")]
+    assert offenders == [], f"non-reliquary tool names on Claude endpoint: {offenders}"
+
+
+def test_openai_endpoint_keeps_search_and_fetch(proxy):
+    openai = proxy.endpoint_profiles[proxy.settings.openai_mcp_path]
+    names = [t["name"] for t in proxy.mcp_tools_for(openai, can_write=True)]
+    assert "search" in names and "fetch" in names, names
+    assert not any(n.startswith("reliquary_") for n in names), names
 
 
 def test_search_pagination(proxy, monkeypatch):
@@ -84,14 +99,14 @@ def test_search_pagination(proxy, monkeypatch):
     monkeypatch.setattr(proxy, "search_memories", fake_search_memories)
     claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
 
-    page1 = run(proxy.call_mcp_tool(claude, "mem0_search", {"query": "memory", "limit": 2}, can_write=False))
+    page1 = run(proxy.call_mcp_tool(claude, "reliquary_search", {"query": "memory", "limit": 2}, can_write=False))
     s1 = page1["structuredContent"]
     assert s1.get("nextCursor") == "2"
 
     page2 = run(
         proxy.call_mcp_tool(
             claude,
-            "mem0_search",
+            "reliquary_search",
             {"query": "memory", "limit": 2, "cursor": "2"},
             can_write=False,
         )
