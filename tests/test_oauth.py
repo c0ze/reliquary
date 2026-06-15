@@ -296,6 +296,34 @@ def test_metadata_advertises_refresh_token_grant():
     assert "refresh_token" in meta["grant_types_supported"]
 
 
+def test_refresh_rotates_and_invalidates_old():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    _, refresh = p.issue_token_pair(client_id="c", scope="mcp")
+    resp, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    assert err is None and resp["access_token"] and resp["refresh_token"] != refresh
+    again, err2 = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    assert err2 is not None and err2[1] == "invalid_grant"  # rotated token rejected
+
+
+def test_refresh_reuse_revokes_family():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    _, refresh = p.issue_token_pair(client_id="c", scope="mcp")
+    resp, _ = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    new_access, new_refresh = resp["access_token"], resp["refresh_token"]
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})  # replay consumed token
+    assert err[1] == "invalid_grant"
+    # family revoked: the rotated-forward tokens are dead too
+    _, err2 = p.exchange_code({"grant_type": "refresh_token", "refresh_token": new_refresh})
+    assert err2[1] == "invalid_grant"
+    assert p.verify_access_token(new_access) is False
+
+
+def test_unknown_refresh_token_invalid_grant():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": "nope"})
+    assert err[1] == "invalid_grant"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -244,6 +244,8 @@ class OAuthProvider:
         self, form: dict[str, str]
     ) -> tuple[dict[str, Any] | None, tuple[int, str, str] | None]:
         self._prune()
+        if form.get("grant_type") == "refresh_token":
+            return self._exchange_refresh_token(form)
         grant_type = form.get("grant_type")
         if grant_type != "authorization_code":
             return None, (400, "unsupported_grant_type", f"grant_type {grant_type!r} is not supported")
@@ -358,6 +360,48 @@ class OAuthProvider:
         # something actually expired, so the common path stays write-free.
         if expired:
             self._persist_access_tokens()
+
+    def _exchange_refresh_token(self, form):
+        presented = (form.get("refresh_token") or "").strip()
+        if not presented:
+            return None, (400, "invalid_request", "refresh_token is required")
+        if self.fixed_client_id is not None and not self.verify_client_id(form.get("client_id") or None):
+            return None, (400, "invalid_client", "client_id does not match the configured OAuth client")
+        self._prune_refresh_tokens()
+        entry = self._refresh_tokens.get(presented)
+        if entry is None or (entry.expires_at is not None and entry.expires_at < time.time()):
+            return None, (400, "invalid_grant", "invalid or expired refresh token")
+        if entry.consumed:
+            self._revoke_family(entry.family_id)  # replay of a rotated token => theft; kill the family
+            return None, (400, "invalid_grant", "refresh token reuse detected; session revoked")
+        entry.consumed = True
+        access_token, refresh_token = self.issue_token_pair(
+            client_id=entry.client_id, scope=entry.scope, resource=entry.resource, family_id=entry.family_id,
+        )
+        self._persist_refresh_tokens()
+        return (
+            {"access_token": access_token, "token_type": "Bearer",
+             "expires_in": int(self.access_token_ttl), "refresh_token": refresh_token, "scope": entry.scope},
+            None,
+        )
+
+    def _revoke_family(self, family_id: str) -> None:
+        self._refresh_tokens = {t: e for t, e in self._refresh_tokens.items() if e.family_id != family_id}
+        self._access_tokens = {t: e for t, e in self._access_tokens.items() if e.family_id != family_id}
+        self._persist_refresh_tokens()
+        self._persist_access_tokens()
+
+    def _prune_refresh_tokens(self) -> None:
+        now = time.time()
+        drop = [
+            t for t, e in self._refresh_tokens.items()
+            if (e.expires_at is not None and e.expires_at < now)
+            or (e.consumed and e.created_at + REFRESH_REUSE_GRACE < now)
+        ]
+        for t in drop:
+            self._refresh_tokens.pop(t, None)
+        if drop:
+            self._persist_refresh_tokens()
 
     def _load_access_tokens(self) -> None:
         now = time.time()
