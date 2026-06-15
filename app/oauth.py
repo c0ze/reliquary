@@ -387,13 +387,14 @@ class OAuthProvider:
 
     def _issue_refresh_token(self, *, client_id: str, scope: str, resource: str | None, family_id: str) -> str:
         token = secrets.token_urlsafe(32)
-        expires_at = (time.time() + self.refresh_token_ttl) if self.refresh_token_ttl else None
+        now = time.time()
+        expires_at = (now + self.refresh_token_ttl) if self.refresh_token_ttl else None
         self._refresh_tokens[token] = RefreshToken(
             client_id=client_id,
             scope=scope,
             resource=(resource or "").strip() or None,
             family_id=family_id,
-            created_at=time.time(),
+            created_at=now,
             expires_at=expires_at,
         )
         self._persist_refresh_tokens()
