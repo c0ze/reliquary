@@ -1043,10 +1043,13 @@ class Mem0ChatProxy:
                 src = str(md.get("source") or md.get("source_url") or md.get("source_ref") or "(unknown)")
                 key = (group, src)
                 entry = groups.setdefault(key, {"source_group": group, "source": src, "count": 0,
-                                                 "private": bool(md.get("private")), "sample_refs": []})
+                                                 "private": False, "sample_refs": []})
                 entry["count"] += 1
-                if md.get("source_ref") and len(entry["sample_refs"]) < 3:
-                    entry["sample_refs"].append(str(md.get("source_ref")))
+                if md.get("private"):
+                    entry["private"] = True  # private if ANY record in the group is private
+                ref = md.get("source_ref")
+                if ref and len(entry["sample_refs"]) < 3 and str(ref) not in entry["sample_refs"]:
+                    entry["sample_refs"].append(str(ref))
             payload = {"sources": sorted(groups.values(), key=lambda e: (-e["count"], e["source"])),
                        "total": len(self.catalog.records_by_id)}
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}

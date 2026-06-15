@@ -160,6 +160,8 @@ def test_sources_resource_groups_by_source(proxy):
     vault = next(s for s in payload["sources"] if s["source"] == "vault")
     assert vault["count"] == 2 and vault["source_group"] == "imported"
     assert set(vault["sample_refs"]) == {"a.md", "b.md"}
+    user = next(s for s in payload["sources"] if s["source_group"] == "user-write")
+    assert user["count"] == 1
 
 
 def test_sources_resource_listed_with_catalog(proxy):
