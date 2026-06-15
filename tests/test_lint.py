@@ -70,3 +70,16 @@ def test_main_json_output(tmp_path, capsys):
     import json
     parsed = json.loads(out)
     assert {item["slug"] for item in parsed["stale_pages"]} == {"old"}
+
+
+def test_build_report_degrades_when_dirs_unwritable(tmp_path):
+    # A cron-invoked lint must not crash when the compiled dirs can't be created
+    # (e.g. the layer isn't set up on this host). It should return an empty report.
+    a_file = tmp_path / "a_file"
+    a_file.write_text("x")  # a path *under* a file can't be created as a dir
+    report = lint.build_report(
+        compiled_dir=str(a_file / "nope"), blob_dir=str(a_file / "nope2"),
+        dataset_path=None, min_count=8,
+    )
+    assert report["stale_pages"] == []
+    assert set(report.keys()) == {"stale_pages", "coverage_gaps", "supersession", "orphans"}

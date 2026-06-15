@@ -25,9 +25,14 @@ from compiled import PageRegistry  # noqa: E402
 
 
 def build_report(*, compiled_dir: str, blob_dir: str, dataset_path: str | None, min_count: int) -> dict:
-    blobs = BlobStore(blob_dir=blob_dir, signing_key=b"lint", max_bytes=0)
-    registry = PageRegistry(registry_dir=compiled_dir, blobs=blobs)
-    pages = registry.list()
+    try:
+        blobs = BlobStore(blob_dir=blob_dir, signing_key=b"lint", max_bytes=0)
+        registry = PageRegistry(registry_dir=compiled_dir, blobs=blobs)
+        pages = registry.list()
+    except OSError:
+        # Compiled dirs are missing or unwritable (layer not set up here) — there is
+        # nothing to lint, so degrade gracefully instead of crashing under cron.
+        pages = []
     raw_counts: dict[str, int] = {}
     records: list = []
     if dataset_path:
