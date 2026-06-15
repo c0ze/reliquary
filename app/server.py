@@ -916,7 +916,7 @@ class Mem0ChatProxy:
                   "mem0_update", "update", "add_image", "delete_image",
                   "create_image_upload", "commit_image_upload", "mem0_compile_page"}
         reads = {"mem0_search", "search", "mem0_fetch", "fetch", "fetch_image", "list_domains",
-                 "mem0_list_pages", "mem0_page_history"}
+                 "mem0_list_pages", "mem0_page_history", "mem0_capabilities", "capabilities"}
         if tool_name in writes:
             return "write"
         if tool_name in reads:
@@ -1121,6 +1121,37 @@ class Mem0ChatProxy:
             },
         ]
 
+    def handle_capabilities_tool(self, profile: "EndpointProfile", context=None) -> dict[str, Any]:
+        is_openai = profile.name == "openai"
+        payload = {
+            "what": "Reliquary: domain-neutral semantic memory over Mem0 + Qdrant, served over MCP.",
+            "endpoint": profile.name,
+            "tools": [t["name"] for t in self.mcp_tools_for(profile, can_write=True)],
+            "rules": {
+                "imported_records": "read-only (protected); user-written records are mutable",
+                "corrections": "propose changes to imported records with propose_update (never mutates the import)",
+                "write_scope": "write tools require a write-scoped token" + (
+                    "; this endpoint also requires MEM0_OPENAI_ALLOW_WRITE" if is_openai else ""),
+                "user_id": "not accepted on the OpenAI endpoint" if is_openai else "optional override accepted",
+            },
+            "images": "store/fetch binary blobs with add_image / fetch_image (+ upload flow)",
+            "taxonomy": {
+                "fields": ["domain", "hall", "room", "topic"],
+                "routeable_domains": self.catalog.routeable_domains if self.catalog else [],
+            },
+            "compiled_layer": self.pages is not None,
+            "project_context": {
+                "active": context is not None,
+                "repo": getattr(context, "repo", None),
+                "how": "pass a `context` object ({client,cwd,git_root,repo}) in tool args, or X-Reliquary-Repo header",
+            },
+            "when_to_write": "store durable facts/decisions the user will want recalled later; don't store transient chatter",
+        }
+        return self.mcp_tool_result(
+            text="Reliquary capabilities (orientation). See structuredContent for details.",
+            structured=payload,
+        )
+
     def mcp_tools_for(self, profile: EndpointProfile, *, can_write: bool = False) -> list[dict[str, Any]]:
         read_only = {"readOnlyHint": True, "openWorldHint": False}
         routing_hint = self._routing_hint()
@@ -1177,6 +1208,13 @@ class Mem0ChatProxy:
                         "required": ["id"],
                         "additionalProperties": False,
                     },
+                },
+                {
+                    "name": "capabilities",
+                    "title": "Capabilities",
+                    "description": "Orient yourself: what Reliquary is, the tools available, read/write and protection rules, taxonomy, and how to supply project context. Call this first.",
+                    "annotations": {"readOnlyHint": True, "openWorldHint": False},
+                    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
                 },
             ]
             if can_write:
@@ -1356,6 +1394,13 @@ class Mem0ChatProxy:
                 "annotations": read_only,
                 "inputSchema": {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"], "additionalProperties": False},
             },
+            {
+                "name": "mem0_capabilities",
+                "title": "Capabilities",
+                "description": "Orient yourself: what Reliquary is, the tools available, read/write and protection rules, taxonomy, and how to supply project context. Call this first.",
+                "annotations": {"readOnlyHint": True, "openWorldHint": False},
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
         ]
         if can_write:
             claude_tools.extend([
@@ -1488,9 +1533,11 @@ class Mem0ChatProxy:
             ])
         return claude_tools
 
-    async def call_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any], *, can_write: bool = False) -> dict[str, Any]:
+    async def call_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any], *, can_write: bool = False, context=None) -> dict[str, Any]:
         try:
             if profile.name == "openai":
+                if tool_name == "capabilities":
+                    return self.handle_capabilities_tool(profile, context=context)
                 if tool_name == "search":
                     return await self.handle_search_tool(
                         arguments,
@@ -1575,6 +1622,8 @@ class Mem0ChatProxy:
                     is_error=True,
                 )
 
+            if tool_name == "mem0_capabilities":
+                return self.handle_capabilities_tool(profile, context=context)
             if tool_name == "mem0_status":
                 status = {
                     "user_id": self.settings.user_id,
