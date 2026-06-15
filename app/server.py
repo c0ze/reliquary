@@ -66,6 +66,9 @@ MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
 LIVE_LEXICAL_SCAN_LIMIT = 5000
+# Soft score bonus that floats project-matching memory up when caller context is
+# supplied (#42). Additive, excludes nothing; a no-op when context is absent.
+CONTEXT_MATCH_BONUS = 0.1
 # A hyphenated identifier token (>= 3 segments, e.g. ARDA-RELIQUARY-IMAGE-20260605-01)
 # is the exact-recall case the live lexical fallback was built for (#28); used to
 # gate that fallback so healthy searches avoid the broad get_all scroll (#30).
@@ -885,7 +888,9 @@ class Mem0ChatProxy:
                     is_error=True,
                 )
             else:
-                result = await self.call_mcp_tool(profile, tool_name, tool_arguments, can_write=can_write)
+                from context import resolve_context
+                ctx = resolve_context(tool_arguments, headers)
+                result = await self.call_mcp_tool(profile, tool_name, tool_arguments, can_write=can_write, context=ctx)
                 self.metrics.record_tool(tool_name, ok=not result.get("isError"))
                 if category == "write" and not result.get("isError"):
                     structured = result.get("structuredContent") or {}
@@ -1182,6 +1187,7 @@ class Mem0ChatProxy:
                                 "type": "string",
                                 "description": "Opaque pagination cursor from a previous response's nextCursor.",
                             },
+                            "context": {"type": "object", "description": "Optional caller context (client, cwd, git_root, repo) for project-aware routing."},
                         },
                         "required": ["query"],
                         "additionalProperties": False,
@@ -1364,6 +1370,7 @@ class Mem0ChatProxy:
                         },
                         "threshold": {"type": "number", "description": "Optional minimum similarity threshold."},
                         "user_id": {"type": "string", "description": "Optional Mem0 user_id override."},
+                        "context": {"type": "object", "description": "Optional caller context (client, cwd, git_root, repo) for project-aware routing."},
                     },
                     "required": ["query"],
                     "additionalProperties": False,
@@ -1578,6 +1585,7 @@ class Mem0ChatProxy:
                         fetch_tool_name="fetch",
                         body_char_cap=OPENAI_SNIPPET_CHAR_CAP,
                         lean_results=True,
+                        context=context,
                     )
                 if tool_name == "list_domains":
                     domains = self.catalog.routeable_domains if self.catalog else []
@@ -1653,7 +1661,7 @@ class Mem0ChatProxy:
                     structured={"domains": domains},
                 )
             if tool_name == "mem0_search":
-                return await self.handle_search_tool(arguments)
+                return await self.handle_search_tool(arguments, context=context)
             if tool_name == "mem0_fetch":
                 return await self.handle_fetch_tool(arguments)
             if tool_name == "mem0_list_pages":
@@ -1723,6 +1731,7 @@ class Mem0ChatProxy:
         fetch_tool_name: str = "mem0_fetch",
         body_char_cap: int = SEARCH_PREVIEW_CHAR_CAP,
         lean_results: bool = False,
+        context=None,
     ) -> dict[str, Any]:
         query = str(arguments.get("query") or "").strip()
         if not query:
@@ -1766,9 +1775,12 @@ class Mem0ChatProxy:
 
         # Order by relevance score across ALL routes, not by route priority, so the
         # best hit (e.g. an exact lexical match) ranks first wherever it came from.
+        # _context_bonus adds CONTEXT_MATCH_BONUS for project-matching hits when caller
+        # context is present; it is 0.0 (no-op) when context is absent (#42).
         raw_results = sorted(
             by_key.values(),
-            key=lambda item: (-self._numeric_score(item.get("score")), str(item.get("id") or "")),
+            key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)),
+                              str(item.get("id") or "")),
         )
         # Synthesis-first (#50): a current synthesis leads; raw hits follow as evidence.
         # Use result_cap (not limit) so paginated pages past the first still see syntheses.
@@ -3197,6 +3209,14 @@ class Mem0ChatProxy:
             return float(value)
         except (TypeError, ValueError):
             return 0.0
+
+    def _context_bonus(self, hit: dict[str, Any], context) -> float:
+        if context is None or not getattr(context, "repo_slug", None):
+            return 0.0
+        md = hit.get("metadata") or {}
+        if md.get("domain") == "dev" or md.get("room") == context.repo_slug:
+            return CONTEXT_MATCH_BONUS
+        return 0.0
 
     async def add_memory(
         self,

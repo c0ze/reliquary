@@ -84,3 +84,43 @@ def test_propose_update_openai_ignores_caller_user_id(proxy):
     run(proxy.handle_propose_update_tool({"target_id": "imp-1", "user_id": "intruder"}, allow_user_id=False))
     rec = next(r for r in proxy.memory._store.values() if r.get("metadata", {}).get("kind") == "correction")
     assert rec["user_id"] == proxy.settings.user_id  # server user, not "intruder"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: caller-context threading + soft project routing bias (#42)
+# ---------------------------------------------------------------------------
+
+def _seed_two(proxy):
+    # Project record: has domain=dev and room=reliquary; id sorts LAST alphabetically.
+    # Distinct memory text prevents deduplication by apply_retrieval_quality.
+    proxy.memory._store["zzz-note"] = {"id": "zzz-note", "memory": "alpha feature for reliquary project",
+        "metadata": {"domain": "dev", "room": "reliquary"}, "user_id": "my_lord"}
+    # Non-project record: id sorts FIRST alphabetically without bias.
+    proxy.memory._store["aaa-note"] = {"id": "aaa-note", "memory": "alpha changelog entry",
+        "metadata": {"domain": "misc"}, "user_id": "my_lord"}
+
+
+def test_context_bias_floats_project_memory_up(proxy):
+    from context import resolve_context
+    _seed_two(proxy)
+    ctx = resolve_context({"context": {"repo": "c0ze/reliquary"}}, {})
+    result = run(proxy.handle_search_tool({"query": "alpha"}, context=ctx))
+    assert result["structuredContent"]["results"][0]["id"] == "zzz-note"
+
+
+def test_no_context_leaves_order_unchanged(proxy):
+    _seed_two(proxy)
+    result = run(proxy.handle_search_tool({"query": "alpha"}))  # no context
+    ids = [r["id"] for r in result["structuredContent"]["results"]]
+    # equal scores => deterministic tie-break by id asc; project record is NOT lifted
+    assert ids[0] == "aaa-note"  # "aaa-note" < "zzz-note" alphabetically; bias absent
+    assert "zzz-note" in ids
+
+
+def test_context_threaded_through_call_mcp_tool(proxy):
+    from context import resolve_context
+    _seed_two(proxy)
+    profile = _profile(proxy, "claude")
+    ctx = resolve_context({"context": {"repo": "c0ze/reliquary"}}, {})
+    result = run(proxy.call_mcp_tool(profile, "mem0_search", {"query": "alpha"}, can_write=False, context=ctx))
+    assert result["structuredContent"]["results"][0]["id"] == "zzz-note"
