@@ -151,6 +151,31 @@ def test_compile_page_derived_from_in_result(proxy):
     assert result["structuredContent"]["derived_from"] == ["id-a", "id-b"]
 
 
+def test_compile_page_rejects_invalid_status(proxy):
+    result = run(proxy.handle_compile_page_tool({
+        "markdown": "x", "slug": "p", "status": "bogus",
+    }))
+    assert result.get("isError") is True
+    assert result["structuredContent"]["error"] == "invalid_status"
+
+
+def test_compile_page_strips_derived_from_values(proxy):
+    run(proxy.handle_compile_page_tool({
+        "markdown": "x", "slug": "p", "derived_from": ["  id-1  ", "id-2"],
+    }))
+    assert proxy.pages.get("p").derived_from == ["id-1", "id-2"]
+
+
+def test_compile_page_ignores_caller_user_id(proxy):
+    # Pages are a global registry; a caller user_id must not scope/own them.
+    run(proxy.handle_compile_page_tool({
+        "markdown": "x", "slug": "p", "user_id": "intruder",
+    }))
+    rec = next(r for r in proxy.compiled_memory._store.values()
+               if r.get("metadata", {}).get("slug") == "p")
+    assert rec["user_id"] == proxy.settings.user_id  # server user, not "intruder"
+
+
 # ---------------------------------------------------------------------------
 # Task 3.3 — handle_list_pages_tool + handle_page_history_tool
 # ---------------------------------------------------------------------------

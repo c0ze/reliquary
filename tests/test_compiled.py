@@ -39,7 +39,7 @@ def test_create_get_read_roundtrip(tmp_path):
     assert got is not None and got.current_blob == info.current_blob
     body, blob_id = reg.read_body("brigid")
     assert "Forge goddess." in body and blob_id == info.current_blob
-    assert body.startswith("---\n") and "title: Brigid" in body  # frontmatter prepended
+    assert body.startswith("---\n") and 'title: "Brigid"' in body  # YAML-safe quoted frontmatter
 
 
 def test_get_unknown_returns_none(tmp_path):
@@ -56,6 +56,31 @@ def test_get_rejects_path_traversal(tmp_path):
         assert reg.get(bad) is None
         assert reg.read_body(bad) is None
     assert reg.get("real") is not None  # the genuine slug still resolves
+
+
+def test_put_revision_normalizes_scalar_list_fields(tmp_path):
+    reg = _registry(tmp_path)
+    info = reg.put_revision("p", "body", {"derived_from": "single-id"})
+    assert info.derived_from == ["single-id"]  # not ['s', 'i', 'n', ...]
+
+
+def test_status_validation_rejects_invalid(tmp_path):
+    import pytest
+    reg = _registry(tmp_path)
+    with pytest.raises(ValueError):
+        reg.put_revision("p", "body", {"status": "bogus"})
+    reg.put_revision("p", "body", {"status": "current"})
+    with pytest.raises(ValueError):
+        reg.set_status("p", "nonsense")
+
+
+def test_frontmatter_is_yaml_safe_for_special_chars(tmp_path):
+    reg = _registry(tmp_path)
+    reg.put_revision("p", "body", {"title": "Brigid: Goddess, of [Fire]"})
+    text, _ = reg.read_body("p")
+    # Colon/comma/brackets stay inside a quoted scalar (json.dumps) rather than
+    # turning the line into an accidental YAML mapping/sequence.
+    assert 'title: "Brigid: Goddess, of [Fire]"' in text
 
 
 def test_update_creates_revision_and_history(tmp_path, monkeypatch):

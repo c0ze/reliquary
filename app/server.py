@@ -1480,7 +1480,6 @@ class Mem0ChatProxy:
                             "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Slugs this page supersedes."},
                             "domain": {"type": "string"}, "hall": {"type": "string"}, "room": {"type": "string"}, "topic": {"type": "string"},
                             "status": {"type": "string", "description": "current | stale | draft | archived (default current)."},
-                            "user_id": {"type": "string"},
                         },
                         "required": ["markdown"],
                         "additionalProperties": False,
@@ -1637,7 +1636,9 @@ class Mem0ChatProxy:
                         structured={"error": "insufficient_scope"},
                         is_error=True,
                     )
-                return await self.handle_compile_page_tool(arguments, allow_user_id=True)
+                # Pages are a single global registry keyed by slug (not namespaced by
+                # user_id), so file them under the server user only — never a caller id.
+                return await self.handle_compile_page_tool(arguments, allow_user_id=False)
             if tool_name == "add_image":
                 if not can_write:
                     return self.mcp_tool_result(
@@ -1930,7 +1931,7 @@ class Mem0ChatProxy:
         if self.pages is None or self.compiled_memory is None:
             return self.mcp_tool_result(text="The compiled layer is not configured.",
                                         structured={"error": "compiled_disabled"}, is_error=True)
-        from compiled import slugify
+        from compiled import slugify, VALID_STATUSES
         markdown = str(arguments.get("markdown") or "").strip()
         if not markdown:
             return self.mcp_tool_result(text="A non-empty `markdown` is required.",
@@ -1940,9 +1941,13 @@ class Mem0ChatProxy:
         if not slug:
             return self.mcp_tool_result(text="Provide a `slug`, `title`, or `topic` to name the page.",
                                         structured={"error": "missing_slug"}, is_error=True)
-        derived_from = [str(x) for x in (arguments.get("derived_from") or []) if str(x).strip()]
-        supersedes = [str(x) for x in (arguments.get("supersedes") or []) if str(x).strip()]
         status = str(arguments.get("status") or "current")
+        if status not in VALID_STATUSES:
+            return self.mcp_tool_result(
+                text=f"`status` must be one of: {', '.join(VALID_STATUSES)}.",
+                structured={"error": "invalid_status", "valid": list(VALID_STATUSES)}, is_error=True)
+        derived_from = [str(x).strip() for x in (arguments.get("derived_from") or []) if str(x).strip()]
+        supersedes = [str(x).strip() for x in (arguments.get("supersedes") or []) if str(x).strip()]
         frontmatter: dict[str, Any] = {"title": title or slug, "status": status,
                                        "derived_from": derived_from, "supersedes": supersedes}
         for key in ("domain", "hall", "room", "topic"):

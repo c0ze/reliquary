@@ -59,18 +59,17 @@ class PageInfo:
 def _emit_frontmatter(info: "PageInfo") -> str:
     """Minimal one-way YAML frontmatter for Obsidian/serving. The registry's JSON
     sidecar is the source of truth; this is never parsed back."""
-    def scalar(v: object) -> str:
-        return "" if v is None else str(v)
-
     lines = ["---"]
     for key in ("slug", "title", "domain", "hall", "room", "topic", "status", "kind"):
         val = getattr(info, key)
         if val:
-            lines.append(f"{key}: {scalar(val)}")
+            # json.dumps yields a double-quoted scalar that is valid YAML and safe
+            # for values containing ':', commas, brackets, or newlines (Obsidian-ready).
+            lines.append(f"{key}: {json.dumps(str(val), ensure_ascii=False)}")
     for key in ("derived_from", "supersedes"):
         vals = getattr(info, key)
         if vals:
-            lines.append(f"{key}: [{', '.join(scalar(v) for v in vals)}]")
+            lines.append(f"{key}: {json.dumps([str(v) for v in vals], ensure_ascii=False)}")
     lines.append("---")
     return "\n".join(lines)
 
@@ -137,10 +136,18 @@ class PageRegistry:
             info = existing or PageInfo(slug=slug, current_blob="", created_at=now)
             for key in ("title", "domain", "hall", "room", "topic", "status", "kind"):
                 if frontmatter.get(key) is not None:
+                    if key == "status" and frontmatter[key] not in VALID_STATUSES:
+                        raise ValueError(f"invalid status: {frontmatter[key]!r}")
                     setattr(info, key, frontmatter[key])
             for key in ("derived_from", "supersedes"):
-                if frontmatter.get(key) is not None:
-                    setattr(info, key, [str(v) for v in frontmatter[key]])
+                vals = frontmatter.get(key)
+                if vals is not None:
+                    # A bare string would otherwise be split into characters.
+                    if isinstance(vals, (str, bytes)):
+                        vals = [vals]
+                    elif not isinstance(vals, (list, tuple, set)):
+                        raise ValueError(f"{key} must be a sequence of ids")
+                    setattr(info, key, [str(v) for v in vals])
             info.updated_at = now
             if not info.created_at:
                 info.created_at = now
@@ -179,6 +186,8 @@ class PageRegistry:
 
     def set_status(self, slug: str, status: str) -> "PageInfo | None":
         with _REGISTRY_LOCK:
+            if status not in VALID_STATUSES:
+                raise ValueError(f"invalid status: {status!r}")
             info = self.get(slug)
             if info is None:
                 return None

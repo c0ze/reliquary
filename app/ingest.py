@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -70,8 +71,8 @@ def _fan_out_bulk(page_registry, touched_ids: set[str], touched_tax: set) -> Non
                 page.domain and page.topic and (page.domain, page.topic) in touched_tax
             ):
                 page_registry.set_status(page.slug, "stale")
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[ingest] staleness fan-out skipped: {exc}", file=sys.stderr)
 
 
 def ingest_records(
@@ -333,7 +334,8 @@ def main() -> None:
                 registry_dir=os.getenv("MEM0_COMPILED_DIR", "/data/compiled"),
                 blobs=BlobStore(blob_dir=os.getenv("MEM0_BLOB_DIR", "/data/blobs"), signing_key=b"ingest", max_bytes=0),
             )
-        except Exception:
+        except Exception as exc:
+            print(f"[ingest] compiled page registry unavailable: {exc}", file=sys.stderr)
             page_registry = None
     summary = ingest_records(
         memory,

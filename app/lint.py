@@ -41,8 +41,10 @@ def build_report(*, compiled_dir: str, blob_dir: str, dataset_path: str | None, 
             catalog = CorpusCatalog.from_path(dataset_path)
             raw_counts = {k: v for k, v in catalog.value_counts["domain"].items()}
             records = list(catalog.records_by_id.values())
-        except Exception:
-            pass
+        except Exception as exc:
+            # Surface the failure: a dropped dataset silently produces an
+            # incomplete report (and a misleadingly clean --strict result).
+            print(f"[lint] dataset load failed for {dataset_path!r}: {exc}", file=sys.stderr)
     return health.run_all(pages, raw_counts=raw_counts, min_count=min_count, records=records)
 
 
