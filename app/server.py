@@ -1173,6 +1173,7 @@ class Mem0ChatProxy:
 
     def handle_capabilities_tool(self, profile: "EndpointProfile", context=None, can_write: bool = False) -> dict[str, Any]:
         is_openai = profile.name == "openai"
+        tp = "" if is_openai else "reliquary_"
         # Reflect the request's ACTUAL scope: a read-only token must not see write
         # tools advertised as available (that would contradict tools/list and any
         # call would return insufficient_scope). Write tools surface only with write.
@@ -1185,12 +1186,12 @@ class Mem0ChatProxy:
             "write_tools_when_authorized": write_only,
             "rules": {
                 "imported_records": "read-only (protected); user-written records are mutable",
-                "corrections": "propose changes to imported records with propose_update (never mutates the import)",
+                "corrections": f"propose changes to imported records with {tp}propose_update (never mutates the import)",
                 "write_scope": "write tools require a write-scoped token" + (
                     "; this endpoint also requires MEM0_OPENAI_ALLOW_WRITE" if is_openai else ""),
                 "user_id": "not accepted on the OpenAI endpoint" if is_openai else "optional override accepted",
             },
-            "images": "store/fetch binary blobs with add_image / fetch_image (+ upload flow)",
+            "images": f"store/fetch binary blobs with {tp}add_image / {tp}fetch_image (+ upload flow)",
             "taxonomy": {
                 "fields": ["domain", "hall", "room", "topic"],
                 "routeable_domains": self.catalog.routeable_domains if self.catalog else [],
@@ -1516,7 +1517,7 @@ class Mem0ChatProxy:
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Memory id from mem0_search or mem0_add_memory."},
+                            "id": {"type": "string", "description": "Memory id from reliquary_search or reliquary_add_memory."},
                             "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
                         },
                         "required": ["id"],
@@ -1578,7 +1579,7 @@ class Mem0ChatProxy:
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "memory_id": {"type": "string", "description": "memory_id returned by add_image."},
+                            "memory_id": {"type": "string", "description": "memory_id returned by reliquary_add_image."},
                             "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
                         },
                         "required": ["memory_id"],
@@ -1768,11 +1769,11 @@ class Mem0ChatProxy:
             if tool_name == "reliquary_delete":
                 if not can_write:
                     return self._scope_error(tool_name)
-                return await self.handle_delete_tool(arguments, allow_user_id=True)
+                return await self.handle_delete_tool(arguments, allow_user_id=True, tool_prefix="reliquary_")
             if tool_name == "reliquary_update":
                 if not can_write:
                     return self._scope_error(tool_name)
-                return await self.handle_update_tool(arguments, allow_user_id=True)
+                return await self.handle_update_tool(arguments, allow_user_id=True, tool_prefix="reliquary_")
             if tool_name == "reliquary_compile_page":
                 if not can_write:
                     return self._scope_error(tool_name)
@@ -2755,7 +2756,7 @@ class Mem0ChatProxy:
             },
         )
 
-    async def handle_delete_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
+    async def handle_delete_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False, tool_prefix: str = "") -> dict[str, Any]:
         record_id = str(arguments.get("id") or "").strip()
         if not record_id:
             return self.mcp_tool_result(
@@ -2776,7 +2777,7 @@ class Mem0ChatProxy:
         if existing is None:
             return self.mcp_tool_result(
                 text=f"No deletable memory found for id={record_id}. "
-                "Only memories created via add_memory can be deleted; imported corpus records cannot.",
+                f"Only memories created via {tool_prefix}add_memory can be deleted; imported corpus records cannot.",
                 structured={"error": "not_found", "id": record_id},
                 is_error=True,
             )
@@ -2793,7 +2794,7 @@ class Mem0ChatProxy:
                 text=f"Refusing to delete id={record_id}: it is not a user-written memory "
                 "(imported corpus records are protected).",
                 structured={"error": "protected_record", "id": record_id,
-                            "suggested_action": "Imported records are read-only — file a correction with propose_update (target_id=<id>)."},
+                            "suggested_action": f"Imported records are read-only — file a correction with {tool_prefix}propose_update (target_id=<id>)."},
                 is_error=True,
             )
         await self.delete_memory(record_id)
@@ -2802,7 +2803,7 @@ class Mem0ChatProxy:
             structured={"deleted": True, "id": record_id, "title": existing.get("title")},
         )
 
-    async def handle_update_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
+    async def handle_update_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False, tool_prefix: str = "") -> dict[str, Any]:
         record_id = str(arguments.get("id") or "").strip()
         if not record_id:
             return self.mcp_tool_result(
@@ -2831,7 +2832,7 @@ class Mem0ChatProxy:
         if existing is None:
             return self.mcp_tool_result(
                 text=f"No updatable memory found for id={record_id}. "
-                "Only memories created via add_memory can be updated; imported corpus records cannot.",
+                f"Only memories created via {tool_prefix}add_memory can be updated; imported corpus records cannot.",
                 structured={"error": "not_found", "id": record_id},
                 is_error=True,
             )
@@ -2846,7 +2847,7 @@ class Mem0ChatProxy:
                 text=f"Refusing to update id={record_id}: it is not a user-written memory "
                 "(imported corpus records are protected).",
                 structured={"error": "protected_record", "id": record_id,
-                            "suggested_action": "Imported records are read-only — file a correction with propose_update (target_id=<id>)."},
+                            "suggested_action": f"Imported records are read-only — file a correction with {tool_prefix}propose_update (target_id=<id>)."},
                 is_error=True,
             )
         # Preserve existing metadata and merge any caller-provided fields, but
