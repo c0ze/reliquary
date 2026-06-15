@@ -349,6 +349,16 @@ class OAuthProvider:
             self._persist_access_tokens()
         return removed
 
+    def revoke_token(self, token: str | None) -> bool:
+        key = (token or "").strip()
+        if not key:
+            return False
+        rt = self._refresh_tokens.get(key)
+        if rt is not None:
+            self._revoke_family(rt.family_id)  # drops the family's refresh + access tokens
+            return True
+        return self.revoke_access_token(key)
+
     def _prune(self) -> None:
         now = time.time()
         expired = [code for code, entry in self._codes.items() if entry.expires_at < now]

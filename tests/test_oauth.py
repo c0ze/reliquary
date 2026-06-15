@@ -350,6 +350,21 @@ def test_refresh_expired_invalid_grant():
     assert err is not None and err[1] == "invalid_grant"
 
 
+def test_revoke_refresh_kills_family_access():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    access, refresh = p.issue_token_pair(client_id="c", scope="mcp")
+    assert p.verify_access_token(access) is True
+    assert p.revoke_token(refresh) is True
+    assert p.verify_access_token(access) is False  # RFC 7009: family access dropped
+
+
+def test_revoke_access_token_still_works():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    access, _ = p.issue_token_pair(client_id="c", scope="mcp")
+    assert p.revoke_token(access) is True
+    assert p.verify_access_token(access) is False
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

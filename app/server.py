@@ -3618,7 +3618,7 @@ class Mem0ChatProxy:
         # RFC 7009: always return 200, regardless of whether the token existed.
         body = await self.read_body(receive)
         form = parse_form(body)
-        self.oauth.revoke_access_token(form.get("token"))
+        self.oauth.revoke_token(form.get("token"))
         await self.send_empty(send, 200, extra_headers={"cache-control": "no-store"})
 
     def _validate_authorize_params(self, params: dict[str, str]) -> str | None:
