@@ -13,7 +13,11 @@ from urllib.parse import urlencode, urlparse
 AUTHORIZATION_CODE_TTL = 600
 ACCESS_TOKEN_TTL = 30 * 24 * 3600  # 30 days
 REFRESH_TOKEN_TTL = 0  # 0 = non-expiring
-REFRESH_REUSE_GRACE = 24 * 3600  # keep a consumed refresh token this long to detect replay
+# A consumed (rotated-away) refresh token is retained this long so a replay within
+# the window still triggers family revocation (delayed resend / short-window theft).
+# After it, a replay is indistinguishable from an unknown token and just returns
+# invalid_grant — fine, since any legitimate successor has long since rotated past it.
+REFRESH_REUSE_GRACE = 24 * 3600
 
 READ_SCOPES = {"read", "readonly", "read_only", "search"}
 
@@ -361,7 +365,7 @@ class OAuthProvider:
         if expired:
             self._persist_access_tokens()
 
-    def _exchange_refresh_token(self, form):
+    def _exchange_refresh_token(self, form: dict[str, str]) -> tuple[dict[str, Any] | None, tuple[int, str, str] | None]:
         presented = (form.get("refresh_token") or "").strip()
         if not presented:
             return None, (400, "invalid_request", "refresh_token is required")

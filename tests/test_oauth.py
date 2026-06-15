@@ -334,6 +334,22 @@ def test_refresh_rejects_wrong_client_when_pinned():
     assert ok_err is None and resp["refresh_token"] != refresh  # correct client still rotates
 
 
+def test_refresh_accepts_any_client_when_not_pinned():
+    # No fixed_client_id => the client_id on a refresh request is not enforced.
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    _, refresh = p.issue_token_pair(client_id="right", scope="mcp")
+    resp, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh, "client_id": "anything"})
+    assert err is None and resp["refresh_token"] != refresh
+
+
+def test_refresh_expired_invalid_grant():
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", refresh_token_ttl=1)
+    _, refresh = p.issue_token_pair(client_id="c", scope="mcp")
+    p._refresh_tokens[refresh].expires_at = time.time() - 1  # backdate past expiry
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    assert err is not None and err[1] == "invalid_grant"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
