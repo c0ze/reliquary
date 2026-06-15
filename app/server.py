@@ -2048,11 +2048,16 @@ class Mem0ChatProxy:
         }
         if reason:
             metadata["reason"] = reason
+        # A correction is a fresh user-write record; it derives from no compiled page,
+        # so there is no staleness fan-out (unlike handle_add_memory_tool).
         result = await self.add_memory(text, user_id=user_id, metadata=metadata, infer=False)
         new_ids = added_memory_ids(result)
+        # Expose the full ids list (mirrors add_memory) so an empty result is
+        # distinguishable from a stored id rather than an ambiguous null.
         return self.mcp_tool_result(
             text=f"Filed correction for {target_id} (status=proposed).",
-            structured={"id": new_ids[0] if new_ids else None, "target_id": target_id, "status": "proposed"})
+            structured={"id": new_ids[0] if new_ids else None, "ids": new_ids,
+                        "target_id": target_id, "status": "proposed"})
 
     def _load_pending_uploads(self) -> None:
         """Restore persisted upload slots (if a state_dir is configured) and reap

@@ -77,3 +77,10 @@ def test_protected_delete_suggests_propose_update(proxy):
     assert result.get("isError") is True
     sc = result["structuredContent"]
     assert sc["error"] == "protected_record" and "propose_update" in sc["suggested_action"]
+
+
+def test_propose_update_openai_ignores_caller_user_id(proxy):
+    # Lean endpoint (allow_user_id=False): a caller-supplied user_id must be ignored.
+    run(proxy.handle_propose_update_tool({"target_id": "imp-1", "user_id": "intruder"}, allow_user_id=False))
+    rec = next(r for r in proxy.memory._store.values() if r.get("metadata", {}).get("kind") == "correction")
+    assert rec["user_id"] == proxy.settings.user_id  # server user, not "intruder"
