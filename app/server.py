@@ -245,6 +245,8 @@ class ProxySettings:
     oauth_allow_registration: bool = True
     memory_concurrent_reads: bool | None = None
     oauth_verbatim_token: bool = False
+    oauth_access_token_ttl: int = 432000   # 5 days
+    oauth_refresh_token_ttl: int = 0       # 0 = non-expiring
     blob_dir: str = "/data/blobs"
     blob_signing_key: str | None = None
     blob_max_bytes: int = 31457280
@@ -309,9 +311,11 @@ class Mem0ChatProxy:
         ) = self._detect_search_api()
         self._count_cache: tuple[float, int | None] | None = None
         token_store = None
+        refresh_token_store = None
         session_store = None
         if settings.state_dir:
             token_store = JsonFileStore(os.path.join(settings.state_dir, "oauth_tokens.json"))
+            refresh_token_store = JsonFileStore(os.path.join(settings.state_dir, "oauth_refresh_tokens.json"))
             session_store = JsonFileStore(os.path.join(settings.state_dir, "mcp_sessions.json"))
         self.mcp_sessions = MCPSessionStore(max_size=MCP_MAX_SESSIONS, ttl=MCP_SESSION_TTL, session_store=session_store)
 
@@ -345,7 +349,10 @@ class Mem0ChatProxy:
             fixed_client_id=settings.oauth_client_id,
             allow_registration=settings.oauth_allow_registration,
             issue_verbatim_token=settings.oauth_verbatim_token,
+            access_token_ttl=settings.oauth_access_token_ttl,
+            refresh_token_ttl=settings.oauth_refresh_token_ttl,
             token_store=token_store,
+            refresh_token_store=refresh_token_store,
         )
         # Static token lookup: maps token value -> scope ('read' or 'write').
         self._static_tokens: dict[str, str] = {
@@ -3855,6 +3862,8 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         oauth_allow_registration=args.oauth_allow_registration,
         memory_concurrent_reads=args.memory_concurrent_reads,
         oauth_verbatim_token=args.oauth_verbatim_token,
+        oauth_access_token_ttl=args.oauth_access_token_ttl,
+        oauth_refresh_token_ttl=args.oauth_refresh_token_ttl,
         blob_dir=args.blob_dir,
         blob_signing_key=normalize_token(args.blob_signing_key),
         blob_max_bytes=args.blob_max_bytes,
@@ -3938,6 +3947,10 @@ def parse_args() -> argparse.Namespace:
         help="Return the master bearer itself as the OAuth access_token (old behavior) instead of a "
         "derived, revocable token. Default false.",
     )
+    parser.add_argument("--oauth-access-token-ttl", type=int, default=int(os.getenv("MEM0_OAUTH_ACCESS_TOKEN_TTL", "432000")),
+                        help="Access-token lifetime in seconds (default 5 days). Refresh rotation renews it.")
+    parser.add_argument("--oauth-refresh-token-ttl", type=int, default=int(os.getenv("MEM0_OAUTH_REFRESH_TOKEN_TTL", "0")),
+                        help="Refresh-token lifetime in seconds (0 = non-expiring).")
     parser.add_argument(
         "--dataset",
         default=os.getenv("MEM0_DATASET_PATH"),

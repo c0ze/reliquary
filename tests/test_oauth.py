@@ -365,6 +365,38 @@ def test_revoke_access_token_still_works():
     assert p.verify_access_token(access) is False
 
 
+def test_refresh_token_survives_restart(tmp_path):
+    """A refresh token issued by one OAuthProvider survives a simulated restart
+    and can still be used to rotate on the reloaded instance."""
+    rt_store_path = str(tmp_path / "refresh_tokens.json")
+    at_store_path = str(tmp_path / "access_tokens.json")
+    rt_store = JsonFileStore(rt_store_path)
+    at_store = JsonFileStore(at_store_path)
+
+    p1 = OAuthProvider(
+        master_token="MASTER", mcp_resource_path="/claude/mcp",
+        token_store=at_store, refresh_token_store=rt_store,
+    )
+    _access, refresh = p1.issue_token_pair(client_id="c", scope="mcp")
+
+    # Simulate a restart: fresh instance backed by the SAME store files
+    p2 = OAuthProvider(
+        master_token="MASTER", mcp_resource_path="/claude/mcp",
+        token_store=at_store, refresh_token_store=rt_store,
+    )
+    resp, err = p2.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    assert err is None, f"expected rotation to succeed after restart but got {err}"
+    assert resp["refresh_token"] != refresh  # token rotated as expected
+    assert resp["access_token"]
+
+
+def test_proxy_settings_access_token_ttl_default():
+    """ProxySettings.oauth_access_token_ttl must default to 432000 (5 days)."""
+    from server import ProxySettings
+    assert ProxySettings().oauth_access_token_ttl == 432000
+    assert ProxySettings().oauth_refresh_token_ttl == 0
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
