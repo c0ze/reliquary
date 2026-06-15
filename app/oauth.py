@@ -12,6 +12,8 @@ from urllib.parse import urlencode, urlparse
 
 AUTHORIZATION_CODE_TTL = 600
 ACCESS_TOKEN_TTL = 30 * 24 * 3600  # 30 days
+REFRESH_TOKEN_TTL = 0  # 0 = non-expiring
+REFRESH_REUSE_GRACE = 24 * 3600  # keep a consumed refresh token this long to detect replay
 
 READ_SCOPES = {"read", "readonly", "read_only", "search"}
 
@@ -38,6 +40,18 @@ class AccessToken:
     scope: str
     expires_at: float
     resource: str | None = None
+    family_id: str | None = None
+
+
+@dataclass
+class RefreshToken:
+    client_id: str
+    scope: str
+    resource: str | None
+    family_id: str
+    created_at: float
+    expires_at: float | None = None  # None = non-expiring
+    consumed: bool = False
 
 
 class OAuthProvider:
@@ -66,7 +80,9 @@ class OAuthProvider:
         allow_registration: bool = True,
         issue_verbatim_token: bool = False,
         access_token_ttl: float = ACCESS_TOKEN_TTL,
+        refresh_token_ttl: float = REFRESH_TOKEN_TTL,
         token_store=None,
+        refresh_token_store=None,
     ):
         self.master_token = master_token
         self.mcp_resource_path = mcp_resource_path
@@ -74,11 +90,16 @@ class OAuthProvider:
         self.allow_registration = allow_registration
         self.issue_verbatim_token = issue_verbatim_token
         self.access_token_ttl = access_token_ttl
+        self.refresh_token_ttl = refresh_token_ttl
         self._codes: dict[str, AuthorizationCode] = {}
         self._token_store = token_store
+        self._refresh_token_store = refresh_token_store
         self._access_tokens: dict[str, AccessToken] = {}
+        self._refresh_tokens: dict[str, RefreshToken] = {}
         if self._token_store is not None:
             self._load_access_tokens()
+        if self._refresh_token_store is not None:
+            self._load_refresh_tokens()
 
     def base_url(self, headers: dict[str, str]) -> str:
         host = headers.get("host") or "localhost"
@@ -105,7 +126,7 @@ class OAuthProvider:
             "registration_endpoint": f"{base}/oauth/register",
             "revocation_endpoint": f"{base}/oauth/revoke",
             "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none"],
             "scopes_supported": ["read", "write"],
@@ -248,7 +269,7 @@ class OAuthProvider:
                 {"access_token": self.master_token, "token_type": "Bearer", "scope": scope},
                 None,
             )
-        access_token = self.issue_access_token(
+        access_token, refresh_token = self.issue_token_pair(
             client_id=entry.client_id, scope=scope, resource=entry.resource
         )
         return (
@@ -256,18 +277,20 @@ class OAuthProvider:
                 "access_token": access_token,
                 "token_type": "Bearer",
                 "expires_in": int(self.access_token_ttl),
+                "refresh_token": refresh_token,
                 "scope": scope,
             },
             None,
         )
 
-    def issue_access_token(self, *, client_id: str, scope: str, resource: str | None = None) -> str:
+    def issue_access_token(self, *, client_id: str, scope: str, resource: str | None = None, family_id: str | None = None) -> str:
         token = secrets.token_urlsafe(32)
         self._access_tokens[token] = AccessToken(
             client_id=client_id,
             scope=scope,
             expires_at=time.time() + self.access_token_ttl,
             resource=(resource or "").strip() or None,
+            family_id=family_id,
         )
         self._persist_access_tokens()
         return token
@@ -345,6 +368,7 @@ class OAuthProvider:
                     scope=entry["scope"],
                     expires_at=float(entry["expires_at"]),
                     resource=entry.get("resource"),
+                    family_id=entry.get("family_id"),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -354,6 +378,48 @@ class OAuthProvider:
     def _persist_access_tokens(self) -> None:
         if self._token_store is not None:
             self._token_store.save({token: asdict(at) for token, at in self._access_tokens.items()})
+
+    def issue_token_pair(self, *, client_id: str, scope: str, resource: str | None = None, family_id: str | None = None) -> tuple[str, str]:
+        family_id = family_id or secrets.token_urlsafe(12)
+        access = self.issue_access_token(client_id=client_id, scope=scope, resource=resource, family_id=family_id)
+        refresh = self._issue_refresh_token(client_id=client_id, scope=scope, resource=resource, family_id=family_id)
+        return access, refresh
+
+    def _issue_refresh_token(self, *, client_id: str, scope: str, resource: str | None, family_id: str) -> str:
+        token = secrets.token_urlsafe(32)
+        expires_at = (time.time() + self.refresh_token_ttl) if self.refresh_token_ttl else None
+        self._refresh_tokens[token] = RefreshToken(
+            client_id=client_id,
+            scope=scope,
+            resource=(resource or "").strip() or None,
+            family_id=family_id,
+            created_at=time.time(),
+            expires_at=expires_at,
+        )
+        self._persist_refresh_tokens()
+        return token
+
+    def _persist_refresh_tokens(self) -> None:
+        if self._refresh_token_store is not None:
+            self._refresh_token_store.save({t: asdict(rt) for t, rt in self._refresh_tokens.items()})
+
+    def _load_refresh_tokens(self) -> None:
+        now = time.time()
+        for token, entry in (self._refresh_token_store.load() if self._refresh_token_store else {}).items():
+            try:
+                rt = RefreshToken(
+                    client_id=entry["client_id"],
+                    scope=entry["scope"],
+                    resource=entry.get("resource"),
+                    family_id=entry["family_id"],
+                    created_at=float(entry["created_at"]),
+                    expires_at=(float(entry["expires_at"]) if entry.get("expires_at") is not None else None),
+                    consumed=bool(entry.get("consumed", False)),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if rt.expires_at is None or rt.expires_at >= now:
+                self._refresh_tokens[token] = rt
 
     @staticmethod
     def _verify_pkce(verifier: str, challenge: str, method: str) -> bool:

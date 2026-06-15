@@ -277,6 +277,25 @@ def test_access_token_scope_resource_bound():
     assert provider.access_token_scope(token) is None
 
 
+def test_authorization_code_grant_returns_refresh_token():
+    """exchange_code on the authorization_code grant must include a refresh_token."""
+    provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    response, error = _exchange(provider)
+    assert error is None
+    assert response["access_token"] != "MASTER"
+    assert response["token_type"] == "Bearer"
+    assert "expires_in" in response
+    assert "refresh_token" in response
+    assert response["refresh_token"]  # non-empty string
+
+
+def test_metadata_advertises_refresh_token_grant():
+    """authorization_server_metadata must list 'refresh_token' in grant_types_supported."""
+    provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    meta = provider.authorization_server_metadata({"host": "mem0.example", "x-forwarded-proto": "https"})
+    assert "refresh_token" in meta["grant_types_supported"]
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
