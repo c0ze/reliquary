@@ -324,6 +324,16 @@ def test_unknown_refresh_token_invalid_grant():
     assert err[1] == "invalid_grant"
 
 
+def test_refresh_rejects_wrong_client_when_pinned():
+    # With fixed_client_id set, a refresh carrying a mismatched client_id is rejected.
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", fixed_client_id="right")
+    _, refresh = p.issue_token_pair(client_id="right", scope="mcp")
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh, "client_id": "wrong"})
+    assert err is not None and err[1] == "invalid_client"
+    resp, ok_err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh, "client_id": "right"})
+    assert ok_err is None and resp["refresh_token"] != refresh  # correct client still rotates
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
