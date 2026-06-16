@@ -692,3 +692,17 @@ def test_delete_page_requires_write_scope(proxy):
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     out = run(proxy.call_mcp_tool(profile, "reliquary_delete_page", {"slug": "x"}, can_write=False))
     assert out["structuredContent"]["error"] == "insufficient_scope"
+
+
+def test_delete_page_aborts_when_index_delete_fails(proxy, monkeypatch):
+    # If the indexed-memory delete fails, the page must NOT be removed — otherwise
+    # search would keep returning a synthesis whose page/blobs are gone.
+    _file_page(proxy, "keepme", markdown="x")
+    assert proxy.pages.get("keepme").memory_id  # has an indexed memory to delete
+    def boom(_mid):
+        raise RuntimeError("vector store unavailable")
+    monkeypatch.setattr(proxy.compiled_memory, "delete", boom)
+    result = run(proxy.handle_delete_page_tool({"slug": "keepme"}))
+    assert result.get("isError") is True
+    assert result["structuredContent"]["error"] == "index_delete_failed"
+    assert proxy.pages.get("keepme") is not None  # page survived the failed delete

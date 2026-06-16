@@ -2275,20 +2275,27 @@ class Mem0ChatProxy:
         if not slug:
             return self.mcp_tool_result(text="A non-empty `slug` is required.",
                                         structured={"error": "missing_slug"}, is_error=True)
-        info = await asyncio.to_thread(self.pages.delete, slug)
+        info = self.pages.get(slug)
         if info is None:
             return self.mcp_tool_result(text=f"No page found for slug={slug}.",
                                         structured={"error": "not_found", "slug": slug}, is_error=True)
-        # Also remove the page's indexed synthesis memory so it stops surfacing in search.
+        # Drop the indexed synthesis memory FIRST. If it fails, abort before
+        # removing the registry/blobs — otherwise search would keep returning a
+        # synthesis whose page is gone (the inconsistent state CodeRabbit flagged).
         deleted_memory = None
         if info.memory_id and self.compiled_memory is not None:
             try:
                 await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
                 deleted_memory = info.memory_id
             except Exception as exc:
-                LOG.warning("delete_page: page %s removed but its indexed memory %s lingers: %s",
-                            slug, info.memory_id, exc)
-        revisions_removed = len(info.history) + 1
+                LOG.warning("delete_page: aborting; could not delete indexed memory %s for %s: %s",
+                            info.memory_id, slug, exc)
+                return self.mcp_tool_result(
+                    text=f"Could not delete the indexed memory for {slug}; page left intact.",
+                    structured={"error": "index_delete_failed", "slug": slug,
+                                "memory_id": info.memory_id}, is_error=True)
+        deleted = await asyncio.to_thread(self.pages.delete, slug)
+        revisions_removed = (len(deleted.history) + 1) if deleted else 0
         return self.mcp_tool_result(
             text=f"Deleted page slug={slug} ({revisions_removed} revision(s) removed).",
             structured={"deleted": True, "slug": slug, "revisions_removed": revisions_removed,

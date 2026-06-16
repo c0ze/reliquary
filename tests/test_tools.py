@@ -407,7 +407,7 @@ def test_search_max_chars_caps_preview(proxy):
     sc = run(proxy.handle_search_tool({"query": "x", "max_chars": 200}))["structuredContent"]
     r = sc["results"][0]
     assert r["truncated"] is True
-    assert len(r["text"]) <= 201           # cap + ellipsis char
+    assert len(r["text"]) <= 200           # preview_body caps at limit *including* the ellipsis
     assert r["char_count"] == 5000         # full length still reported
 
 
@@ -420,4 +420,8 @@ def test_exact_title_match_outranks_tied_neighbours(proxy, fake_memory):
     fake_memory.add("the canonical record", user_id="my_lord",
                     metadata={"title": "Vigil Today", "source_group": "user-write"})
     sc = run(proxy.handle_search_tool({"query": "Vigil Today"}))["structuredContent"]
-    assert sc["results"][0]["title"] == "Vigil Today"
+    titles = [r["title"] for r in sc["results"]]
+    # The exact-title hit must lead, and the same-score non-exact neighbours must
+    # still be present (below it) — proving the bonus reordered ties, not filtered.
+    assert titles[0] == "Vigil Today"
+    assert any(t.startswith("Neighbour") for t in titles[1:])
