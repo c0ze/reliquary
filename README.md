@@ -22,8 +22,8 @@
 - **Semantic recall** over your own corpus (vector search), with optional
   domain/hall/room/topic **routing** plus query-time reranking, recency bias,
   and duplicate suppression for sharper retrieval.
-- **Two MCP endpoints:** a full read+write one for the Claude.ai connector, and
-  a lean, deep-research-shaped read (optionally write) one for ChatGPT.
+- **Two MCP endpoints:** a full one for the Claude.ai connector, and a lean,
+  deep-research-shaped one for ChatGPT — both read+write, gated by token scope.
 - **OAuth 2.1 shim** (PKCE, dynamic client registration, revocable
   resource-scoped tokens) so the Claude.ai Custom Connector can authenticate.
 - **No GPU, no chat LLM** required for retrieval — just an embedding model and a
@@ -98,7 +98,7 @@ The Mem0 library brand (prose, links, `config.yaml` library keys) is unchanged; 
 | Endpoint | For | Auth | Tools |
 |----------|-----|------|-------|
 | `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `reliquary_capabilities`, `reliquary_status`, `reliquary_search`, `reliquary_fetch`, `reliquary_add_memory`, `reliquary_update`, `reliquary_delete`, `reliquary_propose_update`, `reliquary_compile_page`, `reliquary_list_pages`, `reliquary_page_history`, `reliquary_list_domains`, `reliquary_add_image`, `reliquary_fetch_image`, `reliquary_delete_image`, `reliquary_create_image_upload`, `reliquary_commit_image_upload` |
-| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer (or no-auth) | `capabilities`, `search`, `fetch`, `fetch_image` (lean snippet shape); write tools `add_memory`, `update`, `delete`, `add_image`, `delete_image`, `propose_update`, and the image-upload flow if `RELIQUARY_OPENAI_ALLOW_WRITE=true` |
+| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer or OAuth | `capabilities`, `search`, `fetch`, `fetch_image` (lean snippet shape); write tools `add_memory`, `update`, `delete`, `add_image`, `delete_image`, `propose_update`, and the image-upload flow — same write capability as the Claude endpoint, gated by token scope |
 
 **Binary blobs.** `reliquary_add_image` stores a file (base64) plus a searchable caption;
 it returns a `blob_id`, a `memory_id`, and a signed `url`. Find images later with
@@ -153,8 +153,9 @@ restarts — without it, every restart (e.g. a deploy) signs the connector out.
 ### Connecting ChatGPT
 
 Add an MCP server at `https://your-host/openai/mcp` with **API key** auth
-(`Bearer` scheme) using `RELIQUARY_OPENAI_MCP_TOKEN`. Keep
-`RELIQUARY_OPENAI_ALLOW_NOAUTH=false` so the token is required.
+(`Bearer` scheme) using `RELIQUARY_OPENAI_MCP_TOKEN`, or connect via OAuth. A
+valid token is always required, and a write-scoped token gets the same write
+tools as the Claude endpoint.
 
 ## Configuration
 
@@ -164,9 +165,7 @@ config file (see [config.example.yaml](config.example.yaml)). Highlights:
 | Variable | Purpose |
 |----------|---------|
 | `RELIQUARY_CLAUDE_MCP_TOKEN` | bearer for `/claude/mcp` (required for write + OAuth) |
-| `RELIQUARY_OPENAI_MCP_TOKEN` | bearer for `/openai/mcp` |
-| `RELIQUARY_OPENAI_ALLOW_NOAUTH` | `true` to allow unauthenticated `/openai/mcp` (default `false`) |
-| `RELIQUARY_OPENAI_ALLOW_WRITE` | expose `add_memory` + `delete` on `/openai/mcp` (default `false`). **Refuses to start** with `ALLOW_NOAUTH=true`, to avoid public write. |
+| `RELIQUARY_OPENAI_MCP_TOKEN` | bearer for `/openai/mcp` (OAuth also works; required for any access, write-capable by scope) |
 | `RELIQUARY_OAUTH_CLIENT_ID` / `RELIQUARY_OAUTH_ALLOW_REGISTRATION` | lock the OAuth shim to one known client |
 | `RELIQUARY_STATE_DIR` | dir that persists OAuth tokens + MCP sessions across restarts (**set this to stay signed in**) |
 | `RELIQUARY_OAUTH_ACCESS_TOKEN_TTL` / `RELIQUARY_OAUTH_REFRESH_TOKEN_TTL` | access-token lifetime (default 5 days) / refresh-token lifetime (default `0` = non-expiring) |
@@ -176,8 +175,9 @@ Run `python app/server.py --help` for the full flag list.
 
 ## Security notes
 
-- **Default-closed.** `/openai/mcp` requires a bearer by default; the write tool
-  is opt-in and cannot be combined with no-auth.
+- **Default-closed.** Every endpoint requires a valid token; there is no
+  anonymous access. Write vs read is decided by the token's scope, identically
+  for the Claude and OpenAI endpoints.
 - **OAuth tokens are derived & revocable.** The connector gets a short-lived,
   resource-scoped access token (default 5 days) plus a **rotating refresh token**
   (non-expiring by default, with reuse detection) so it renews silently. Set

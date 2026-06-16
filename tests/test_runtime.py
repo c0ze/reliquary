@@ -227,6 +227,28 @@ def test_legacy_mcp_token_maps_to_claude_token():
     assert LEGACY_ENV_RENAMES["MEM0_MCP_TOKEN"] == "RELIQUARY_CLAUDE_MCP_TOKEN"
 
 
+def test_warn_flags_obsolete_openai_write_and_noauth_vars(caplog):
+    from server import warn_legacy_env_vars
+    import logging
+    env = {
+        "RELIQUARY_OPENAI_ALLOW_WRITE": "true",
+        "RELIQUARY_OPENAI_ALLOW_NOAUTH": "false",
+        "PATH": "/usr/bin",
+    }
+    with caplog.at_level(logging.WARNING):
+        warn_legacy_env_vars(env)
+    assert "RELIQUARY_OPENAI_ALLOW_WRITE" in caplog.text
+    assert "RELIQUARY_OPENAI_ALLOW_NOAUTH" in caplog.text
+    assert "obsolete" in caplog.text.lower()
+
+
+def test_obsolete_vars_are_not_treated_as_renames():
+    # The removed flags must not masquerade as MEM0_* -> RELIQUARY_* renames.
+    from server import LEGACY_ENV_RENAMES
+    assert "MEM0_OPENAI_ALLOW_WRITE" not in LEGACY_ENV_RENAMES
+    assert "MEM0_OPENAI_ALLOW_NOAUTH" not in LEGACY_ENV_RENAMES
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

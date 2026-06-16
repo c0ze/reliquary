@@ -38,7 +38,6 @@ def _proxy_with_static_tokens(tmp_path, fake_memory, static_tokens):
         user_id="my_lord",
         claude_token="claude-secret",
         openai_token="openai-secret",
-        openai_allow_write=True,
         blob_dir=str(tmp_path / "blobs_scopes"),
         blob_signing_key="test-signing-key-scopes",
         static_tokens=static_tokens,
@@ -80,23 +79,25 @@ def test_resolve_scope_unknown_bearer_is_none(proxy):
     assert proxy.resolve_scope(profile, _headers("not-a-real-token")) is None
 
 
-def test_resolve_scope_noauth_profile_gives_read(proxy):
-    # The OpenAI profile in conftest has allow_noauth=False; build a custom one
-    # with allow_noauth=True to test the no-auth path.
-    from server import EndpointProfile
-    noauth_profile = EndpointProfile(
-        name="noauth-test",
-        path="/test/mcp",
-        token=None,
-        allow_write=False,
-        allow_noauth=True,
-    )
-    assert proxy.resolve_scope(noauth_profile, {}) == "read"
+def test_resolve_scope_no_auth_openai_is_none(proxy):
+    # No anonymous access on any endpoint: a tokenless request to OpenAI (which
+    # used to allow opt-in no-auth reads) now resolves to None, same as Claude.
+    profile = proxy.endpoint_profiles[proxy.settings.openai_mcp_path]
+    assert proxy.resolve_scope(profile, {}) is None
 
 
-def test_resolve_scope_no_auth_non_noauth_profile_is_none(proxy):
+def test_resolve_scope_no_auth_claude_is_none(proxy):
     profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
     assert proxy.resolve_scope(profile, {}) is None
+
+
+def test_openai_endpoint_is_write_capable_like_claude(proxy):
+    # Both endpoints are symmetric: allow_write is True, and the endpoint's own
+    # master token grants write scope.
+    claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    openai = proxy.endpoint_profiles[proxy.settings.openai_mcp_path]
+    assert claude.allow_write is True and openai.allow_write is True
+    assert proxy.resolve_scope(openai, _headers("openai-secret")) == "write"
 
 
 # ---------------------------------------------------------------------------
