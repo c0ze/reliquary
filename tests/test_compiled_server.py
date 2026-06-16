@@ -646,3 +646,49 @@ def test_synthesis_excluded_by_non_matching_filter(proxy):
     assert "dev-tooling" in ids_domain, (
         "synthesis page dev-tooling (domain=dev) must be included when searching with domain=dev"
     )
+
+
+# ---------------------------------------------------------------------------
+# page_history enrichment (per-revision ts/status) + delete_page
+# ---------------------------------------------------------------------------
+
+
+def test_page_history_enriched_revisions(proxy):
+    _file_page(proxy, "enrich-rev", markdown="V1")
+    _file_page(proxy, "enrich-rev", markdown="V2")
+    sc = run(proxy.handle_page_history_tool({"slug": "enrich-rev"}))["structuredContent"]
+    # Back-compat: blob-id list still present, newest first.
+    assert len(sc["revisions"]) == 2
+    assert sc["current"] == sc["revisions"][0]
+    # Enriched rows carry ts/status/current and the head is flagged current.
+    hist = sc["history"]
+    assert len(hist) == 2
+    assert hist[0]["current"] is True and hist[1]["current"] is False
+    assert hist[0]["status"] == "current"
+    assert isinstance(hist[0]["ts"], (int, float)) and hist[0]["ts"] > 0
+    # The superseded revision recorded its own timestamp at supersede time.
+    assert isinstance(hist[1]["ts"], (int, float)) and hist[1]["ts"] > 0
+
+
+def test_delete_page_removes_page_and_memory(proxy):
+    _file_page(proxy, "doomed-page", markdown="bye")
+    assert proxy.pages.get("doomed-page") is not None
+    result = run(proxy.handle_delete_page_tool({"slug": "doomed-page"}))
+    sc = result["structuredContent"]
+    assert result.get("isError") is not True
+    assert sc["deleted"] is True and sc["slug"] == "doomed-page"
+    # Page is gone from the registry and its history no longer resolves.
+    assert proxy.pages.get("doomed-page") is None
+    assert run(proxy.handle_page_history_tool({"slug": "doomed-page"})).get("isError") is True
+
+
+def test_delete_page_not_found(proxy):
+    result = run(proxy.handle_delete_page_tool({"slug": "never-existed"}))
+    assert result.get("isError") is True
+    assert result["structuredContent"]["error"] == "not_found"
+
+
+def test_delete_page_requires_write_scope(proxy):
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    out = run(proxy.call_mcp_tool(profile, "reliquary_delete_page", {"slug": "x"}, can_write=False))
+    assert out["structuredContent"]["error"] == "insufficient_scope"

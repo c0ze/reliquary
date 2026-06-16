@@ -98,7 +98,7 @@ The Mem0 library brand (prose, links, `config.yaml` library keys) is unchanged; 
 
 | Endpoint | For | Auth | Tools |
 |----------|-----|------|-------|
-| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `reliquary_capabilities`, `reliquary_status`, `reliquary_search`, `reliquary_fetch`, `reliquary_add_memory`, `reliquary_update`, `reliquary_delete`, `reliquary_propose_update`, `reliquary_compile_page`, `reliquary_list_pages`, `reliquary_page_history`, `reliquary_list_domains`, `reliquary_add_image`, `reliquary_fetch_image`, `reliquary_delete_image`, `reliquary_create_image_upload`, `reliquary_commit_image_upload` |
+| `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `reliquary_capabilities`, `reliquary_status`, `reliquary_search`, `reliquary_fetch`, `reliquary_add_memory`, `reliquary_update`, `reliquary_delete`, `reliquary_propose_update`, `reliquary_compile_page`, `reliquary_delete_page`, `reliquary_list_pages`, `reliquary_page_history`, `reliquary_list_domains`, `reliquary_add_image`, `reliquary_fetch_image`, `reliquary_delete_image`, `reliquary_create_image_upload`, `reliquary_commit_image_upload` |
 | `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer or OAuth | `capabilities`, `search`, `fetch`, `fetch_image` (lean snippet shape); write tools `add_memory`, `update`, `delete`, `add_image`, `delete_image`, `propose_update`, and the image-upload flow — same write capability as the Claude endpoint, gated by token scope |
 
 **Binary blobs.** `reliquary_add_image` stores a file (base64) plus a searchable caption;
@@ -116,7 +116,9 @@ revision in the blob store, indexed into a **separate Qdrant collection**, and
 cited back to its source memories via `derived_from`. Search then leads with a
 relevant *current* synthesis and surfaces raw memories as its evidence. New raw
 writes flag dependent pages `stale` (a queued suggestion, never an auto-rewrite).
-Inspect pages with `reliquary_list_pages` / `reliquary_page_history`, and read the
+Inspect pages with `reliquary_list_pages` / `reliquary_page_history` (the latter
+reports per-revision timestamp + status), archive a page by re-filing it with
+`status=archived`, or permanently remove one with `reliquary_delete_page`. Read the
 `reliquary://schema`, `reliquary://recent`, `reliquary://needs-review`, and
 `reliquary://domain/<d>/index` resources. It is on by default; set
 `RELIQUARY_COMPILED_COLLECTION=` (empty) to disable (an empty layer is a query-time

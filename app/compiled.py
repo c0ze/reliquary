@@ -53,6 +53,10 @@ class PageInfo:
     created_at: float = 0.0
     updated_at: float = 0.0
     history: list[str] = field(default_factory=list)
+    # Per-superseded-revision metadata, parallel to `history` (same order): each
+    # entry is {"blob", "ts", "status"} captured when that revision was replaced.
+    # Older registries predate this field, so it can be shorter than `history`.
+    revisions_meta: list[dict] = field(default_factory=list)
     memory_id: str | None = None
 
 
@@ -155,6 +159,13 @@ class PageRegistry:
                                        mimetype="text/markdown")
             if existing and existing.current_blob and existing.current_blob != blob_info.id:
                 info.history.append(existing.current_blob)
+                # Capture the superseded revision's timestamp + status so
+                # page_history can report when/how each revision changed.
+                info.revisions_meta.append({
+                    "blob": existing.current_blob,
+                    "ts": existing.updated_at,
+                    "status": existing.status,
+                })
             info.current_blob = blob_info.id
             self._save(info)
             return info
@@ -183,6 +194,42 @@ class PageRegistry:
     def history(self, slug: str) -> "list[str]":
         info = self.get(slug)
         return list(info.history) if info else []
+
+    def history_detailed(self, slug: str) -> "list[dict] | None":
+        """Per-revision rows, newest first: the current revision followed by the
+        superseded ones. Each row is {blob, ts, status, current}. Revisions filed
+        before revision metadata existed report ts=None/status=None."""
+        info = self.get(slug)
+        if info is None:
+            return None
+        rows = [{"blob": info.current_blob, "ts": info.updated_at,
+                 "status": info.status, "current": True}]
+        meta_by_blob = {m.get("blob"): m for m in info.revisions_meta}
+        for blob in reversed(info.history):
+            m = meta_by_blob.get(blob, {})
+            rows.append({"blob": blob, "ts": m.get("ts"),
+                         "status": m.get("status"), "current": False})
+        return rows
+
+    def delete(self, slug: str) -> "PageInfo | None":
+        """Hard-delete a page: unlink its current + historical revision blobs
+        (ref-counted) and remove the registry entry. Returns the deleted PageInfo
+        (so the caller can clean up the indexed memory) or None if absent."""
+        with _REGISTRY_LOCK:
+            info = self.get(slug)
+            if info is None:
+                return None
+            for blob in [info.current_blob, *info.history]:
+                if blob:
+                    try:
+                        self.blobs.delete(blob)
+                    except Exception:
+                        pass  # best-effort; a missing/shared blob must not block delete
+            try:
+                os.remove(self._path(slug))
+            except FileNotFoundError:
+                pass
+            return info
 
     def set_status(self, slug: str, status: str) -> "PageInfo | None":
         with _REGISTRY_LOCK:

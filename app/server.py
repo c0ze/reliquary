@@ -33,6 +33,7 @@ from urlfetch import validate_public_url
 from helpers import (
     OPENAI_SNIPPET_CHAR_CAP,
     SEARCH_PREVIEW_CHAR_CAP,
+    SEARCH_PREVIEW_CHAR_CAP_MAX,
     coerce_threshold,
     decode_headers,
     decode_image_payload,
@@ -69,6 +70,11 @@ LIVE_LEXICAL_SCAN_LIMIT = 5000
 # Soft score bonus that floats project-matching memory up when caller context is
 # supplied (#42). Additive, excludes nothing; a no-op when context is absent.
 CONTEXT_MATCH_BONUS = 0.1
+# Score bonuses that float lexically exact matches above vector ties: a record
+# whose title (or topic/room slug) equals the query should outrank semantically
+# similar but inexact neighbours that share the same vector score. Additive.
+EXACT_TITLE_BONUS = 1.0
+EXACT_FIELD_BONUS = 0.5  # query == topic/room slug, or query is a substring of the title
 # A hyphenated identifier token (>= 3 segments, e.g. ARDA-RELIQUARY-IMAGE-20260605-01)
 # is the exact-recall case the live lexical fallback was built for (#28); used to
 # gate that fallback so healthy searches avoid the broad get_all scroll (#30).
@@ -986,7 +992,7 @@ class Mem0ChatProxy:
             "reliquary_add_memory", "reliquary_delete", "reliquary_update",
             "reliquary_add_image", "reliquary_delete_image",
             "reliquary_create_image_upload", "reliquary_commit_image_upload",
-            "reliquary_compile_page", "reliquary_propose_update",
+            "reliquary_compile_page", "reliquary_delete_page", "reliquary_propose_update",
             # OpenAI lean endpoint (carve-out — must stay bare)
             "add_memory", "delete", "update", "add_image", "delete_image",
             "create_image_upload", "commit_image_upload", "propose_update",
@@ -1476,6 +1482,8 @@ class Mem0ChatProxy:
                             "description": "Opaque pagination cursor from a previous response's nextCursor.",
                         },
                         "threshold": {"type": "number", "description": "Optional minimum similarity threshold."},
+                        "max_chars": {"type": "integer", "minimum": 100, "maximum": SEARCH_PREVIEW_CHAR_CAP_MAX,
+                                      "description": f"Per-hit body preview cap (default {SEARCH_PREVIEW_CHAR_CAP}). Lower it for compact results; full text via fetch."},
                         "user_id": {"type": "string", "description": "Optional Mem0 user_id override."},
                         "context": {"type": "object", "description": "Optional caller context (client, cwd, git_root, repo) for project-aware routing."},
                         "domain": {"type": "string", "description": "Hard metadata filter: restrict results to this domain (e.g. 'dev', 'life'). Bypasses query-text routing."},
@@ -1711,6 +1719,17 @@ class Mem0ChatProxy:
                     },
                 },
                 {
+                    "name": "reliquary_delete_page",
+                    "title": "Delete Synthesis Page",
+                    "description": "Hard-delete a compiled synthesis page by slug: removes its revisions and its indexed "
+                    "memory. Unlike status=archived (which keeps the page), this is permanent. Only compiled pages are "
+                    "affected; raw/imported corpus records are untouched.",
+                    "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+                    "inputSchema": {"type": "object", "properties": {
+                        "slug": {"type": "string", "description": "Slug of the page to delete (from reliquary_list_pages)."},
+                    }, "required": ["slug"], "additionalProperties": False},
+                },
+                {
                     "name": "reliquary_propose_update",
                     "title": "Propose Correction",
                     "description": "File a correction for a protected/imported record without mutating it. Stores a linked user-write record (kind=correction, status=proposed).",
@@ -1840,6 +1859,10 @@ class Mem0ChatProxy:
                 # Pages are a single global registry keyed by slug (not namespaced by
                 # user_id), so file them under the server user only — never a caller id.
                 return await self.handle_compile_page_tool(arguments, allow_user_id=False)
+            if tool_name == "reliquary_delete_page":
+                if not can_write:
+                    return self._scope_error(tool_name)
+                return await self.handle_delete_page_tool(arguments)
             if tool_name == "reliquary_add_image":
                 if not can_write:
                     return self._scope_error(tool_name)
@@ -1905,6 +1928,13 @@ class Mem0ChatProxy:
             if allow_threshold
             else self.settings.memory_threshold
         )
+        # Optional per-hit body cap override (clamped). Lets a caller request more
+        # compact previews to control token cost; full text is always via fetch.
+        if arguments.get("max_chars") is not None:
+            body_char_cap = self._coerce_int(
+                arguments.get("max_chars"), default=body_char_cap,
+                minimum=100, maximum=SEARCH_PREVIEW_CHAR_CAP_MAX,
+            )
 
         result_cap = offset + limit + 1
 
@@ -1928,7 +1958,8 @@ class Mem0ChatProxy:
                 by_key[key] = enriched
             raw_results = sorted(
                 by_key.values(),
-                key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)),
+                key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)
+                                    + self._exact_match_bonus(item, query)),
                                   str(item.get("id") or "")),
             )
             # Synthesis-first: apply ALL explicit filters so every taxonomy dimension
@@ -1964,7 +1995,8 @@ class Mem0ChatProxy:
             # context is present; it is 0.0 (no-op) when context is absent (#42).
             raw_results = sorted(
                 by_key.values(),
-                key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)),
+                key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)
+                                    + self._exact_match_bonus(item, query)),
                                   str(item.get("id") or "")),
             )
             # Synthesis-first (#50): a current synthesis leads; raw hits follow as evidence.
@@ -2223,14 +2255,44 @@ class Mem0ChatProxy:
         if not slug:
             return self.mcp_tool_result(text="A non-empty `slug` is required.",
                                         structured={"error": "missing_slug"}, is_error=True)
-        info = self.pages.get(slug)
+        detailed = self.pages.history_detailed(slug)
+        if detailed is None:
+            return self.mcp_tool_result(text=f"No page found for slug={slug}.",
+                                        structured={"error": "not_found", "slug": slug}, is_error=True)
+        return self.mcp_tool_result(
+            text=f"{len(detailed)} revision(s) for {slug}.",
+            structured={"slug": slug, "current": detailed[0]["blob"],
+                        # blob ids only, newest-first (back-compat with the old shape)
+                        "revisions": [r["blob"] for r in detailed],
+                        # enriched: per-revision blob + ts + status + current flag
+                        "history": detailed})
+
+    async def handle_delete_page_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.pages is None:
+            return self.mcp_tool_result(text="The compiled layer is not configured.",
+                                        structured={"error": "compiled_disabled"}, is_error=True)
+        slug = str(arguments.get("slug") or "").strip()
+        if not slug:
+            return self.mcp_tool_result(text="A non-empty `slug` is required.",
+                                        structured={"error": "missing_slug"}, is_error=True)
+        info = await asyncio.to_thread(self.pages.delete, slug)
         if info is None:
             return self.mcp_tool_result(text=f"No page found for slug={slug}.",
                                         structured={"error": "not_found", "slug": slug}, is_error=True)
-        revisions = [info.current_blob] + list(reversed(info.history))
-        return self.mcp_tool_result(text=f"{len(revisions)} revision(s) for {slug}.",
-                                    structured={"slug": slug, "current": info.current_blob,
-                                                "revisions": revisions})
+        # Also remove the page's indexed synthesis memory so it stops surfacing in search.
+        deleted_memory = None
+        if info.memory_id and self.compiled_memory is not None:
+            try:
+                await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
+                deleted_memory = info.memory_id
+            except Exception as exc:
+                LOG.warning("delete_page: page %s removed but its indexed memory %s lingers: %s",
+                            slug, info.memory_id, exc)
+        revisions_removed = len(info.history) + 1
+        return self.mcp_tool_result(
+            text=f"Deleted page slug={slug} ({revisions_removed} revision(s) removed).",
+            structured={"deleted": True, "slug": slug, "revisions_removed": revisions_removed,
+                        "memory_id": deleted_memory})
 
     async def handle_propose_update_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
         target_id = str(arguments.get("target_id") or "").strip()
@@ -3416,6 +3478,26 @@ class Mem0ChatProxy:
             return float(value)
         except (TypeError, ValueError):
             return 0.0
+
+    @staticmethod
+    def _exact_match_bonus(hit: dict[str, Any], query: str) -> float:
+        """Float lexically exact hits above same-score vector neighbours: full
+        title equality wins most, then topic/room slug equality or the query
+        appearing verbatim in the title. Slugs compare with '-'/' ' normalized."""
+        q = (query or "").strip().lower()
+        if not q:
+            return 0.0
+        md = hit.get("metadata") or {}
+        title = str(hit.get("title") or "").strip().lower()
+        if title and title == q:
+            return EXACT_TITLE_BONUS
+        norm = lambda s: str(s or "").strip().lower().replace("-", " ")
+        q_norm = norm(q)
+        if any(norm(md.get(f)) == q_norm and q_norm for f in ("topic", "room")):
+            return EXACT_FIELD_BONUS
+        if title and q in title:
+            return EXACT_FIELD_BONUS
+        return 0.0
 
     @staticmethod
     def _context_bonus(hit: dict[str, Any], context) -> float:

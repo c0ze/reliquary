@@ -49,7 +49,12 @@ if TYPE_CHECKING:
     import httpx
 
 
-SEARCH_PREVIEW_CHAR_CAP = 10000
+# Per-hit body cap for Claude-endpoint search previews. Kept modest so a
+# multi-hit search stays within a sane token budget; the full document is always
+# available via `fetch`, and a caller can override per-call with `max_chars`
+# (clamped to SEARCH_PREVIEW_CHAR_CAP_MAX).
+SEARCH_PREVIEW_CHAR_CAP = 2000
+SEARCH_PREVIEW_CHAR_CAP_MAX = 10000
 # ChatGPT/OpenAI deep-research connector expects lean search hits (short snippet
 # + id/title/url); the full document is pulled via the `fetch` tool.
 OPENAI_SNIPPET_CHAR_CAP = 500
