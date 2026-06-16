@@ -59,6 +59,11 @@ def test_capabilities_reflects_write_scope(proxy):
 
 
 def test_propose_update_stores_correction(proxy):
+    # Seed a live memory so the target_id validation passes.
+    proxy.memory._store["imp-1"] = {
+        "id": "imp-1", "memory": "original text", "metadata": {"source_group": "imported"},
+        "user_id": proxy.settings.user_id,
+    }
     result = run(proxy.handle_propose_update_tool({"target_id": "imp-1", "reason": "wrong date", "replacement_text": "Correct: 1999"}))
     assert result.get("isError") is not True
     sc = result["structuredContent"]
@@ -73,6 +78,52 @@ def test_propose_update_missing_target(proxy):
     result = run(proxy.handle_propose_update_tool({"reason": "x"}))
     assert result.get("isError") is True
     assert result["structuredContent"]["error"] == "missing_target"
+
+
+def test_propose_update_nonexistent_target_returns_not_found(proxy):
+    """A target_id that exists in neither catalog nor live memory must be rejected."""
+    initial_count = len(proxy.memory._store)
+    result = run(proxy.handle_propose_update_tool({
+        "target_id": "does-not-exist",
+        "reason": "something",
+    }))
+    assert result.get("isError") is True
+    sc = result["structuredContent"]
+    assert sc["error"] == "not_found"
+    assert sc["id"] == "does-not-exist"
+    assert "suggested_action" in sc
+    # No record was created.
+    assert len(proxy.memory._store) == initial_count
+
+
+def test_propose_update_valid_live_memory_target_succeeds(proxy):
+    """After adding a live memory, propose_update against its id must succeed."""
+    add_result = run(proxy.handle_add_memory_tool({"text": "a note to correct"}))
+    assert not add_result["isError"]
+    target_id = add_result["structuredContent"]["ids"][0]
+    result = run(proxy.handle_propose_update_tool({
+        "target_id": target_id,
+        "reason": "needs correction",
+        "replacement_text": "Corrected text",
+    }))
+    assert result.get("isError") is not True
+    sc = result["structuredContent"]
+    assert sc["target_id"] == target_id and sc["status"] == "proposed"
+
+
+def test_propose_update_valid_catalog_target_succeeds(proxy):
+    """A target_id in the catalog's records_by_id must be accepted."""
+    from types import SimpleNamespace
+    proxy.catalog = SimpleNamespace(
+        routeable_domains=[],
+        records_by_id={"cat-rec-1": SimpleNamespace(import_record_id="cat-rec-1", metadata={})},
+    )
+    result = run(proxy.handle_propose_update_tool({
+        "target_id": "cat-rec-1",
+        "reason": "wrong info",
+    }))
+    assert result.get("isError") is not True
+    assert result["structuredContent"]["target_id"] == "cat-rec-1"
 
 
 def test_propose_update_write_gated(proxy):
@@ -103,6 +154,11 @@ def test_protected_update_suggests_propose_update(proxy):
 
 def test_propose_update_openai_ignores_caller_user_id(proxy):
     # Lean endpoint (allow_user_id=False): a caller-supplied user_id must be ignored.
+    # Seed the target so it passes validation.
+    proxy.memory._store["imp-1"] = {
+        "id": "imp-1", "memory": "original", "metadata": {"source_group": "imported"},
+        "user_id": proxy.settings.user_id,
+    }
     run(proxy.handle_propose_update_tool({"target_id": "imp-1", "user_id": "intruder"}, allow_user_id=False))
     rec = next(r for r in proxy.memory._store.values() if r.get("metadata", {}).get("kind") == "correction")
     assert rec["user_id"] == proxy.settings.user_id  # server user, not "intruder"

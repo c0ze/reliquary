@@ -87,6 +87,51 @@ def test_openai_endpoint_keeps_search_and_fetch(proxy):
     assert not any(n.startswith("reliquary_") for n in names), names
 
 
+def test_search_explicit_domain_filter(proxy):
+    """Searching with domain= returns only domain-matching hits and echoes filters."""
+    proxy.memory._store["dev-1"] = {
+        "id": "dev-1", "memory": "alpha dev note", "metadata": {"domain": "dev"}, "user_id": "my_lord",
+    }
+    proxy.memory._store["misc-1"] = {
+        "id": "misc-1", "memory": "alpha misc note", "metadata": {"domain": "misc"}, "user_id": "my_lord",
+    }
+    claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    result = run(proxy.call_mcp_tool(claude, "reliquary_search", {"query": "alpha", "domain": "dev", "limit": 20}, can_write=False))
+    assert not result.get("isError"), result
+    sc = result["structuredContent"]
+    ids = {r["id"] for r in sc["results"]}
+    assert "dev-1" in ids
+    assert "misc-1" not in ids
+    assert sc.get("filters") == {"domain": "dev"}
+
+
+def test_search_no_filter_unchanged_behavior(proxy):
+    """Without explicit filters, search returns all matching records across domains."""
+    proxy.memory._store["dev-1"] = {
+        "id": "dev-1", "memory": "alpha dev note", "metadata": {"domain": "dev"}, "user_id": "my_lord",
+    }
+    proxy.memory._store["misc-1"] = {
+        "id": "misc-1", "memory": "alpha misc note", "metadata": {"domain": "misc"}, "user_id": "my_lord",
+    }
+    claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    result = run(proxy.call_mcp_tool(claude, "reliquary_search", {"query": "alpha", "limit": 20}, can_write=False))
+    assert not result.get("isError"), result
+    sc = result["structuredContent"]
+    ids = {r["id"] for r in sc["results"]}
+    assert "dev-1" in ids and "misc-1" in ids
+    # No filters echoed when none supplied.
+    assert "filters" not in sc
+
+
+def test_search_explicit_filters_in_schema(proxy):
+    """The Claude reliquary_search tool schema must advertise domain/hall/room/topic params."""
+    claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    tools = {t["name"]: t for t in proxy.mcp_tools_for(claude, can_write=False)}
+    search_schema = tools["reliquary_search"]["inputSchema"]["properties"]
+    for field in ("domain", "hall", "room", "topic"):
+        assert field in search_schema, f"missing {field!r} in reliquary_search schema"
+
+
 def test_search_pagination(proxy, monkeypatch):
     hits = [
         {

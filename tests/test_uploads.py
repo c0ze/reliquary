@@ -363,3 +363,65 @@ def test_orphaned_upload_blob_reaped_after_restart(make_proxy, tmp_path):
         assert p2.blobs.get(blob_id) is None
 
     run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Task 3: RELIQUARY_PUBLIC_BASE_URL — absolute signed URLs
+# ---------------------------------------------------------------------------
+
+import base64 as _base64
+
+_PNG_BYTES_SMALL = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+_PNG_B64_SMALL = _base64.b64encode(_PNG_BYTES_SMALL).decode("ascii")
+
+
+def test_blob_url_absolute_when_public_base_url_set(make_proxy):
+    """With public_base_url set, signed blob URLs must start with that base."""
+    p = make_proxy(public_base_url="https://r.example.com")
+    result = run(p.handle_add_image_tool({
+        "caption": "absolute url test",
+        "image_base64": _PNG_B64_SMALL,
+    }))
+    assert not result["isError"], result
+    url = result["structuredContent"]["url"]
+    assert url.startswith("https://r.example.com/blobs/"), f"expected absolute URL, got: {url}"
+
+
+def test_blob_url_relative_without_public_base_url(proxy):
+    """Without public_base_url, signed blob URLs must start with /blobs/."""
+    result = run(proxy.handle_add_image_tool({
+        "caption": "relative url test",
+        "image_base64": _PNG_B64_SMALL,
+    }))
+    assert not result["isError"], result
+    url = result["structuredContent"]["url"]
+    assert url.startswith("/blobs/"), f"expected relative URL, got: {url}"
+
+
+def test_upload_url_absolute_when_public_base_url_set(make_proxy):
+    """With public_base_url set, the create_image_upload URL must be absolute."""
+    p = make_proxy(public_base_url="https://r.example.com")
+    profile = p.endpoint_profiles[p.settings.claude_mcp_path]
+    result = run(p.call_mcp_tool(
+        profile,
+        "reliquary_create_image_upload",
+        {"mimetype": "image/png", "size": len(_PNG_BYTES_SMALL)},
+        can_write=True,
+    ))
+    assert not result["isError"], result
+    upload_url = result["structuredContent"]["upload_url"]
+    assert upload_url.startswith("https://r.example.com/uploads/"), f"expected absolute URL, got: {upload_url}"
+
+
+def test_upload_url_relative_without_public_base_url(proxy):
+    """Without public_base_url, the create_image_upload URL must start with /uploads/."""
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    result = run(proxy.call_mcp_tool(
+        profile,
+        "reliquary_create_image_upload",
+        {"mimetype": "image/png", "size": len(_PNG_BYTES_SMALL)},
+        can_write=True,
+    ))
+    assert not result["isError"], result
+    upload_url = result["structuredContent"]["upload_url"]
+    assert upload_url.startswith("/uploads/"), f"expected relative URL, got: {upload_url}"
