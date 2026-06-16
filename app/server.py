@@ -2175,6 +2175,16 @@ class Mem0ChatProxy:
                 structured={"error": "missing_target",
                             "suggested_action": "Pass target_id = the id of the record you want to correct."},
                 is_error=True)
+        # Validate that the target exists — either as an imported catalog record or as
+        # a live memory — before filing a correction. An unknown id would create an
+        # orphaned correction that points to nothing.
+        in_catalog = bool(self.catalog and target_id in self.catalog.records_by_id)
+        if not in_catalog and (await self.fetch_live_memory(target_id)) is None:
+            return self.mcp_tool_result(
+                text=f"No record found for target_id={target_id!r}.",
+                structured={"error": "not_found", "id": target_id,
+                            "suggested_action": "target_id must be an existing record id from reliquary_search"},
+                is_error=True)
         user_id = str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
         reason = str(arguments.get("reason") or "").strip()
         replacement = str(arguments.get("replacement_text") or "").strip()
