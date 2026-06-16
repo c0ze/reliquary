@@ -76,6 +76,9 @@ _EXACT_ID_RE = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+){2,}")
 # Minimum vector score for a current synthesis page to lead search results.
 # 0.0 = lead whenever a current synthesis matches at all (simple MVP; tunable).
 COMPILED_LEAD_MIN_SCORE = 0.0
+# Max blob size (bytes) to include image_base64 inline in fetch_image structuredContent.
+# Above this cap, the field is omitted and the text notes the signed URL instead.
+INLINE_IMAGE_MAX_BYTES = 1_000_000
 
 # Former MEM0_* env var names -> their RELIQUARY_* replacements. Used only to warn
 # operators who still have stale vars set; the old names are no longer read.
@@ -1217,6 +1220,7 @@ class Mem0ChatProxy:
             "what": "Reliquary: domain-neutral semantic memory over Mem0 + Qdrant, served over MCP.",
             "endpoint": profile.name,
             "tools": available,
+            "write_authorized": bool(can_write),
             "write_tools_when_authorized": write_only,
             "rules": {
                 "imported_records": "read-only (protected); user-written records are mutable",
@@ -2784,9 +2788,16 @@ class Mem0ChatProxy:
         data, mimetype = result
         encoded = base64.b64encode(data).decode("ascii")
         url = self._signed_blob_url(blob_id)
+        size = len(data)
+        structured: dict[str, Any] = {"blob_id": blob_id, "url": url, "mimetype": mimetype, "size": size}
+        if size <= INLINE_IMAGE_MAX_BYTES:
+            structured["image_base64"] = encoded
+            note = ""
+        else:
+            note = f" Inline bytes omitted (size {size} > {INLINE_IMAGE_MAX_BYTES}); download via the signed URL."
         return self.mcp_tool_result(
-            text=f"Image {blob_id} ({mimetype}, {len(data)} bytes). Download: {url}",
-            structured={"blob_id": blob_id, "url": url, "mimetype": mimetype, "size": len(data)},
+            text=f"Image {blob_id} ({mimetype}, {size} bytes). Download: {url}{note}",
+            structured=structured,
             image=(encoded, mimetype),
         )
 
