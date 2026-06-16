@@ -89,13 +89,30 @@ _RENAMED_ENV_SUFFIXES = (
     "EMBEDDER_MODEL", "EMBEDDER_PROVIDER", "IMAGE_URL_INGEST", "LINT_COVERAGE_MIN",
     "MEMORY_CONCURRENT_READS", "METRICS_PUBLIC", "OAUTH_ACCESS_TOKEN_TTL",
     "OAUTH_ALLOW_REGISTRATION", "OAUTH_CLIENT_ID", "OAUTH_REFRESH_TOKEN_TTL",
-    "OAUTH_VERBATIM_TOKEN", "OPENAI_ALLOW_NOAUTH", "OPENAI_ALLOW_WRITE",
+    "OAUTH_VERBATIM_TOKEN",
     "OPENAI_MCP_PATH", "OPENAI_MCP_TOKEN", "RATE_LIMIT_SEARCHES", "RATE_LIMIT_WRITES",
     "SCHEMA_PATH", "STATE_DIR", "STATIC_TOKENS", "WRITEBACK_PATH",
 )
 LEGACY_ENV_RENAMES = {f"MEM0_{s}": f"RELIQUARY_{s}" for s in _RENAMED_ENV_SUFFIXES}
 # The dropped alias has no suffix-symmetric successor; point operators at the canonical name:
 LEGACY_ENV_RENAMES["MEM0_MCP_TOKEN"] = "RELIQUARY_CLAUDE_MCP_TOKEN"
+
+# Env vars for features that no longer exist. Unlike renames these have no
+# successor; warn so operators delete them, but setting them has no effect.
+_OPENAI_WRITE_REMOVED_NOTE = (
+    "removed - the OpenAI endpoint is now symmetric with Claude: write-capable, "
+    "gated by OAuth/token scope. No separate write flag is needed."
+)
+_OPENAI_NOAUTH_REMOVED_NOTE = (
+    "removed - there is no anonymous access on any endpoint. Every request needs "
+    "a valid token (master/static/OAuth); without one the connection is rejected."
+)
+OBSOLETE_ENV_VARS = {
+    "RELIQUARY_OPENAI_ALLOW_WRITE": _OPENAI_WRITE_REMOVED_NOTE,
+    "MEM0_OPENAI_ALLOW_WRITE": _OPENAI_WRITE_REMOVED_NOTE,
+    "RELIQUARY_OPENAI_ALLOW_NOAUTH": _OPENAI_NOAUTH_REMOVED_NOTE,
+    "MEM0_OPENAI_ALLOW_NOAUTH": _OPENAI_NOAUTH_REMOVED_NOTE,
+}
 
 
 def warn_legacy_env_vars(env=None) -> dict[str, str]:
@@ -109,6 +126,12 @@ def warn_legacy_env_vars(env=None) -> dict[str, str]:
         LOG.warning(
             "Ignoring %d legacy MEM0_* env var(s) - Reliquary now reads RELIQUARY_* "
             "names. Rename in your environment:\n%s", len(found), lines
+        )
+    obsolete = {name: why for name, why in OBSOLETE_ENV_VARS.items() if name in env}
+    if obsolete:
+        lines = "\n".join(f"  {name}: {why}" for name, why in sorted(obsolete.items()))
+        LOG.warning(
+            "Ignoring %d obsolete env var(s); safe to delete:\n%s", len(obsolete), lines
         )
     return found
 
@@ -251,7 +274,6 @@ class EndpointProfile:
     path: str
     token: str | None
     allow_write: bool
-    allow_noauth: bool
 
 
 @dataclass
@@ -273,8 +295,6 @@ class ProxySettings:
     openai_mcp_path: str = "/openai/mcp"
     claude_token: str | None = None
     openai_token: str | None = None
-    openai_allow_noauth: bool = False
-    openai_allow_write: bool = False
     mcp_allowed_origins: tuple[str, ...] = ()
     dataset_path: str | None = None
     oauth_client_id: str | None = None
@@ -356,20 +376,21 @@ class Mem0ChatProxy:
             session_store = JsonFileStore(os.path.join(settings.state_dir, "mcp_sessions.json"))
         self.mcp_sessions = MCPSessionStore(max_size=MCP_MAX_SESSIONS, ttl=MCP_SESSION_TTL, session_store=session_store)
 
+        # Both endpoints are symmetric: a valid token (master/static/OAuth) is
+        # required for any access, and its scope decides read vs write. There is
+        # no anonymous access - no token means no connection.
         self.endpoint_profiles = {
             settings.claude_mcp_path: EndpointProfile(
                 name="claude",
                 path=settings.claude_mcp_path,
                 token=settings.claude_token,
                 allow_write=True,
-                allow_noauth=False,
             ),
             settings.openai_mcp_path: EndpointProfile(
                 name="openai",
                 path=settings.openai_mcp_path,
                 token=settings.openai_token,
-                allow_write=settings.openai_allow_write,
-                allow_noauth=settings.openai_allow_noauth,
+                allow_write=True,
             ),
         }
 
@@ -659,8 +680,6 @@ class Mem0ChatProxy:
                 "openai_mcp_path": self.settings.openai_mcp_path,
                 "claude_auth_enabled": bool(self.settings.claude_token),
                 "openai_auth_enabled": bool(self.settings.openai_token),
-                "openai_allow_noauth": self.settings.openai_allow_noauth,
-                "openai_allow_write": self.settings.openai_allow_write,
                 "oauth_client_id_fixed": bool(self.settings.oauth_client_id),
                 "oauth_registration_enabled": self.settings.oauth_allow_registration,
                 "catalog_loaded": self.catalog is not None,
@@ -1225,8 +1244,7 @@ class Mem0ChatProxy:
             "rules": {
                 "imported_records": "read-only (protected); user-written records are mutable",
                 "corrections": f"propose changes to imported records with {tp}propose_update (never mutates the import)",
-                "write_scope": "write tools require a write-scoped token" + (
-                    "; this endpoint also requires RELIQUARY_OPENAI_ALLOW_WRITE" if is_openai else ""),
+                "write_scope": "write tools require a write-scoped token",
                 "user_id": "not accepted on the OpenAI endpoint" if is_openai else "optional override accepted",
             },
             "images": f"store/fetch binary blobs with {tp}add_image / {tp}fetch_image (+ upload flow)",
@@ -3474,11 +3492,11 @@ class Mem0ChatProxy:
     def resolve_scope(self, profile: EndpointProfile, headers: dict[str, str]) -> str | None:
         """Return the granted scope ('write'/'read') for this request, or None if
         unauthorized. Master token => write; a matching static token => its scope;
-        a valid OAuth token => its issued scope; no auth => 'read' iff the endpoint
-        allows no-auth."""
+        a valid OAuth token => its issued scope; no auth => None (no anonymous
+        access on any endpoint)."""
         authorization = headers.get("authorization", "").strip()
         if not authorization:
-            return "read" if profile.allow_noauth else None
+            return None
         scheme, _, token = authorization.partition(" ")
         token = token.strip()
         if scheme.lower() != "bearer" or not token:
@@ -4011,8 +4029,6 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         openai_mcp_path=args.openai_mcp_path,
         claude_token=claude_token,
         openai_token=openai_token,
-        openai_allow_noauth=args.openai_allow_noauth,
-        openai_allow_write=args.openai_allow_write,
         mcp_allowed_origins=tuple(args.mcp_allowed_origin),
         dataset_path=args.dataset,
         oauth_client_id=normalize_token(args.oauth_client_id),
@@ -4073,23 +4089,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--system-instruction", default=DEFAULT_MEMORY_INSTRUCTION, help="Instruction text injected ahead of the retrieved memory block.")
     parser.add_argument("--claude-mcp-path", default=os.getenv("RELIQUARY_CLAUDE_MCP_PATH", "/claude/mcp"), help="Path for the bearer-protected Claude MCP endpoint.")
-    parser.add_argument("--openai-mcp-path", default=os.getenv("RELIQUARY_OPENAI_MCP_PATH", "/openai/mcp"), help="Path for the read-only OpenAI/ChatGPT MCP endpoint.")
+    parser.add_argument("--openai-mcp-path", default=os.getenv("RELIQUARY_OPENAI_MCP_PATH", "/openai/mcp"), help="Path for the OpenAI/ChatGPT MCP endpoint.")
     parser.add_argument("--claude-mcp-token", default=os.getenv("RELIQUARY_CLAUDE_MCP_TOKEN"), help="Bearer token required for the Claude MCP endpoint.")
-    parser.add_argument("--openai-mcp-token", default=os.getenv("RELIQUARY_OPENAI_MCP_TOKEN"), help="Optional bearer token for the OpenAI MCP endpoint.")
-    parser.add_argument(
-        "--openai-allow-noauth",
-        action=argparse.BooleanOptionalAction,
-        default=os.getenv("RELIQUARY_OPENAI_ALLOW_NOAUTH", "false").lower() in {"1", "true", "yes"},
-        help="Allow unauthenticated requests to the OpenAI MCP endpoint (default false). "
-        "Opt in only when the endpoint is not reachable from untrusted networks.",
-    )
-    parser.add_argument(
-        "--openai-allow-write",
-        action=argparse.BooleanOptionalAction,
-        default=os.getenv("RELIQUARY_OPENAI_ALLOW_WRITE", "false").lower() in {"1", "true", "yes"},
-        help="Expose the add_memory write tool on the OpenAI MCP endpoint (default false: read-only). "
-        "Only enable when the endpoint's bearer token is trusted to write to the corpus.",
-    )
+    parser.add_argument("--openai-mcp-token", default=os.getenv("RELIQUARY_OPENAI_MCP_TOKEN"), help="Optional bearer token for the OpenAI MCP endpoint (OAuth also works).")
     parser.add_argument("--oauth-client-id", default=os.getenv("RELIQUARY_OAUTH_CLIENT_ID"), help="Pre-shared OAuth client_id. When set, only this id is accepted.")
     parser.add_argument(
         "--oauth-allow-registration",
@@ -4192,14 +4194,6 @@ def main() -> None:
     )
     warn_legacy_env_vars()
     settings = build_settings(args)
-    if settings.openai_allow_write and settings.openai_allow_noauth:
-        # No-auth lets tokenless requests through regardless of any configured
-        # token, so write + no-auth = anyone can write/poison the corpus. Refuse.
-        raise SystemExit(
-            "Refusing to start: --openai-allow-write together with --openai-allow-noauth would "
-            "expose PUBLIC WRITE access to the memory store on /openai/mcp. Require a bearer first: "
-            "set RELIQUARY_OPENAI_ALLOW_NOAUTH=false (and a RELIQUARY_OPENAI_MCP_TOKEN) before enabling writes."
-        )
     if settings.oauth_access_token_ttl <= 0:
         raise SystemExit(
             "Refusing to start: RELIQUARY_OAUTH_ACCESS_TOKEN_TTL must be > 0 "
@@ -4214,14 +4208,6 @@ def main() -> None:
         LOG.warning(
             "Claude MCP endpoint has no bearer token configured. "
             "Set RELIQUARY_CLAUDE_MCP_TOKEN (or --claude-mcp-token) to require auth."
-        )
-    if settings.openai_allow_noauth and settings.host not in {"127.0.0.1", "localhost", "::1"}:
-        LOG.warning(
-            "OpenAI MCP endpoint allows unauthenticated access AND is bound to %s "
-            "(not loopback). The entire memory corpus is readable without a token. "
-            "Set --no-openai-allow-noauth (or RELIQUARY_OPENAI_ALLOW_NOAUTH=false) unless this "
-            "host is on a trusted network.",
-            settings.host,
         )
     app = Mem0ChatProxy(settings)
     import uvicorn

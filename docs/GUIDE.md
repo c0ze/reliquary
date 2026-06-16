@@ -38,9 +38,9 @@ AI assistants can query and append to over MCP:
 - **Taxonomy routing** — optional `domain / hall / room / topic` metadata lets a
   query that mentions a known area (e.g. "infra", "pagan") get routed to a
   narrower pool *before* falling back to global search, which sharpens results.
-- **Two MCP endpoints** — a full read+write one shaped for the **Claude.ai**
-  connector, and a lean, deep-research-shaped read (optionally write) one for
-  **ChatGPT**.
+- **Two MCP endpoints** — a full one shaped for the **Claude.ai** connector, and
+  a lean, deep-research-shaped one for **ChatGPT** — both read+write, gated by
+  token scope.
 - **OAuth 2.1 shim** — PKCE + dynamic client registration + revocable,
   resource-scoped tokens, so the Claude.ai Custom Connector can authenticate.
 - **No GPU, no chat LLM required** for retrieval — just an embedding model and a
@@ -59,8 +59,8 @@ AI assistants can query and append to over MCP:
 ```text
                  ┌────────────────────────────────────────────┐
    Claude.ai ───▶│  reliquary app  (ASGI / uvicorn)           │
-   ChatGPT   ───▶│   • /claude/mcp   (full read+write)        │
-   curl      ───▶│   • /openai/mcp   (lean read, opt-in write)│
+   ChatGPT   ───▶│   • /claude/mcp   (full, read+write)       │
+   curl      ───▶│   • /openai/mcp   (lean, read+write)       │
                  │   • OAuth 2.1 shim, /healthz, /status       │
                  │   • brand assets: /favicon.ico, /icon*.png  │
                  └───────────────┬───────────────┬────────────┘
@@ -97,7 +97,7 @@ response echoes the applied `filters`.
 | Path | Method | Auth | Purpose |
 |------|--------|------|---------|
 | `/claude/mcp` | POST | Bearer or OAuth | Full MCP: `reliquary_status`, `reliquary_search`, `reliquary_fetch`, `reliquary_add_memory`, `reliquary_delete`, image/blob tools |
-| `/openai/mcp` | POST | Bearer (or no-auth) | Lean MCP: `search`, `fetch`, + write/image tools if writes enabled |
+| `/openai/mcp` | POST | Bearer or OAuth | Lean MCP: `search`, `fetch`, + write/image tools — same write capability as Claude, gated by token scope |
 | `/uploads/{upload_id}` | POST | Same MCP bearer (write) | Raw binary upload endpoint returned by `reliquary_create_image_upload`; finalize with `reliquary_commit_image_upload` |
 | `/healthz` | GET | none | Liveness check |
 | `/status` | GET | Claude bearer | Config + taxonomy introspection |
@@ -203,9 +203,7 @@ file** (`config.yaml`). Run `python app/server.py --help` for every flag.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `RELIQUARY_CLAUDE_MCP_TOKEN` | — | Bearer for `/claude/mcp` (required for write + OAuth) |
-| `RELIQUARY_OPENAI_MCP_TOKEN` | — | Bearer for `/openai/mcp` |
-| `RELIQUARY_OPENAI_ALLOW_NOAUTH` | `false` | `true` lets anyone reaching `/openai/mcp` read with no token |
-| `RELIQUARY_OPENAI_ALLOW_WRITE` | `false` | Expose `add_memory` + `delete` on `/openai/mcp`. **Refuses to start** together with `ALLOW_NOAUTH=true` (no public write) |
+| `RELIQUARY_OPENAI_MCP_TOKEN` | — | Bearer for `/openai/mcp` (OAuth also works; required for any access, write-capable by scope) |
 | `RELIQUARY_OAUTH_CLIENT_ID` | — | Pin the OAuth client id; only this id is accepted |
 | `RELIQUARY_OAUTH_ALLOW_REGISTRATION` | `true` | Allow `POST /oauth/register` (DCR). Disable after the connector registers once |
 | `RELIQUARY_OAUTH_VERBATIM_TOKEN` | `false` | Return the master bearer verbatim instead of a derived, revocable token |
@@ -355,12 +353,13 @@ There are **two** auth surfaces, one per connector.
 
 ChatGPT connectors use a static API key. Add an MCP server at
 `https://your-host/openai/mcp` with **API key / Bearer** auth, using
-`RELIQUARY_OPENAI_MCP_TOKEN`. Keep `RELIQUARY_OPENAI_ALLOW_NOAUTH=false` so the token is
-required.
+`RELIQUARY_OPENAI_MCP_TOKEN`. A valid token is always required — there is no
+anonymous access.
 
-To let ChatGPT **write**, set `RELIQUARY_OPENAI_ALLOW_WRITE=true` (exposes
-`add_memory`). The server **refuses to start** if write is enabled together with
-no-auth, to avoid an unauthenticated public write surface.
+The OpenAI endpoint is symmetric with Claude: a write-scoped token (the master
+bearer, a `write` static token, or a write-scoped OAuth grant) gets the full
+write tool set (`add_memory`, `update`, `delete`, image tools); a read-scoped
+token is read-only.
 
 ### Claude.ai — OAuth 2.1 (with a built-in shim)
 
@@ -639,10 +638,11 @@ sequence: `/.well-known/*` → `/oauth/register` → `/oauth/authorize` →
 
 ## Security notes
 
-- **Default-closed.** `/openai/mcp` requires a bearer by default; the write tool
-  is opt-in and **cannot** be combined with no-auth.
+- **Default-closed.** Every endpoint requires a valid token; there is no
+  anonymous access. Write vs read is decided by token scope, identically for the
+  Claude and OpenAI endpoints.
 - **Use distinct tokens** for the Claude and OpenAI endpoints so one leak doesn't
-  grant both (they have different capabilities).
+  grant both.
 - **OAuth tokens are derived & revocable** (resource-scoped, 30-day, in memory) —
   a restart invalidates them.
 - **Publish only behind TLS**, and prefer narrowing your proxy to the
