@@ -295,6 +295,7 @@ class ProxySettings:
     rate_limit_searches: int = 0
     metrics_public: bool = False
     image_url_ingest: bool = True
+    public_base_url: str = ""
 
 
 @dataclass
@@ -2348,7 +2349,7 @@ class Mem0ChatProxy:
             profile=profile.name if profile else None,
         )
         self._save_pending_uploads()
-        upload_url = f"/uploads/{upload_id}"
+        upload_url = self._absolute_url(f"/uploads/{upload_id}")
         return self.mcp_tool_result(
             text=(
                 f"Created upload slot {upload_id}. POST the raw bytes to {upload_url} with the SAME "
@@ -3434,9 +3435,14 @@ class Mem0ChatProxy:
             return True
         return origin in set(self.settings.mcp_allowed_origins)
 
+    def _absolute_url(self, path: str) -> str:
+        """Prefix *path* with public_base_url when set; otherwise return path unchanged."""
+        base = self.settings.public_base_url.rstrip("/")
+        return f"{base}{path}" if base else path
+
     def _signed_blob_url(self, blob_id: str) -> str:
         exp, sig = self.blobs.sign(blob_id, self.settings.blob_url_ttl)
-        return f"/blobs/{blob_id}?exp={exp}&sig={sig}"
+        return self._absolute_url(f"/blobs/{blob_id}?exp={exp}&sig={sig}")
 
     def _require_claude_auth(self, headers: dict[str, str]) -> bool:
         """True only when the request carries the Claude endpoint's bearer (or a
@@ -4018,6 +4024,7 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         rate_limit_searches=args.rate_limit_searches,
         metrics_public=args.metrics_public,
         image_url_ingest=args.image_url_ingest,
+        public_base_url=args.public_base_url,
     )
 
 
@@ -4152,6 +4159,12 @@ def parse_args() -> argparse.Namespace:
                         help="Qdrant collection for the compiled synthesis layer. Empty disables the layer.")
     parser.add_argument("--compiled-dir", default=os.getenv("RELIQUARY_COMPILED_DIR", "/data/compiled"),
                         help="Host directory for the page registry + vault export.")
+    parser.add_argument(
+        "--public-base-url",
+        default=os.getenv("RELIQUARY_PUBLIC_BASE_URL", ""),
+        help="Optional public base URL (e.g. https://r.example.com) prepended to blob and upload "
+        "URLs returned by the server. Unset = relative paths (default).",
+    )
     parser.add_argument("--schema-path", default=os.getenv("RELIQUARY_SCHEMA_PATH"),
                         help="Path to the editable memory constitution (reliquary://schema). Unset uses a built-in default.")
     parser.add_argument("--lint-coverage-min", type=int, default=int(os.getenv("RELIQUARY_LINT_COVERAGE_MIN", "8")),

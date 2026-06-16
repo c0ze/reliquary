@@ -171,6 +171,8 @@ config file (see [config.example.yaml](config.example.yaml)). Highlights:
 | `RELIQUARY_STATE_DIR` | dir that persists OAuth tokens + MCP sessions across restarts (**set this to stay signed in**) |
 | `RELIQUARY_OAUTH_ACCESS_TOKEN_TTL` / `RELIQUARY_OAUTH_REFRESH_TOKEN_TTL` | access-token lifetime (default 5 days) / refresh-token lifetime (default `0` = non-expiring) |
 | `RELIQUARY_DATASET_PATH` | curated JSONL enabling taxonomy routing + `fetch` bootstrap docs |
+| `RELIQUARY_BLOB_SIGNING_KEY` | HMAC key for signed blob URLs; unset = random per-process (URLs break on restart) |
+| `RELIQUARY_PUBLIC_BASE_URL` | optional prefix (e.g. `https://r.example.com`) prepended to blob + upload URLs; unset = relative paths |
 
 Run `python app/server.py --help` for the full flag list.
 
