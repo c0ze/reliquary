@@ -24,7 +24,19 @@ class FakeMemory:
 
     def search(self, query, *, user_id=None, limit=None, top_k=None, filters=None, threshold=None, **kw):
         uid = user_id or (filters or {}).get("user_id")
-        hits = [dict(rec, score=1.0) for rec in self._store.values() if uid is None or rec["user_id"] == uid]
+        # Build metadata filter: any of domain/hall/room/topic present in filters
+        # (excluding user_id which is a top-level param, not a metadata field).
+        _META_FILTER_KEYS = {"domain", "hall", "room", "topic"}
+        meta_filter = {k: v for k, v in (filters or {}).items() if k in _META_FILTER_KEYS}
+        hits = []
+        for rec in self._store.values():
+            if uid is not None and rec["user_id"] != uid:
+                continue
+            if meta_filter:
+                rec_meta = rec.get("metadata") or {}
+                if not all(rec_meta.get(k) == v for k, v in meta_filter.items()):
+                    continue
+            hits.append(dict(rec, score=1.0))
         cap = limit or top_k
         if cap:
             hits = hits[:cap]

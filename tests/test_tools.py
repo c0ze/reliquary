@@ -326,3 +326,72 @@ def test_exact_marker_ranks_first_across_routes(proxy, fake_memory):
     top = results[0]
     assert marker in (top.get("text") or ""), f"exact marker not ranked #1: {top.get('text')!r}"
     assert top.get("score") and top["score"] >= 2.0
+
+
+# ---------------------------------------------------------------------------
+# Task 4a: capabilities.write_authorized
+# ---------------------------------------------------------------------------
+
+def _profile(proxy, name):
+    if name == "claude":
+        return proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    return proxy.endpoint_profiles[proxy.settings.openai_mcp_path]
+
+
+def test_capabilities_write_authorized_true_with_write_scope(proxy):
+    """capabilities must include write_authorized=True when can_write=True."""
+    profile = _profile(proxy, "claude")
+    result = run(proxy.call_mcp_tool(profile, "reliquary_capabilities", {}, can_write=True))
+    assert not result.get("isError")
+    assert result["structuredContent"]["write_authorized"] is True
+
+
+def test_capabilities_write_authorized_false_with_read_only_scope(proxy):
+    """capabilities must include write_authorized=False when can_write=False."""
+    profile = _profile(proxy, "claude")
+    result = run(proxy.call_mcp_tool(profile, "reliquary_capabilities", {}, can_write=False))
+    assert not result.get("isError")
+    assert result["structuredContent"]["write_authorized"] is False
+
+
+# ---------------------------------------------------------------------------
+# Task 4b: fetch_image inline base64 in structuredContent
+# ---------------------------------------------------------------------------
+
+def test_fetch_image_small_blob_includes_image_base64(proxy):
+    """For a small blob, fetch_image structuredContent must include image_base64."""
+    add_result = run(proxy.handle_add_image_tool({
+        "caption": "Small inline image",
+        "image_base64": _PNG_B64,
+    }))
+    assert not add_result["isError"], add_result
+    blob_id = add_result["structuredContent"]["blob_id"]
+    fetch_result = run(proxy.handle_fetch_image_tool({"id": blob_id}))
+    assert not fetch_result["isError"], fetch_result
+    sc = fetch_result["structuredContent"]
+    assert "image_base64" in sc, "expected image_base64 in structuredContent for small blob"
+    # Must decode back to the original bytes.
+    decoded = base64.b64decode(sc["image_base64"])
+    assert decoded == _PNG_BYTES, "image_base64 decodes to wrong bytes"
+
+
+def test_fetch_image_large_blob_omits_image_base64(proxy, monkeypatch):
+    """For a blob over INLINE_IMAGE_MAX_BYTES, image_base64 must be absent."""
+    from server import INLINE_IMAGE_MAX_BYTES
+    large_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * (INLINE_IMAGE_MAX_BYTES + 1)
+    large_b64 = base64.b64encode(large_data).decode("ascii")
+
+    # Patch blob_max_bytes so the store accepts the large blob (auto-restored by monkeypatch).
+    monkeypatch.setattr(proxy.settings, "blob_max_bytes", 0)  # 0 = disable cap
+    add_result = run(proxy.handle_add_image_tool({
+        "caption": "Large image",
+        "image_base64": large_b64,
+    }))
+    assert not add_result["isError"], add_result
+    blob_id = add_result["structuredContent"]["blob_id"]
+    fetch_result = run(proxy.handle_fetch_image_tool({"id": blob_id}))
+    assert not fetch_result["isError"], fetch_result
+    sc = fetch_result["structuredContent"]
+    assert "image_base64" not in sc, "image_base64 must not appear for large blobs"
+    # URL must still be present.
+    assert "url" in sc

@@ -20,8 +20,9 @@
 </p>
 
 - **Semantic recall** over your own corpus (vector search), with optional
-  domain/hall/room/topic **routing** plus query-time reranking, recency bias,
-  and duplicate suppression for sharper retrieval.
+  domain/hall/room/topic **routing** — or explicit `domain`/`hall`/`room`/`topic`
+  filters — plus query-time reranking, recency bias, and duplicate suppression
+  for sharper retrieval.
 - **Two MCP endpoints:** a full one for the Claude.ai connector, and a lean,
   deep-research-shaped one for ChatGPT — both read+write, gated by token scope.
 - **OAuth 2.1 shim** (PKCE, dynamic client registration, revocable
@@ -170,6 +171,8 @@ config file (see [config.example.yaml](config.example.yaml)). Highlights:
 | `RELIQUARY_STATE_DIR` | dir that persists OAuth tokens + MCP sessions across restarts (**set this to stay signed in**) |
 | `RELIQUARY_OAUTH_ACCESS_TOKEN_TTL` / `RELIQUARY_OAUTH_REFRESH_TOKEN_TTL` | access-token lifetime (default 5 days) / refresh-token lifetime (default `0` = non-expiring) |
 | `RELIQUARY_DATASET_PATH` | curated JSONL enabling taxonomy routing + `fetch` bootstrap docs |
+| `RELIQUARY_BLOB_SIGNING_KEY` | HMAC key for signed blob URLs; unset = random per-process (URLs break on restart) |
+| `RELIQUARY_PUBLIC_BASE_URL` | optional prefix (e.g. `https://r.example.com`) prepended to blob + upload URLs; unset = relative paths |
 
 Run `python app/server.py --help` for the full flag list.
 

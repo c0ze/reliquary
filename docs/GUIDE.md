@@ -87,6 +87,11 @@ server — MCP + OAuth + the Mem0 client). No chat LLM is involved in retrieval.
 4. The app shapes the result for the endpoint: rich (Claude) or lean snippets
    with `id`/`title`/`url` (ChatGPT). `fetch(id)` returns the full document.
 
+**Explicit filters:** pass `domain`/`hall`/`room`/`topic` to `reliquary_search` to
+*hard-restrict* results to that taxonomy slice — this overrides the query-text
+routing in step 2, giving predictable retrieval when you know where to look. The
+response echoes the applied `filters`.
+
 ### Endpoints
 
 | Path | Method | Auth | Purpose |

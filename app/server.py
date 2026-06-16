@@ -76,6 +76,9 @@ _EXACT_ID_RE = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+){2,}")
 # Minimum vector score for a current synthesis page to lead search results.
 # 0.0 = lead whenever a current synthesis matches at all (simple MVP; tunable).
 COMPILED_LEAD_MIN_SCORE = 0.0
+# Max blob size (bytes) to include image_base64 inline in fetch_image structuredContent.
+# Above this cap, the field is omitted and the text notes the signed URL instead.
+INLINE_IMAGE_MAX_BYTES = 1_000_000
 
 # Former MEM0_* env var names -> their RELIQUARY_* replacements. Used only to warn
 # operators who still have stale vars set; the old names are no longer read.
@@ -315,6 +318,7 @@ class ProxySettings:
     rate_limit_searches: int = 0
     metrics_public: bool = False
     image_url_ingest: bool = True
+    public_base_url: str = ""
 
 
 @dataclass
@@ -1235,6 +1239,7 @@ class Mem0ChatProxy:
             "what": "Reliquary: domain-neutral semantic memory over Mem0 + Qdrant, served over MCP.",
             "endpoint": profile.name,
             "tools": available,
+            "write_authorized": bool(can_write),
             "write_tools_when_authorized": write_only,
             "rules": {
                 "imported_records": "read-only (protected); user-written records are mutable",
@@ -1473,6 +1478,10 @@ class Mem0ChatProxy:
                         "threshold": {"type": "number", "description": "Optional minimum similarity threshold."},
                         "user_id": {"type": "string", "description": "Optional Mem0 user_id override."},
                         "context": {"type": "object", "description": "Optional caller context (client, cwd, git_root, repo) for project-aware routing."},
+                        "domain": {"type": "string", "description": "Hard metadata filter: restrict results to this domain (e.g. 'dev', 'life'). Bypasses query-text routing."},
+                        "hall": {"type": "string", "description": "Hard metadata filter: restrict results to this hall."},
+                        "room": {"type": "string", "description": "Hard metadata filter: restrict results to this room."},
+                        "topic": {"type": "string", "description": "Hard metadata filter: restrict results to this topic."},
                     },
                     "required": ["query"],
                     "additionalProperties": False,
@@ -1897,44 +1906,80 @@ class Mem0ChatProxy:
             else self.settings.memory_threshold
         )
 
-        routes = self.catalog.build_routes(query) if self.catalog else [_GlobalRoute()]
         result_cap = offset + limit + 1
 
-        # Collect candidates from every route, deduping by id but keeping the
-        # highest-scoring copy: an early domain route may match a record weakly
-        # while the global route matches the same record strongly (e.g. an exact
-        # lexical hit at score ~2.0). Route priority must not shadow the better copy.
-        by_key: dict[str, dict[str, Any]] = {}
-        for route in routes:
-            hits = await self.search_memories(
-                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters
-            )
-            for hit in hits:
-                enriched = self._enrich_hit(hit, route=route.description)
-                key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
-                existing = by_key.get(key)
-                if existing is None or self._numeric_score(enriched.get("score")) > self._numeric_score(existing.get("score")):
-                    by_key[key] = enriched
+        # Build explicit metadata filters from caller-supplied taxonomy params.
+        # When any are present, bypass catalog routing and run a single hard-filtered
+        # search; when absent, fall back to catalog-based route logic (unchanged).
+        _TAXONOMY_KEYS = ("domain", "hall", "room", "topic")
+        # Strip whitespace from values so "dev " matches the same as "dev" (Fix 2).
+        explicit: dict[str, str] = {k: str(v).strip() for k in _TAXONOMY_KEYS
+                                    if (v := arguments.get(k)) is not None and str(v).strip()}
 
-        # Order by relevance score across ALL routes, not by route priority, so the
-        # best hit (e.g. an exact lexical match) ranks first wherever it came from.
-        # _context_bonus adds CONTEXT_MATCH_BONUS for project-matching hits when caller
-        # context is present; it is 0.0 (no-op) when context is absent (#42).
-        raw_results = sorted(
-            by_key.values(),
-            key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)),
-                              str(item.get("id") or "")),
-        )
-        # Synthesis-first (#50): a current synthesis leads; raw hits follow as evidence.
+        if explicit:
+            # Hard-filter path: one search with the explicit filters; no catalog routing.
+            hits = await self.search_memories(
+                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=explicit
+            )
+            by_key: dict[str, dict[str, Any]] = {}
+            for hit in hits:
+                enriched = self._enrich_hit(hit, route="explicit-filter")
+                key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
+                by_key[key] = enriched
+            raw_results = sorted(
+                by_key.values(),
+                key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)),
+                                  str(item.get("id") or "")),
+            )
+            # Synthesis-first: apply ALL explicit filters so every taxonomy dimension
+            # (domain, hall, room, topic) enforces the same hard-restrict guarantee (Fix 1).
+            synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
+            synthesis_results = [
+                s for s in synthesis_results
+                if all((s.get("metadata") or {}).get(k) == v for k, v in explicit.items())
+            ]
+            routes_used = [f"explicit-filter({', '.join(f'{k}={v}' for k, v in explicit.items())})"]
+        else:
+            routes = self.catalog.build_routes(query) if self.catalog else [_GlobalRoute()]
+
+            # Collect candidates from every route, deduping by id but keeping the
+            # highest-scoring copy: an early domain route may match a record weakly
+            # while the global route matches the same record strongly (e.g. an exact
+            # lexical hit at score ~2.0). Route priority must not shadow the better copy.
+            by_key = {}
+            for route in routes:
+                hits = await self.search_memories(
+                    query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters
+                )
+                for hit in hits:
+                    enriched = self._enrich_hit(hit, route=route.description)
+                    key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
+                    existing = by_key.get(key)
+                    if existing is None or self._numeric_score(enriched.get("score")) > self._numeric_score(existing.get("score")):
+                        by_key[key] = enriched
+
+            # Order by relevance score across ALL routes, not by route priority, so the
+            # best hit (e.g. an exact lexical match) ranks first wherever it came from.
+            # _context_bonus adds CONTEXT_MATCH_BONUS for project-matching hits when caller
+            # context is present; it is 0.0 (no-op) when context is absent (#42).
+            raw_results = sorted(
+                by_key.values(),
+                key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)),
+                                  str(item.get("id") or "")),
+            )
+            # Synthesis-first (#50): a current synthesis leads; raw hits follow as evidence.
+            synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
+            routes_used = [route.description for route in routes]
+
         # Use result_cap (not limit) so paginated pages past the first still see syntheses.
-        synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
         # synthesis ids are slugs, raw ids are mem0 uuids — disjoint namespaces, so this
         # dedupe is a safety guard, not a real overlap risk.
         synthesis_ids = {str(s.get("id")) for s in synthesis_results}
         combined = synthesis_results + [r for r in raw_results if str(r.get("id")) not in synthesis_ids]
         next_cursor = str(offset + limit) if len(combined) > offset + limit else None
         results = combined[offset:offset + limit]
-        lines = [f"Search for {query!r} returned {len(results)} result(s)."]
+        filter_header = (f" [filters: {', '.join(f'{k}={v}' for k, v in explicit.items())}]" if explicit else "")
+        lines = [f"Search for {query!r} returned {len(results)} result(s).{filter_header}"]
         structured_results: list[dict[str, Any]] = []
         for index, item in enumerate(results, start=1):
             score = item.get("score")
@@ -1987,11 +2032,13 @@ class Mem0ChatProxy:
             structured = {
                 "query": query,
                 "user_id": user_id,
-                "routes": [route.description for route in routes],
+                "routes": routes_used,
                 "available_domains": self.catalog.routeable_domains if self.catalog else [],
                 "results": structured_results,
                 "nextCursor": next_cursor,
             }
+            if explicit:
+                structured["filters"] = explicit
         return self.mcp_tool_result(text="\n".join(lines), structured=structured)
 
     async def handle_fetch_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2193,6 +2240,16 @@ class Mem0ChatProxy:
                 structured={"error": "missing_target",
                             "suggested_action": "Pass target_id = the id of the record you want to correct."},
                 is_error=True)
+        # Validate that the target exists — either as an imported catalog record or as
+        # a live memory — before filing a correction. An unknown id would create an
+        # orphaned correction that points to nothing.
+        in_catalog = bool(self.catalog and target_id in self.catalog.records_by_id)
+        if not in_catalog and (await self.fetch_live_memory(target_id)) is None:
+            return self.mcp_tool_result(
+                text=f"No record found for target_id={target_id!r}.",
+                structured={"error": "not_found", "id": target_id,
+                            "suggested_action": "target_id must be an existing record id from reliquary_search"},
+                is_error=True)
         user_id = str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
         reason = str(arguments.get("reason") or "").strip()
         replacement = str(arguments.get("replacement_text") or "").strip()
@@ -2315,7 +2372,7 @@ class Mem0ChatProxy:
             profile=profile.name if profile else None,
         )
         self._save_pending_uploads()
-        upload_url = f"/uploads/{upload_id}"
+        upload_url = self._absolute_url(f"/uploads/{upload_id}")
         return self.mcp_tool_result(
             text=(
                 f"Created upload slot {upload_id}. POST the raw bytes to {upload_url} with the SAME "
@@ -2750,9 +2807,16 @@ class Mem0ChatProxy:
         data, mimetype = result
         encoded = base64.b64encode(data).decode("ascii")
         url = self._signed_blob_url(blob_id)
+        size = len(data)
+        structured: dict[str, Any] = {"blob_id": blob_id, "url": url, "mimetype": mimetype, "size": size}
+        if size <= INLINE_IMAGE_MAX_BYTES:
+            structured["image_base64"] = encoded
+            note = ""
+        else:
+            note = f" Inline bytes omitted (size {size} > {INLINE_IMAGE_MAX_BYTES}); download via the signed URL."
         return self.mcp_tool_result(
-            text=f"Image {blob_id} ({mimetype}, {len(data)} bytes). Download: {url}",
-            structured={"blob_id": blob_id, "url": url, "mimetype": mimetype, "size": len(data)},
+            text=f"Image {blob_id} ({mimetype}, {size} bytes). Download: {url}{note}",
+            structured=structured,
             image=(encoded, mimetype),
         )
 
@@ -3401,9 +3465,14 @@ class Mem0ChatProxy:
             return True
         return origin in set(self.settings.mcp_allowed_origins)
 
+    def _absolute_url(self, path: str) -> str:
+        """Prefix *path* with public_base_url when set; otherwise return path unchanged."""
+        base = self.settings.public_base_url.rstrip("/")
+        return f"{base}{path}" if base else path
+
     def _signed_blob_url(self, blob_id: str) -> str:
         exp, sig = self.blobs.sign(blob_id, self.settings.blob_url_ttl)
-        return f"/blobs/{blob_id}?exp={exp}&sig={sig}"
+        return self._absolute_url(f"/blobs/{blob_id}?exp={exp}&sig={sig}")
 
     def _require_claude_auth(self, headers: dict[str, str]) -> bool:
         """True only when the request carries the Claude endpoint's bearer (or a
@@ -3983,6 +4052,7 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         rate_limit_searches=args.rate_limit_searches,
         metrics_public=args.metrics_public,
         image_url_ingest=args.image_url_ingest,
+        public_base_url=args.public_base_url,
     )
 
 
@@ -4103,6 +4173,12 @@ def parse_args() -> argparse.Namespace:
                         help="Qdrant collection for the compiled synthesis layer. Empty disables the layer.")
     parser.add_argument("--compiled-dir", default=os.getenv("RELIQUARY_COMPILED_DIR", "/data/compiled"),
                         help="Host directory for the page registry + vault export.")
+    parser.add_argument(
+        "--public-base-url",
+        default=os.getenv("RELIQUARY_PUBLIC_BASE_URL", ""),
+        help="Optional public base URL (e.g. https://r.example.com) prepended to blob and upload "
+        "URLs returned by the server. Unset = relative paths (default).",
+    )
     parser.add_argument("--schema-path", default=os.getenv("RELIQUARY_SCHEMA_PATH"),
                         help="Path to the editable memory constitution (reliquary://schema). Unset uses a built-in default.")
     parser.add_argument("--lint-coverage-min", type=int, default=int(os.getenv("RELIQUARY_LINT_COVERAGE_MIN", "8")),
