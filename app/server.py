@@ -1455,6 +1455,10 @@ class Mem0ChatProxy:
                         "threshold": {"type": "number", "description": "Optional minimum similarity threshold."},
                         "user_id": {"type": "string", "description": "Optional Mem0 user_id override."},
                         "context": {"type": "object", "description": "Optional caller context (client, cwd, git_root, repo) for project-aware routing."},
+                        "domain": {"type": "string", "description": "Hard metadata filter: restrict results to this domain (e.g. 'dev', 'life'). Bypasses query-text routing."},
+                        "hall": {"type": "string", "description": "Hard metadata filter: restrict results to this hall."},
+                        "room": {"type": "string", "description": "Hard metadata filter: restrict results to this room."},
+                        "topic": {"type": "string", "description": "Hard metadata filter: restrict results to this topic."},
                     },
                     "required": ["query"],
                     "additionalProperties": False,
@@ -1879,44 +1883,79 @@ class Mem0ChatProxy:
             else self.settings.memory_threshold
         )
 
-        routes = self.catalog.build_routes(query) if self.catalog else [_GlobalRoute()]
         result_cap = offset + limit + 1
 
-        # Collect candidates from every route, deduping by id but keeping the
-        # highest-scoring copy: an early domain route may match a record weakly
-        # while the global route matches the same record strongly (e.g. an exact
-        # lexical hit at score ~2.0). Route priority must not shadow the better copy.
-        by_key: dict[str, dict[str, Any]] = {}
-        for route in routes:
-            hits = await self.search_memories(
-                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters
-            )
-            for hit in hits:
-                enriched = self._enrich_hit(hit, route=route.description)
-                key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
-                existing = by_key.get(key)
-                if existing is None or self._numeric_score(enriched.get("score")) > self._numeric_score(existing.get("score")):
-                    by_key[key] = enriched
+        # Build explicit metadata filters from caller-supplied taxonomy params.
+        # When any are present, bypass catalog routing and run a single hard-filtered
+        # search; when absent, fall back to catalog-based route logic (unchanged).
+        _TAXONOMY_KEYS = ("domain", "hall", "room", "topic")
+        explicit: dict[str, str] = {k: str(v) for k in _TAXONOMY_KEYS
+                                    if (v := arguments.get(k)) is not None and str(v).strip()}
 
-        # Order by relevance score across ALL routes, not by route priority, so the
-        # best hit (e.g. an exact lexical match) ranks first wherever it came from.
-        # _context_bonus adds CONTEXT_MATCH_BONUS for project-matching hits when caller
-        # context is present; it is 0.0 (no-op) when context is absent (#42).
-        raw_results = sorted(
-            by_key.values(),
-            key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)),
-                              str(item.get("id") or "")),
-        )
-        # Synthesis-first (#50): a current synthesis leads; raw hits follow as evidence.
+        if explicit:
+            # Hard-filter path: one search with the explicit filters; no catalog routing.
+            hits = await self.search_memories(
+                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=explicit
+            )
+            by_key: dict[str, dict[str, Any]] = {}
+            for hit in hits:
+                enriched = self._enrich_hit(hit, route="explicit-filter")
+                key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
+                by_key[key] = enriched
+            raw_results = sorted(
+                by_key.values(),
+                key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)),
+                                  str(item.get("id") or "")),
+            )
+            # Synthesis-first: filter to the requested domain when given.
+            synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
+            if "domain" in explicit:
+                synthesis_results = [
+                    s for s in synthesis_results
+                    if (s.get("metadata") or {}).get("domain") == explicit["domain"]
+                ]
+            routes_used = [f"explicit-filter({', '.join(f'{k}={v}' for k, v in explicit.items())})"]
+        else:
+            routes = self.catalog.build_routes(query) if self.catalog else [_GlobalRoute()]
+
+            # Collect candidates from every route, deduping by id but keeping the
+            # highest-scoring copy: an early domain route may match a record weakly
+            # while the global route matches the same record strongly (e.g. an exact
+            # lexical hit at score ~2.0). Route priority must not shadow the better copy.
+            by_key = {}
+            for route in routes:
+                hits = await self.search_memories(
+                    query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters
+                )
+                for hit in hits:
+                    enriched = self._enrich_hit(hit, route=route.description)
+                    key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
+                    existing = by_key.get(key)
+                    if existing is None or self._numeric_score(enriched.get("score")) > self._numeric_score(existing.get("score")):
+                        by_key[key] = enriched
+
+            # Order by relevance score across ALL routes, not by route priority, so the
+            # best hit (e.g. an exact lexical match) ranks first wherever it came from.
+            # _context_bonus adds CONTEXT_MATCH_BONUS for project-matching hits when caller
+            # context is present; it is 0.0 (no-op) when context is absent (#42).
+            raw_results = sorted(
+                by_key.values(),
+                key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)),
+                                  str(item.get("id") or "")),
+            )
+            # Synthesis-first (#50): a current synthesis leads; raw hits follow as evidence.
+            synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
+            routes_used = [route.description for route in routes]
+
         # Use result_cap (not limit) so paginated pages past the first still see syntheses.
-        synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
         # synthesis ids are slugs, raw ids are mem0 uuids — disjoint namespaces, so this
         # dedupe is a safety guard, not a real overlap risk.
         synthesis_ids = {str(s.get("id")) for s in synthesis_results}
         combined = synthesis_results + [r for r in raw_results if str(r.get("id")) not in synthesis_ids]
         next_cursor = str(offset + limit) if len(combined) > offset + limit else None
         results = combined[offset:offset + limit]
-        lines = [f"Search for {query!r} returned {len(results)} result(s)."]
+        filter_header = (f" [filters: {', '.join(f'{k}={v}' for k, v in explicit.items())}]" if explicit else "")
+        lines = [f"Search for {query!r} returned {len(results)} result(s).{filter_header}"]
         structured_results: list[dict[str, Any]] = []
         for index, item in enumerate(results, start=1):
             score = item.get("score")
@@ -1969,11 +2008,13 @@ class Mem0ChatProxy:
             structured = {
                 "query": query,
                 "user_id": user_id,
-                "routes": [route.description for route in routes],
+                "routes": routes_used,
                 "available_domains": self.catalog.routeable_domains if self.catalog else [],
                 "results": structured_results,
                 "nextCursor": next_cursor,
             }
+            if explicit:
+                structured["filters"] = explicit
         return self.mcp_tool_result(text="\n".join(lines), structured=structured)
 
     async def handle_fetch_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
