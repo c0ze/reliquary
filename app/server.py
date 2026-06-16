@@ -1894,7 +1894,8 @@ class Mem0ChatProxy:
         # When any are present, bypass catalog routing and run a single hard-filtered
         # search; when absent, fall back to catalog-based route logic (unchanged).
         _TAXONOMY_KEYS = ("domain", "hall", "room", "topic")
-        explicit: dict[str, str] = {k: str(v) for k in _TAXONOMY_KEYS
+        # Strip whitespace from values so "dev " matches the same as "dev" (Fix 2).
+        explicit: dict[str, str] = {k: str(v).strip() for k in _TAXONOMY_KEYS
                                     if (v := arguments.get(k)) is not None and str(v).strip()}
 
         if explicit:
@@ -1912,13 +1913,13 @@ class Mem0ChatProxy:
                 key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)),
                                   str(item.get("id") or "")),
             )
-            # Synthesis-first: filter to the requested domain when given.
+            # Synthesis-first: apply ALL explicit filters so every taxonomy dimension
+            # (domain, hall, room, topic) enforces the same hard-restrict guarantee (Fix 1).
             synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
-            if "domain" in explicit:
-                synthesis_results = [
-                    s for s in synthesis_results
-                    if (s.get("metadata") or {}).get("domain") == explicit["domain"]
-                ]
+            synthesis_results = [
+                s for s in synthesis_results
+                if all((s.get("metadata") or {}).get(k) == v for k, v in explicit.items())
+            ]
             routes_used = [f"explicit-filter({', '.join(f'{k}={v}' for k, v in explicit.items())})"]
         else:
             routes = self.catalog.build_routes(query) if self.catalog else [_GlobalRoute()]

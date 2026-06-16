@@ -381,8 +381,8 @@ def test_fetch_image_large_blob_omits_image_base64(proxy, monkeypatch):
     large_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * (INLINE_IMAGE_MAX_BYTES + 1)
     large_b64 = base64.b64encode(large_data).decode("ascii")
 
-    # Patch blob_max_bytes so the store accepts the large blob.
-    proxy.settings.blob_max_bytes = 0  # 0 = disable cap
+    # Patch blob_max_bytes so the store accepts the large blob (auto-restored by monkeypatch).
+    monkeypatch.setattr(proxy.settings, "blob_max_bytes", 0)  # 0 = disable cap
     add_result = run(proxy.handle_add_image_tool({
         "caption": "Large image",
         "image_base64": large_b64,

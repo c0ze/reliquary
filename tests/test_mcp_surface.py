@@ -96,7 +96,7 @@ def test_search_explicit_domain_filter(proxy):
         "id": "misc-1", "memory": "alpha misc note", "metadata": {"domain": "misc"}, "user_id": "my_lord",
     }
     claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
-    result = run(proxy.call_mcp_tool(claude, "reliquary_search", {"query": "alpha", "domain": "dev"}, can_write=False))
+    result = run(proxy.call_mcp_tool(claude, "reliquary_search", {"query": "alpha", "domain": "dev", "limit": 20}, can_write=False))
     assert not result.get("isError"), result
     sc = result["structuredContent"]
     ids = {r["id"] for r in sc["results"]}
@@ -114,7 +114,7 @@ def test_search_no_filter_unchanged_behavior(proxy):
         "id": "misc-1", "memory": "alpha misc note", "metadata": {"domain": "misc"}, "user_id": "my_lord",
     }
     claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
-    result = run(proxy.call_mcp_tool(claude, "reliquary_search", {"query": "alpha"}, can_write=False))
+    result = run(proxy.call_mcp_tool(claude, "reliquary_search", {"query": "alpha", "limit": 20}, can_write=False))
     assert not result.get("isError"), result
     sc = result["structuredContent"]
     ids = {r["id"] for r in sc["results"]}

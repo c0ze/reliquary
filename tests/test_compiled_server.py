@@ -603,3 +603,46 @@ def test_live_add_no_compiled_layer_is_noop(make_proxy):
     # Must not crash when the compiled layer is disabled.
     result = run(proxy.handle_add_memory_tool({"text": "x", "domain": "pagan", "topic": "deities"}))
     assert result.get("isError") is not True
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 — synthesis hard-filter must honour ALL explicit taxonomy filters
+# ---------------------------------------------------------------------------
+
+
+def test_synthesis_excluded_by_non_matching_filter(proxy):
+    """A synthesis page in domain=dev must NOT appear when searching room=music.
+
+    This verifies the hard-restrict guarantee: every explicit filter key is
+    applied to synthesis results, not just `domain`.
+    """
+    # File a synthesis page in domain=dev (no room set).
+    run(proxy.handle_compile_page_tool({
+        "markdown": "Developer tooling overview.",
+        "slug": "dev-tooling",
+        "title": "Dev Tooling",
+        "domain": "dev",
+    }))
+    claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+
+    # Searching with room=music — the synthesis has no room, and its domain ≠ music room.
+    # The synthesis must NOT surface.
+    result_filtered = run(proxy.call_mcp_tool(
+        claude, "reliquary_search", {"query": "tooling", "room": "music", "limit": 20}, can_write=False,
+    ))
+    assert not result_filtered.get("isError"), result_filtered
+    ids_filtered = {r["id"] for r in result_filtered["structuredContent"]["results"]}
+    assert "dev-tooling" not in ids_filtered, (
+        "synthesis page dev-tooling (domain=dev, room=None) must be excluded "
+        "when searching with room=music"
+    )
+
+    # Searching with domain=dev — the synthesis must still appear.
+    result_domain = run(proxy.call_mcp_tool(
+        claude, "reliquary_search", {"query": "tooling", "domain": "dev", "limit": 20}, can_write=False,
+    ))
+    assert not result_domain.get("isError"), result_domain
+    ids_domain = {r["id"] for r in result_domain["structuredContent"]["results"]}
+    assert "dev-tooling" in ids_domain, (
+        "synthesis page dev-tooling (domain=dev) must be included when searching with domain=dev"
+    )
