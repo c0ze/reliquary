@@ -20,8 +20,9 @@
 </p>
 
 - **Semantic recall** over your own corpus (vector search), with optional
-  domain/hall/room/topic **routing** plus query-time reranking, recency bias,
-  and duplicate suppression for sharper retrieval.
+  domain/hall/room/topic **routing** — or explicit `domain`/`hall`/`room`/`topic`
+  filters — plus query-time reranking, recency bias, and duplicate suppression
+  for sharper retrieval.
 - **Two MCP endpoints:** a full read+write one for the Claude.ai connector, and
   a lean, deep-research-shaped read (optionally write) one for ChatGPT.
 - **OAuth 2.1 shim** (PKCE, dynamic client registration, revocable
