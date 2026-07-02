@@ -117,3 +117,4 @@ See the main README for full documentation. Summary:
 | `RELIQUARY_RATE_LIMIT_WRITES` | `0` | Max write tool calls per token per minute. `0` = unlimited. |
 | `RELIQUARY_RATE_LIMIT_SEARCHES` | `0` | Max search/fetch calls per token per minute. `0` = unlimited. |
 | `RELIQUARY_METRICS_PUBLIC` | `false` | Expose `/metrics` without auth. Default: requires Claude bearer. |
+| `RELIQUARY_RETRIEVAL_STATS_PATH` | unset | Path for the append-only JSONL retrieval-event log. Disabled when unset; feeds `lint.py` archive/compile proposals. |

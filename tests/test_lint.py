@@ -99,3 +99,115 @@ def test_build_report_degrades_when_dirs_unwritable(tmp_path):
     assert report["stale_pages"] == []
     assert set(report.keys()) == {"stale_pages", "coverage_gaps", "supersession", "orphans",
                                   "cold_records", "hot_topics"}
+
+
+def _write_stats_jsonl(path, events):
+    # events: list of (id, domain, topic) tuples; one JSONL line per event.
+    import json as _json
+    with open(path, "w", encoding="utf-8") as fh:
+        for i, (item_id, domain, topic) in enumerate(events):
+            entry = {"ts": float(i), "event": "search", "id": item_id}
+            if domain is not None:
+                entry["domain"] = domain
+            if topic is not None:
+                entry["topic"] = topic
+            fh.write(_json.dumps(entry) + "\n")
+
+
+def _write_dataset(path, records):
+    # records: list of (id, domain) tuples.
+    import json as _json
+    with open(path, "w", encoding="utf-8") as fh:
+        for rid, domain in records:
+            fh.write(_json.dumps({"id": rid, "text": "t",
+                                  "metadata": {"domain": domain, "title": "x"}}) + "\n")
+
+
+def test_build_report_cold_records_flags_never_retrieved(tmp_path):
+    compiled_dir, blob_dir = _dirs(tmp_path)
+    dataset = tmp_path / "corpus.jsonl"
+    _write_dataset(dataset, [("r1", "pagan"), ("r2", "pagan")])
+
+    stats_path = tmp_path / "stats.jsonl"
+    # Enough events to clear a low floor; only r1 is ever retrieved, so r2 is cold.
+    _write_stats_jsonl(stats_path, [("r1", "pagan", "rituals")] * 3)
+
+    report = lint.build_report(compiled_dir=compiled_dir, blob_dir=blob_dir,
+                               dataset_path=str(dataset), min_count=8,
+                               stats_path=str(stats_path), cold_min_events=1)
+    cold_ids = {item["id"] for item in report["cold_records"]}
+    assert cold_ids == {"r2"}
+    assert "r1" not in cold_ids
+
+
+def test_build_report_cold_records_suppressed_below_event_floor(tmp_path):
+    compiled_dir, blob_dir = _dirs(tmp_path)
+    dataset = tmp_path / "corpus.jsonl"
+    _write_dataset(dataset, [("r1", "pagan"), ("r2", "pagan")])
+
+    stats_path = tmp_path / "stats.jsonl"
+    _write_stats_jsonl(stats_path, [("r1", "pagan", "rituals")] * 3)
+
+    # Default floor (200) is well above the 3 events written, so cold_records
+    # must stay empty even though r2 was never retrieved.
+    report = lint.build_report(compiled_dir=compiled_dir, blob_dir=blob_dir,
+                               dataset_path=str(dataset), min_count=8,
+                               stats_path=str(stats_path))
+    assert report["cold_records"] == []
+
+
+def test_build_report_hot_topic_without_synthesis(tmp_path):
+    reg = _registry(tmp_path)
+    reg.put_revision("other", "current body", {"status": "current", "domain": "other", "topic": "other"})
+    compiled_dir, blob_dir = _dirs(tmp_path)
+
+    stats_path = tmp_path / "stats.jsonl"
+    _write_stats_jsonl(stats_path, [("r1", "pagan", "rituals")] * 5)
+
+    report = lint.build_report(compiled_dir=compiled_dir, blob_dir=blob_dir,
+                               dataset_path=None, min_count=8,
+                               stats_path=str(stats_path), hot_topic_min=5)
+    hot = {(item["domain"], item["topic"]) for item in report["hot_topics"]}
+    assert ("pagan", "rituals") in hot
+
+
+def test_build_report_no_stats_path_leaves_new_categories_empty(tmp_path):
+    compiled_dir, blob_dir = _dirs(tmp_path)
+    dataset = tmp_path / "corpus.jsonl"
+    _write_dataset(dataset, [("r1", "pagan")])
+
+    report = lint.build_report(compiled_dir=compiled_dir, blob_dir=blob_dir,
+                               dataset_path=str(dataset), min_count=8)
+    assert report["cold_records"] == []
+    assert report["hot_topics"] == []
+    assert set(report.keys()) == {"stale_pages", "coverage_gaps", "supersession", "orphans",
+                                  "cold_records", "hot_topics"}
+
+
+def test_format_report_renders_cold_records_and_hot_topics(tmp_path):
+    compiled_dir, blob_dir = _dirs(tmp_path)
+    dataset = tmp_path / "corpus.jsonl"
+    _write_dataset(dataset, [("r1", "pagan"), ("r2", "pagan")])
+
+    stats_path = tmp_path / "stats.jsonl"
+    _write_stats_jsonl(stats_path, [("r1", "pagan", "rituals")] * 5)
+
+    report = lint.build_report(compiled_dir=compiled_dir, blob_dir=blob_dir,
+                               dataset_path=str(dataset), min_count=8,
+                               stats_path=str(stats_path), cold_min_events=1, hot_topic_min=5)
+    text = lint.format_report(report)
+    assert "cold_records" in text
+    assert "hot_topics" in text
+    assert "candidate for archive" in text
+    assert "candidate to compile" in text
+
+
+def test_main_help_shows_new_flags(capsys):
+    try:
+        lint.main(["--help"])
+    except SystemExit:
+        pass
+    out = capsys.readouterr().out
+    assert "--stats-path" in out
+    assert "--cold-min-events" in out
+    assert "--hot-topic-min" in out

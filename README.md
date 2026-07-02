@@ -54,6 +54,7 @@ explicitly configured):
 | `RELIQUARY_RATE_LIMIT_WRITES` | Max write tool calls per token per minute (`0` = unlimited). |
 | `RELIQUARY_RATE_LIMIT_SEARCHES` | Max search/fetch calls per token per minute (`0` = unlimited). |
 | `RELIQUARY_METRICS_PUBLIC` | Set to `true` to expose `GET /metrics` without auth. Default `false` = requires the Claude bearer token. |
+| `RELIQUARY_RETRIEVAL_STATS_PATH` | Path for an append-only JSONL retrieval-event log (one entry per search hit / fetch). Unset = disabled. Feeds `python app/lint.py` archive/compile proposals. |
 
 `GET /metrics` emits Prometheus text format with per-tool call counters,
 rate-limit rejection counts, process uptime, and (when the vector store supports
@@ -123,8 +124,10 @@ reports per-revision timestamp + status), archive a page by re-filing it with
 `reliquary://domain/<d>/index` resources. It is on by default; set
 `RELIQUARY_COMPILED_COLLECTION=` (empty) to disable (an empty layer is a query-time
 no-op). Two cron-friendly CLIs support it: `python app/lint.py` proposes refreshes
-(never applies them) and `python app/export_vault.py --out vault/` exports pages to
-an Obsidian-style vault. See [`docs/GUIDE.md`](docs/GUIDE.md#compilation-layer).
+(never applies them) — with `RELIQUARY_RETRIEVAL_STATS_PATH` set, it also proposes
+archive candidates (imported records never retrieved) and compile candidates (hot
+topics with no synthesis page) — and `python app/export_vault.py --out vault/`
+exports pages to an Obsidian-style vault. See [`docs/GUIDE.md`](docs/GUIDE.md#compilation-layer).
 
 **Project context & governance.** Reliquary is a generic personal-memory tool by
 default, but a coding agent can opt into light, *soft* project-awareness. Pass a
