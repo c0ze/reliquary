@@ -550,6 +550,24 @@ Key environment variables:
 | `RELIQUARY_COMPILED_DIR` | `/data/compiled` | Container path for the page registry + vault export. |
 | `RELIQUARY_SCHEMA_PATH` | *(built-in)* | Path to an editable memory constitution file. |
 | `RELIQUARY_LINT_COVERAGE_MIN` | `8` | Raw record threshold before lint flags a gap. |
+| `RELIQUARY_RETRIEVAL_STATS_PATH` | *unset* | Path to an append-only JSONL retrieval-event log. Opt-in, best-effort — a write failure never breaks a request. |
+| `RELIQUARY_LINT_COLD_MIN_EVENTS` | `200` | Minimum total retrieval events before lint proposes never-retrieved records for archive. |
+
+**Retrieval usage stats.** When `RELIQUARY_RETRIEVAL_STATS_PATH` is set, the
+server appends an event to that JSONL log for each search hit and fetch. Nothing
+reads it live — `python app/lint.py` aggregates it offline (`--stats-path`, or the
+env var) into two additional proposal categories, alongside the existing ones:
+
+- **`cold_records`** — imported records that have never been retrieved since
+  stats collection began; candidates to archive. Suppressed until the log has
+  at least `RELIQUARY_LINT_COLD_MIN_EVENTS` (default `200`, `--cold-min-events`)
+  total events, so a freshly-enabled or sparse log doesn't flag live corpus.
+- **`hot_topics`** — domain/topic pairs with `>= --hot-topic-min` retrievals
+  (default: `--coverage-min`) and no current synthesis page; candidates to
+  compile with `reliquary_compile_page`.
+
+Both are proposals only, surfaced the same way as everything else lint reports
+(and via the `reliquary://needs-review` MCP resource) — nothing is auto-applied.
 
 ---
 
