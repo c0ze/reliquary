@@ -2137,12 +2137,14 @@ class Mem0ChatProxy:
                 structured["filters"] = explicit
         # Best-effort usage telemetry (#retrieval-stats): record which RAW memories were
         # surfaced, so lint can propose archive/compile from evidence. Synthesis pages are
-        # excluded (they're not catalog records and would skew hot-topic counts).
+        # excluded via the server-set `route` field (== "synthesis"; see _synthesis_first_hits),
+        # NOT via caller/importer-controlled metadata.kind -- a raw record can carry an
+        # arbitrary metadata.kind and must not be silently dropped from stats because of it.
         stat_items = [
             {"id": r.get("id"), "domain": (r.get("metadata") or {}).get("domain"),
              "topic": (r.get("metadata") or {}).get("topic")}
             for r in results
-            if r.get("id") and (r.get("metadata") or {}).get("kind") != "synthesis"
+            if r.get("id") and r.get("route") != "synthesis"
         ]
         self.retrieval_stats.record("search", stat_items)
         return self.mcp_tool_result(text="\n".join(lines), structured=structured)
