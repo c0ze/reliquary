@@ -1087,7 +1087,7 @@ class Mem0ChatProxy:
             resources.append({
                 "uri": "reliquary://needs-review",
                 "name": "Pages needing review",
-                "description": "Synthesis pages flagged stale (plus coverage gaps).",
+                "description": "Review proposals: stale pages, coverage gaps, plus cold-record (archive) and hot-topic (compile) candidates from retrieval usage.",
                 "mimeType": "application/json",
             })
         if self.catalog:
