@@ -64,7 +64,7 @@ from retrieval_quality import apply_retrieval_quality, retrieval_candidate_limit
 LOG = logging.getLogger("reliquary")
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_SERVER_NAME = "reliquary"
-MCP_SERVER_VERSION = "0.4.2"
+MCP_SERVER_VERSION = "0.5.0"
 MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
