@@ -342,3 +342,30 @@ def test_run_all_hot_topic_min_defaults_to_min_count():
     out_explicit = health.run_all(pages, raw_counts={}, min_count=10, records=(), stats=stats,
                                    hot_topic_min=5)
     assert [item["count"] for item in out_explicit["hot_topics"]] == [8]  # explicit override wins
+
+
+def test_run_all_hot_topic_min_explicit_zero_is_honored():
+    # An explicit hot_topic_min=0 must NOT be replaced by min_count — `0 or min_count`
+    # would silently discard the caller's explicit zero threshold.
+    pages = []
+    stats = {"by_id": {}, "by_topic": {"pagan\tsamhain": 0}, "by_domain": {}, "events": 8}
+    out = health.run_all(pages, raw_counts={}, min_count=10, records=(), stats=stats,
+                          hot_topic_min=0)
+    assert [item["count"] for item in out["hot_topics"]] == [0]
+
+
+def test_run_all_records_accepts_generator_for_both_consumers():
+    # records is consumed by both orphans() and cold_records(); a generator (as opposed
+    # to a list) must not be exhausted by the first consumer before the second runs.
+    recs = [_Rec("r1", {}), _Rec("r2", {"domain": "pagan"})]
+    stats = {
+        # non-empty by_id (for an unrelated id) so cold_records' empty-stats guard
+        # doesn't short-circuit before the records generator is even consumed.
+        "by_id": {"other": {"count": 1, "last_ts": 1.0, "domain": "infra", "topic": "x"}},
+        "by_topic": {},
+        "by_domain": {},
+        "events": health.COLD_RECORD_MIN_EVENTS,
+    }
+    out = health.run_all([], raw_counts={}, min_count=8, records=(r for r in recs), stats=stats)
+    assert [item["id"] for item in out["orphans"]] == ["r1"]
+    assert {item["id"] for item in out["cold_records"]} == {"r1", "r2"}

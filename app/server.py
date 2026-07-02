@@ -319,6 +319,7 @@ class ProxySettings:
     compiled_dir: str = "/data/compiled"
     schema_path: str | None = None
     lint_coverage_min: int = 8
+    lint_cold_min_events: int = 200
     state_dir: str | None = None
     static_tokens: tuple[tuple[str, str, str], ...] = ()
     audit_log_path: str | None = None
@@ -1125,7 +1126,8 @@ class Mem0ChatProxy:
             records = list(self.catalog.records_by_id.values()) if self.catalog else []
             stats = aggregate(self.settings.retrieval_stats_path)
             report = health.run_all(pages, raw_counts=raw_counts, min_count=self.settings.lint_coverage_min,
-                                    records=records, stats=stats)
+                                    records=records, stats=stats,
+                                    cold_min_events=self.settings.lint_cold_min_events)
             payload = {
                 "stale": [self._page_summary(p) for p in pages if p.status == "stale"],
                 "coverage_gaps": report["coverage_gaps"],
@@ -4182,6 +4184,7 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         compiled_dir=args.compiled_dir,
         schema_path=args.schema_path,
         lint_coverage_min=args.lint_coverage_min,
+        lint_cold_min_events=args.lint_cold_min_events,
         state_dir=args.state_dir,
         static_tokens=parse_static_tokens(args.static_tokens),
         audit_log_path=args.audit_log,
@@ -4324,6 +4327,8 @@ def parse_args() -> argparse.Namespace:
                         help="Path to the editable memory constitution (reliquary://schema). Unset uses a built-in default.")
     parser.add_argument("--lint-coverage-min", type=int, default=int(os.getenv("RELIQUARY_LINT_COVERAGE_MIN", "8")),
                         help="Min raw records in a domain/topic with no synthesis before lint flags a coverage gap.")
+    parser.add_argument("--lint-cold-min-events", type=int, default=int(os.getenv("RELIQUARY_LINT_COLD_MIN_EVENTS", "200")),
+                        help="Minimum total retrieval events before the needs-review resource proposes never-retrieved records for archive (guards against sparse-data false positives).")
     return parser.parse_args()
 
 

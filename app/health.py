@@ -122,6 +122,7 @@ def run_all(pages: Iterable[Any], *, raw_counts: dict[str, int], min_count: int,
             hot_topic_min: int | None = None,
             cold_min_events: int | None = None) -> dict[str, list[dict[str, Any]]]:
     pages = list(pages)
+    records = list(records)
     by_id = (stats or {}).get("by_id", {})
     by_topic = (stats or {}).get("by_topic", {})
     events = (stats or {}).get("events", 0)
@@ -135,5 +136,8 @@ def run_all(pages: Iterable[Any], *, raw_counts: dict[str, int], min_count: int,
         "supersession": supersession(pages),
         "orphans": orphans(records),
         "cold_records": cold_records(records, by_id) if events >= cold_floor else [],
-        "hot_topics": hot_topics_without_synthesis(pages, by_topic, min_retrievals=hot_topic_min or min_count),
+        "hot_topics": hot_topics_without_synthesis(
+            pages, by_topic,
+            min_retrievals=hot_topic_min if hot_topic_min is not None else min_count,
+        ),
     }

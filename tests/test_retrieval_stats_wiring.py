@@ -145,3 +145,47 @@ def test_needs_review_cold_records_empty_below_event_floor(make_proxy, tmp_path)
     res = proxy.read_resource("reliquary://needs-review")
     payload = json.loads(res["contents"][0]["text"])
     assert payload["cold_records"] == []
+
+
+def _write_dataset(path, records):
+    # records: list of (id, domain) tuples -> one raw catalog record per line.
+    with open(path, "w", encoding="utf-8") as fh:
+        for rid, domain in records:
+            fh.write(json.dumps({"id": rid, "text": "t",
+                                 "metadata": {"domain": domain, "title": "x"}}) + "\n")
+
+
+def _write_stats_jsonl(path, events):
+    # events: list of (id, domain, topic) tuples; one JSONL line per event.
+    with open(path, "w", encoding="utf-8") as fh:
+        for i, (item_id, domain, topic) in enumerate(events):
+            entry = {"ts": float(i), "event": "search", "id": item_id, "domain": domain, "topic": topic}
+            fh.write(json.dumps(entry) + "\n")
+
+
+def test_needs_review_honors_lint_cold_min_events_setting(make_proxy, tmp_path):
+    # RELIQUARY_LINT_COLD_MIN_EVENTS must reach the live needs-review resource
+    # (not just the offline lint CLI) via settings.lint_cold_min_events.
+    dataset = tmp_path / "corpus.jsonl"
+    _write_dataset(dataset, [("r1", "pagan"), ("r2", "pagan")])
+
+    stats_path = tmp_path / "stats.jsonl"
+    # Only 3 events -- far below the default 200-event floor -- but r2 is never
+    # retrieved, so with a low configured floor it should surface as cold.
+    _write_stats_jsonl(stats_path, [("r1", "pagan", "rituals")] * 3)
+
+    proxy = make_proxy(dataset_path=str(dataset), retrieval_stats_path=str(stats_path),
+                        lint_cold_min_events=1)
+    assert proxy.settings.lint_cold_min_events == 1
+
+    res = proxy.read_resource("reliquary://needs-review")
+    payload = json.loads(res["contents"][0]["text"])
+    cold_ids = {item["id"] for item in payload["cold_records"]}
+    assert cold_ids == {"r2"}
+
+    # Same sparse stats but with the default 200-event floor: cold_records must
+    # stay empty, proving the low floor above genuinely came from the setting.
+    default_proxy = make_proxy(dataset_path=str(dataset), retrieval_stats_path=str(stats_path))
+    res_default = default_proxy.read_resource("reliquary://needs-review")
+    payload_default = json.loads(res_default["contents"][0]["text"])
+    assert payload_default["cold_records"] == []
