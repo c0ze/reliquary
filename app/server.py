@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import secrets
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -62,7 +63,7 @@ from retrieval_quality import apply_retrieval_quality, retrieval_candidate_limit
 LOG = logging.getLogger("reliquary")
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_SERVER_NAME = "reliquary"
-MCP_SERVER_VERSION = "0.2.0"
+MCP_SERVER_VERSION = "0.4.0"
 MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
@@ -377,6 +378,23 @@ class Mem0ChatProxy:
         refresh_token_store = None
         session_store = None
         if settings.state_dir:
+            # Fail fast at startup on a missing or unwritable mount, matching
+            # BlobStore/PageRegistry, instead of deferring the failure to the first
+            # JsonFileStore.save() and breaking OAuth mid-request. makedirs alone isn't
+            # enough: exist_ok=True succeeds silently on an existing-but-unwritable
+            # dir (e.g. a root-owned Docker bind mount), so probe with an actual write.
+            os.makedirs(settings.state_dir, exist_ok=True)
+            try:
+                fd, probe_path = tempfile.mkstemp(dir=settings.state_dir)
+                os.write(fd, b"0")
+                os.close(fd)
+                os.unlink(probe_path)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"RELIQUARY_STATE_DIR {settings.state_dir!r} is not writable; "
+                    "fix ownership/permissions on the mounted state dir (OAuth tokens and "
+                    "MCP sessions cannot be persisted)"
+                ) from exc
             token_store = JsonFileStore(os.path.join(settings.state_dir, "oauth_tokens.json"))
             refresh_token_store = JsonFileStore(os.path.join(settings.state_dir, "oauth_refresh_tokens.json"))
             session_store = JsonFileStore(os.path.join(settings.state_dir, "mcp_sessions.json"))
@@ -4295,7 +4313,8 @@ def main() -> None:
         )
     if not settings.claude_token:
         LOG.warning(
-            "Claude MCP endpoint has no bearer token configured. "
+            "No master token configured: the Claude MCP endpoint cannot be authenticated "
+            "against, and OAuth authorization is disabled (no tokens can be minted). "
             "Set RELIQUARY_CLAUDE_MCP_TOKEN (or --claude-mcp-token) to require auth."
         )
     app = Mem0ChatProxy(settings)

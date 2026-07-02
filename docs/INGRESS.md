@@ -11,7 +11,7 @@ Only these paths should be reachable from untrusted networks:
 | Path prefix | Purpose |
 |---|---|
 | `/claude/*` | Claude MCP endpoint (bearer-protected) |
-| `/openai/*` | ChatGPT / OpenAI MCP endpoint (bearer or no-auth) |
+| `/openai/*` | ChatGPT / OpenAI MCP endpoint (bearer-protected) |
 | `/uploads/*` | Raw binary upload slots for `create_image_upload`. Requires the same write bearer as the MCP endpoint that minted the slot (anonymous uploads → `401` before any bytes are read); the one-time `upl_` id is also unguessable and short-lived. |
 | `/oauth/*` | OAuth 2.1 token exchange |
 | `/.well-known/*` | OAuth discovery metadata |
@@ -104,8 +104,8 @@ server {
       registered once.
 - [ ] `/metrics` is only scraped from an internal network
       (Prometheus scrape job points at the internal address, not the public one).
-- [ ] `RELIQUARY_OPENAI_ALLOW_NOAUTH` is `false` unless the OpenAI endpoint is on a
-      trusted network with no untrusted callers.
+- [ ] `RELIQUARY_OPENAI_MCP_TOKEN` is set to a strong random secret, distinct from
+      the Claude token (one leak must not grant both).
 
 ## Environment variables for operational features
 

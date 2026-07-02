@@ -1,9 +1,9 @@
 [project]
 name = "reliquary"
-version = "0.1.0"
+version = "0.4.0"
 description = "A personal memory server for AIs — Mem0 + Qdrant behind MCP, for Claude and ChatGPT"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
     "mem0ai>=0.1.0",

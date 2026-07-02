@@ -84,6 +84,28 @@ def test_resource_scoped_token_only_valid_for_its_resource():
     assert provider.verify_access_token(token) is False
 
 
+def test_verify_bearer_empty_master_rejects_empty_candidate():
+    # No master token configured (operator never set RELIQUARY_CLAUDE_MCP_TOKEN) means
+    # compare_digest("", "") would otherwise return True — OAuth must stay closed instead.
+    provider = OAuthProvider(master_token="", mcp_resource_path="/claude/mcp")
+    assert provider.verify_bearer("") is False
+
+
+def test_verify_bearer_empty_master_rejects_any_candidate():
+    provider = OAuthProvider(master_token="", mcp_resource_path="/claude/mcp")
+    assert provider.verify_bearer("anything") is False
+
+
+def test_verify_bearer_accepts_correct_master_token():
+    provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    assert provider.verify_bearer("MASTER") is True
+
+
+def test_verify_bearer_rejects_wrong_token():
+    provider = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp")
+    assert provider.verify_bearer("WRONG") is False
+
+
 def test_valid_redirect_uri_rules():
     ok = OAuthProvider.valid_redirect_uri
     assert ok("https://chatgpt.com/callback") is True
@@ -419,6 +441,49 @@ def test_proxy_settings_access_token_ttl_default():
     from server import ProxySettings
     assert ProxySettings().oauth_access_token_ttl == 432000
     assert ProxySettings().oauth_refresh_token_ttl == 0
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-level: /oauth/authorize must not mint a code when no master token
+# is configured, even with an empty bearer_token submission.
+# ---------------------------------------------------------------------------
+
+def _asgi_body(form: dict[str, str]):
+    """A minimal ASGI receive/send pair for driving handle_oauth_authorize_post directly."""
+    from urllib.parse import urlencode
+
+    body = urlencode(form).encode("utf-8")
+    sent = {"messages": []}
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        sent["messages"].append(message)
+
+    return receive, send, sent
+
+
+def test_authorize_post_empty_bearer_rejected_when_no_master_token(make_proxy):
+    """End-to-end: no RELIQUARY_CLAUDE_MCP_TOKEN configured + empty bearer_token
+    on the /oauth/authorize form must NOT mint an authorization code (401), even
+    though compare_digest("", "") would otherwise say the empty strings match."""
+    import asyncio
+
+    proxy = make_proxy(claude_token="")
+    _, challenge = _pkce_pair()
+    form = {
+        "response_type": "code",
+        "client_id": "client-1",
+        "redirect_uri": "https://claude.ai/cb",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "bearer_token": "",
+    }
+    receive, send, sent = _asgi_body(form)
+    asyncio.run(proxy.handle_oauth_authorize_post(receive, send))
+    start = next(m for m in sent["messages"] if m["type"] == "http.response.start")
+    assert start["status"] == 401
 
 
 if __name__ == "__main__":

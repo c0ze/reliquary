@@ -150,8 +150,10 @@ the OAuth flow; you authorize once by pasting your `RELIQUARY_CLAUDE_MCP_TOKEN` 
 the `/oauth/authorize` page, and the connector receives a derived, revocable
 access token (not the master) **plus a refresh token**, so it renews silently
 instead of re-authorizing. After it registers, pin `RELIQUARY_OAUTH_CLIENT_ID` and set
-`RELIQUARY_OAUTH_ALLOW_REGISTRATION=false`. **Set `RELIQUARY_STATE_DIR`** so tokens survive
-restarts — without it, every restart (e.g. a deploy) signs the connector out.
+`RELIQUARY_OAUTH_ALLOW_REGISTRATION=false`. The Docker Compose stack persists tokens
+across restarts by default (host dir `./data/state`, override with `STATE_HOST_DIR`);
+if you're running outside Docker, **set `RELIQUARY_STATE_DIR`** yourself — without it,
+every restart (e.g. a deploy) signs the connector out.
 
 ### Connecting ChatGPT
 
@@ -170,7 +172,7 @@ config file (see [config.example.yaml](config.example.yaml)). Highlights:
 | `RELIQUARY_CLAUDE_MCP_TOKEN` | bearer for `/claude/mcp` (required for write + OAuth) |
 | `RELIQUARY_OPENAI_MCP_TOKEN` | bearer for `/openai/mcp` (OAuth also works; required for any access, write-capable by scope) |
 | `RELIQUARY_OAUTH_CLIENT_ID` / `RELIQUARY_OAUTH_ALLOW_REGISTRATION` | lock the OAuth shim to one known client |
-| `RELIQUARY_STATE_DIR` | dir that persists OAuth tokens + MCP sessions across restarts (**set this to stay signed in**) |
+| `RELIQUARY_STATE_DIR` | dir that persists OAuth tokens + MCP sessions across restarts; Docker Compose defaults it to `/data/state` (override the host side with `STATE_HOST_DIR`) — set explicitly only when running outside Docker |
 | `RELIQUARY_OAUTH_ACCESS_TOKEN_TTL` / `RELIQUARY_OAUTH_REFRESH_TOKEN_TTL` | access-token lifetime (default 5 days) / refresh-token lifetime (default `0` = non-expiring) |
 | `RELIQUARY_DATASET_PATH` | curated JSONL enabling taxonomy routing + `fetch` bootstrap docs |
 | `RELIQUARY_BLOB_SIGNING_KEY` | HMAC key for signed blob URLs; unset = random per-process (URLs break on restart) |
@@ -185,8 +187,9 @@ Run `python app/server.py --help` for the full flag list.
   for the Claude and OpenAI endpoints.
 - **OAuth tokens are derived & revocable.** The connector gets a short-lived,
   resource-scoped access token (default 5 days) plus a **rotating refresh token**
-  (non-expiring by default, with reuse detection) so it renews silently. Set
-  `RELIQUARY_STATE_DIR` to persist tokens across restarts — without it, a restart signs
+  (non-expiring by default, with reuse detection) so it renews silently. The Docker
+  Compose stack persists tokens across restarts by default (see `STATE_HOST_DIR`);
+  outside Docker, set `RELIQUARY_STATE_DIR` yourself — without it, a restart signs
   connectors out. Revoking a *refresh* token via `/oauth/revoke` drops the whole
   rotation family; revoking an access token removes just that token.
 - **Embedded vs server Qdrant.** Reads run concurrently only against a Qdrant
