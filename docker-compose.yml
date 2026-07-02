@@ -53,10 +53,16 @@ services:
       embedder-pull:
         condition: service_completed_successfully
     env_file: .env
+    # Default RELIQUARY_STATE_DIR to the mounted state volume even if .env ships
+    # it blank, so OAuth tokens + MCP sessions persist across restarts instead of
+    # signing connectors out. An explicit value in .env still wins.
+    environment:
+      RELIQUARY_STATE_DIR: ${RELIQUARY_STATE_DIR:-/data/state}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ${BLOB_HOST_DIR:-./data/blobs}:/data/blobs
       - ${COMPILED_HOST_DIR:-./data/compiled}:/data/compiled
+      - ${STATE_HOST_DIR:-./data/state}:/data/state
     # Publish to loopback only; put Cloudflare Tunnel / Caddy / Traefik in front
     # for public TLS. Remove the 127.0.0.1 prefix at your own risk.
     ports:
