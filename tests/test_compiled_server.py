@@ -510,6 +510,7 @@ def test_needs_review_surfaces_coverage_gaps(proxy):
     class _Cat:
         routeable_domains = []
         value_counts = {"domain": {"pagan": 10}}
+        records_by_id = {}
 
     proxy.catalog = _Cat()
     res = _read_resource(proxy, "reliquary://needs-review")
@@ -522,6 +523,7 @@ def test_needs_review_no_gap_when_domain_covered(proxy):
     class _Cat:
         routeable_domains = []
         value_counts = {"domain": {"pagan": 10}}
+        records_by_id = {}
 
     proxy.catalog = _Cat()
     _file_page(proxy, "pagan-page", domain="pagan", status="current")

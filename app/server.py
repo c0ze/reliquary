@@ -30,6 +30,7 @@ from blobs import BlobStore, BlobTooLarge
 from ratelimit import RateLimiter
 from metrics import Metrics
 from audit import AuditLog
+from retrieval_stats import RetrievalStatsLog, aggregate
 from urlfetch import validate_public_url
 from helpers import (
     OPENAI_SNIPPET_CHAR_CAP,
@@ -321,6 +322,7 @@ class ProxySettings:
     state_dir: str | None = None
     static_tokens: tuple[tuple[str, str, str], ...] = ()
     audit_log_path: str | None = None
+    retrieval_stats_path: str | None = None
     rate_limit_writes: int = 0
     rate_limit_searches: int = 0
     metrics_public: bool = False
@@ -476,6 +478,7 @@ class Mem0ChatProxy:
 
         self.metrics = Metrics()
         self.audit = AuditLog(settings.audit_log_path)
+        self.retrieval_stats = RetrievalStatsLog(settings.retrieval_stats_path)
         self.write_limiter = RateLimiter(settings.rate_limit_writes)
         self.search_limiter = RateLimiter(settings.rate_limit_searches)
 
@@ -1119,9 +1122,15 @@ class Mem0ChatProxy:
         if uri == "reliquary://needs-review" and self.pages is not None:
             pages = self.pages.list()
             raw_counts = dict(self.catalog.value_counts["domain"]) if self.catalog else {}
+            records = list(self.catalog.records_by_id.values()) if self.catalog else []
+            stats = aggregate(self.settings.retrieval_stats_path)
+            report = health.run_all(pages, raw_counts=raw_counts, min_count=self.settings.lint_coverage_min,
+                                    records=records, stats=stats)
             payload = {
                 "stale": [self._page_summary(p) for p in pages if p.status == "stale"],
-                "coverage_gaps": health.coverage_gaps(pages, raw_counts, min_count=self.settings.lint_coverage_min),
+                "coverage_gaps": report["coverage_gaps"],
+                "cold_records": report["cold_records"],
+                "hot_topics": report["hot_topics"],
             }
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
         domain_prefix = "reliquary://domain/"
@@ -2089,6 +2098,16 @@ class Mem0ChatProxy:
             }
             if explicit:
                 structured["filters"] = explicit
+        # Best-effort usage telemetry (#retrieval-stats): record which RAW memories were
+        # surfaced, so lint can propose archive/compile from evidence. Synthesis pages are
+        # excluded (they're not catalog records and would skew hot-topic counts).
+        stat_items = [
+            {"id": r.get("id"), "domain": (r.get("metadata") or {}).get("domain"),
+             "topic": (r.get("metadata") or {}).get("topic")}
+            for r in results
+            if r.get("id") and (r.get("metadata") or {}).get("kind") != "synthesis"
+        ]
+        self.retrieval_stats.record("search", stat_items)
         return self.mcp_tool_result(text="\n".join(lines), structured=structured)
 
     async def handle_fetch_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2111,6 +2130,8 @@ class Mem0ChatProxy:
                         is_error=True,
                     )
                 body, blob_id = body_result
+                self.retrieval_stats.record(
+                    "fetch", [{"id": page.slug, "domain": page.domain, "topic": page.topic}])
                 return self.mcp_tool_result(
                     text=body,
                     structured={"id": page.slug, "title": page.title, "text": body,
@@ -2123,6 +2144,10 @@ class Mem0ChatProxy:
             if document is not None:
                 # The body goes in the text content too, not just structuredContent,
                 # so clients that don't read structuredContent still get the document.
+                doc_metadata = document.get("metadata") or {}
+                self.retrieval_stats.record(
+                    "fetch", [{"id": record_id, "domain": doc_metadata.get("domain"),
+                               "topic": doc_metadata.get("topic")}])
                 return self.mcp_tool_result(
                     text=format_fetched_document(document),
                     structured=document,
@@ -2130,6 +2155,10 @@ class Mem0ChatProxy:
 
         live = await self.fetch_live_memory(record_id)
         if live is not None:
+            live_metadata = live.get("metadata") or {}
+            self.retrieval_stats.record(
+                "fetch", [{"id": record_id, "domain": live_metadata.get("domain"),
+                           "topic": live_metadata.get("topic")}])
             return self.mcp_tool_result(
                 text=format_fetched_document(live),
                 structured=live,
@@ -2901,6 +2930,7 @@ class Mem0ChatProxy:
             note = ""
         else:
             note = f" Inline bytes omitted (size {size} > {INLINE_IMAGE_MAX_BYTES}); download via the signed URL."
+        self.retrieval_stats.record("fetch", [{"id": blob_id}])
         return self.mcp_tool_result(
             text=f"Image {blob_id} ({mimetype}, {size} bytes). Download: {url}{note}",
             structured=structured,
@@ -4155,6 +4185,7 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         state_dir=args.state_dir,
         static_tokens=parse_static_tokens(args.static_tokens),
         audit_log_path=args.audit_log,
+        retrieval_stats_path=args.retrieval_stats_path,
         rate_limit_writes=args.rate_limit_writes,
         rate_limit_searches=args.rate_limit_searches,
         metrics_public=args.metrics_public,
@@ -4265,6 +4296,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--audit-log", default=os.getenv("RELIQUARY_AUDIT_LOG"),
         help="Append a JSONL audit line per write (add/update/delete) to this path. Unset = disabled.")
+    parser.add_argument("--retrieval-stats-path", default=os.getenv("RELIQUARY_RETRIEVAL_STATS_PATH"),
+        help="Append a JSONL retrieval-event line per search hit / fetch to this path, so app/lint.py can propose "
+        "archive/compile actions from usage. Unset = disabled.")
     parser.add_argument("--rate-limit-writes", type=int, default=int(os.getenv("RELIQUARY_RATE_LIMIT_WRITES", "0")),
         help="Max write tool calls per token per minute (0 = unlimited).")
     parser.add_argument("--rate-limit-searches", type=int, default=int(os.getenv("RELIQUARY_RATE_LIMIT_SEARCHES", "0")),
