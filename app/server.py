@@ -25,7 +25,7 @@ from ingest import load_config
 from oauth import OAuthProvider, RegistrationDisabledError, scope_is_write
 from catalog import CorpusCatalog
 from persistence import JsonFileStore
-from runtime import AsyncRWLock, MCPSessionStore, reads_can_be_concurrent
+from runtime import AsyncRWLock, MCPSessionStore, native_hybrid_active, reads_can_be_concurrent
 from blobs import BlobStore, BlobTooLarge
 from ratelimit import RateLimiter
 from metrics import Metrics
@@ -308,6 +308,7 @@ class ProxySettings:
     oauth_client_id: str | None = None
     oauth_allow_registration: bool = True
     memory_concurrent_reads: bool | None = None
+    native_hybrid: str = "auto"
     oauth_verbatim_token: bool = False
     oauth_access_token_ttl: int = 432000   # 5 days
     oauth_refresh_token_ttl: int = 0       # 0 = non-expiring
@@ -376,6 +377,21 @@ class Mem0ChatProxy:
             self._search_user_id_param,
             self._search_limit_param,
         ) = self._detect_search_api()
+        import importlib.util
+        vector_store = getattr(self.memory, "vector_store", None)
+        # _has_bm25_slot is a private mem0 attribute tied to the mem0ai==2.0.4 pin; if a
+        # future rename drops it, getattr returns False and auto mode fails safe back to
+        # dense + get_all lexical fallback.
+        has_bm25_slot = bool(getattr(vector_store, "_has_bm25_slot", False))
+        fastembed_available = importlib.util.find_spec("fastembed") is not None
+        self._native_hybrid = native_hybrid_active(
+            settings.native_hybrid, has_bm25_slot=has_bm25_slot, fastembed_available=fastembed_available,
+        )
+        LOG.info(
+            "Search mode: %s",
+            "native hybrid (dense + Qdrant BM25); get_all lexical fallback retained only for exact-id queries"
+            if self._native_hybrid else "dense + get_all lexical fallback",
+        )
         self._count_cache: tuple[float, int | None] | None = None
         token_store = None
         refresh_token_store = None
@@ -704,6 +720,7 @@ class Mem0ChatProxy:
                 "memory_threshold": self.settings.memory_threshold,
                 "writeback": self.settings.writeback,
                 "memory_read_concurrency": "concurrent" if self._concurrent_reads else "exclusive",
+                "search_mode": "hybrid" if self._native_hybrid else "dense+lexical-fallback",
                 "claude_mcp_path": self.settings.claude_mcp_path,
                 "openai_mcp_path": self.settings.openai_mcp_path,
                 "claude_auth_enabled": bool(self.settings.claude_token),
@@ -1849,6 +1866,7 @@ class Mem0ChatProxy:
                     "catalog_loaded": self.catalog is not None,
                     "catalog_records": len(self.catalog.records_by_id) if self.catalog else 0,
                     "catalog_domains": self.catalog.routeable_domains if self.catalog else [],
+                    "search_mode": "hybrid" if self._native_hybrid else "dense+lexical-fallback",
                 }
                 return self.mcp_tool_result(
                     text=f"Mem0 is available. Approximate memory count: {status['approx_memory_count']}.",
@@ -3344,6 +3362,13 @@ class Mem0ChatProxy:
         so only run it when vector results are thin (fewer than ``limit``) OR the query
         contains an exact identifier token — the recall case it was built for (#28).
         Healthy searches with a full result set and a natural-language query skip it."""
+        if self._native_hybrid and not _EXACT_ID_RE.search(query):
+            # mem0's BM25 hybrid is dense-anchored (it re-ranks the dense candidate pool,
+            # not a true independent keyword index), so it can miss a low-dense-rank exact
+            # token in a user-write. Keep the get_all fallback ONLY for exact-identifier
+            # queries (the #28 recall case it exists for); skip the broad scan for ordinary
+            # queries, which hybrid re-ranks well.
+            return False
         if len(hits) < limit:
             return True
         return bool(_EXACT_ID_RE.search(query))
@@ -4173,6 +4198,7 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
         oauth_client_id=normalize_token(args.oauth_client_id),
         oauth_allow_registration=args.oauth_allow_registration,
         memory_concurrent_reads=args.memory_concurrent_reads,
+        native_hybrid=args.native_hybrid,
         oauth_verbatim_token=args.oauth_verbatim_token,
         oauth_access_token_ttl=args.oauth_access_token_ttl,
         oauth_refresh_token_ttl=args.oauth_refresh_token_ttl,
@@ -4214,6 +4240,14 @@ def parse_args() -> argparse.Namespace:
         default=None if _concurrent_reads_env is None else _concurrent_reads_env.lower() in {"1", "true", "yes"},
         help="Allow concurrent memory reads. Default: auto (concurrent only for server-backed "
         "Qdrant; exclusive for embedded/local Qdrant, which is not read-thread-safe).",
+    )
+    parser.add_argument(
+        "--native-hybrid",
+        default=os.getenv("RELIQUARY_NATIVE_HYBRID", "auto"),
+        choices=["auto", "on", "off"],
+        help="Whether to rely on mem0's server-side BM25 hybrid search and skip reliquary's "
+        "get_all lexical fallback. auto=detect (bm25 collection slot + fastembed installed); "
+        "on=assume active; off=always use the fallback.",
     )
     parser.add_argument("--upstream-base-url", default=None, help="Override the upstream LLM base URL.")
     parser.add_argument(
