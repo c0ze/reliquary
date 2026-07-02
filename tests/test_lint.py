@@ -29,8 +29,9 @@ def test_build_report_finds_stale_page(tmp_path):
                                dataset_path=None, min_count=8)
     stale_slugs = {item["slug"] for item in report["stale_pages"]}
     assert stale_slugs == {"old"}
-    # The four categories are always present.
-    assert set(report.keys()) == {"stale_pages", "coverage_gaps", "supersession", "orphans"}
+    # All categories are always present.
+    assert set(report.keys()) == {"stale_pages", "coverage_gaps", "supersession", "orphans",
+                                  "cold_records", "hot_topics"}
 
 
 def test_main_strict_exit_code_nonzero_when_proposals(tmp_path):
@@ -96,4 +97,5 @@ def test_build_report_degrades_when_dirs_unwritable(tmp_path):
         dataset_path=None, min_count=8,
     )
     assert report["stale_pages"] == []
-    assert set(report.keys()) == {"stale_pages", "coverage_gaps", "supersession", "orphans"}
+    assert set(report.keys()) == {"stale_pages", "coverage_gaps", "supersession", "orphans",
+                                  "cold_records", "hot_topics"}
