@@ -371,6 +371,9 @@ class Mem0ChatProxy:
         refresh_token_store = None
         session_store = None
         if settings.state_dir:
+            # Fail fast at startup on an unwritable mount, matching BlobStore/PageRegistry
+            # instead of deferring makedirs to JsonFileStore.save() and breaking OAuth mid-request.
+            os.makedirs(settings.state_dir, exist_ok=True)
             token_store = JsonFileStore(os.path.join(settings.state_dir, "oauth_tokens.json"))
             refresh_token_store = JsonFileStore(os.path.join(settings.state_dir, "oauth_refresh_tokens.json"))
             session_store = JsonFileStore(os.path.join(settings.state_dir, "mcp_sessions.json"))

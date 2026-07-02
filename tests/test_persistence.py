@@ -25,3 +25,15 @@ def test_save_is_atomic_no_tmp_left(tmp_path):
     store.save({"x": 1})
     leftovers = [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"]
     assert leftovers == []
+
+
+def test_state_dir_created_eagerly_at_proxy_init(make_proxy, tmp_path):
+    """An unwritable/missing state_dir mount should fail fast at startup, the
+    same way BlobStore/PageRegistry fail fast on their dirs — not silently
+    defer directory creation to the first OAuth token write mid-request."""
+    state_dir = tmp_path / "nested" / "state"
+    assert not state_dir.exists()
+
+    make_proxy(state_dir=str(state_dir))
+
+    assert state_dir.is_dir()
