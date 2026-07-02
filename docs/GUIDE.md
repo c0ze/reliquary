@@ -20,11 +20,12 @@ see the [README](../README.md).
 8. [Authentication](#authentication)
 9. [Embeddings & the tokenizer](#embeddings--the-tokenizer)
 10. [Embedder alternatives (Ollama vs LM Studio vs external)](#embedder-alternatives)
-11. [External access (Cloudflare / Tailscale / ngrok)](#external-access)
-12. [Operations](#operations)
-13. [Troubleshooting](#troubleshooting)
-14. [Security notes](#security-notes)
-15. [MCP transport notes](#mcp-transport-notes)
+11. [Native hybrid search](#native-hybrid-search)
+12. [External access (Cloudflare / Tailscale / ngrok)](#external-access)
+13. [Operations](#operations)
+14. [Troubleshooting](#troubleshooting)
+15. [Security notes](#security-notes)
+16. [MCP transport notes](#mcp-transport-notes)
 
 ---
 
@@ -209,6 +210,7 @@ file** (`config.yaml`). Run `python app/server.py --help` for every flag.
 | `RELIQUARY_OAUTH_VERBATIM_TOKEN` | `false` | Return the master bearer verbatim instead of a derived, revocable token |
 | `RELIQUARY_DATASET_PATH` | — | Curated JSONL (or dir) enabling taxonomy routing + `fetch` bootstrap docs |
 | `RELIQUARY_EMBEDDER_PROVIDER` / `_MODEL` / `_BASE_URL` / `_API_KEY` / `_DIMS` | — | Synthesize an embedder block without editing `config.yaml` |
+| `RELIQUARY_NATIVE_HYBRID` | `auto` | `auto`/`on`/`off` — detect/assume/disable mem0's server-side BM25 hybrid; see [Native hybrid search](#native-hybrid-search) |
 | `RELIQUARY_CLAUDE_MCP_PATH` / `RELIQUARY_OPENAI_MCP_PATH` | `/claude/mcp` / `/openai/mcp` | Override endpoint paths |
 
 ### Key CLI flags
@@ -452,6 +454,64 @@ sync** and re-ingest after a change.
 
 Swap models in the Docker stack by editing the `embedder` image/model in
 `docker-compose.yml` **and** the model + dims in `config.yaml` together.
+
+---
+
+## Native hybrid search
+
+By default, retrieval is pure dense (cosine) similarity over Qdrant, plus
+reliquary's own `get_all` lexical fallback scan for queries that look like an
+exact identifier (the recall case from #28 — a low-similarity but exact token
+match in a user-write). mem0 2.0.4 can also do **server-side BM25 hybrid**:
+Qdrant scores a sparse BM25 vector alongside the dense one and mem0 uses it to
+re-rank the dense candidate pool.
+
+**Important — this is dense-anchored, not independent.** The BM25 score only
+re-ranks whatever the dense search already retrieved; it is not a full
+keyword index laid over the whole corpus. A keyword-only match that falls
+outside the dense top-N is not injected into the results. That's why
+reliquary keeps its exact-identifier `get_all` fallback even with hybrid
+active — hybrid improves ordinary (natural-language) retrieval quality and
+removes the need for the broad lexical scan on those queries, but it isn't a
+substitute for the fallback on exact-identifier lookups.
+
+**Enable it (opt-in, three steps):**
+
+1. **Install `fastembed`** — not part of the default image, to keep it lean:
+   ```bash
+   pip install -r requirements-hybrid.txt
+   ```
+   (Or bake it into a derived image, or `pip install fastembed` inside the
+   running container.) mem0 loads it via
+   `SparseTextEmbedding(model_name="Qdrant/bm25")` once it's importable.
+2. **Point `config.yaml` at a fresh collection.** mem0 only provisions the
+   Qdrant `bm25` sparse-vector slot when it **creates** a collection.
+   Existing collections predate the slot and stay dense-only forever — set a
+   new `vector_store.config.collection_name`, or drop/recreate the old one.
+3. **Reindex your corpus** into the new collection:
+   ```bash
+   python app/ingest.py corpus.jsonl --config config.yaml --user-id default
+   ```
+
+Control detection with `RELIQUARY_NATIVE_HYBRID` (also `--native-hybrid`):
+
+| Value | Behavior |
+|-------|----------|
+| `auto` (default) | Detects a `bm25` sparse slot on the live collection **and** that `fastembed` is importable; if both hold, treats hybrid as active |
+| `on` | Assumes hybrid is active without probing — use once you're certain the collection + dependency are in place |
+| `off` | Always runs the `get_all` lexical fallback for every query, as if hybrid weren't available |
+
+**Verify it's live:** `GET /status` (or the `reliquary_status` MCP tool)
+reports `"search_mode": "hybrid"` when native hybrid is detected/assumed
+active, or `"search_mode": "dense+lexical-fallback"` otherwise.
+
+```bash
+curl -s -H "Authorization: Bearer $RELIQUARY_CLAUDE_MCP_TOKEN" \
+  http://127.0.0.1:8787/status | grep search_mode
+```
+
+Either way, the exact-identifier `get_all` fallback is retained — only the
+broad scan for ordinary queries is skipped once hybrid is confirmed active.
 
 ---
 

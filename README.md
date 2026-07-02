@@ -82,6 +82,16 @@ Caddy, or Traefik.
 > keep `embedding_model_dims` in sync with the model. Changing the embedder
 > changes the vector space — re-ingest your corpus afterwards.
 
+> **Native hybrid search (opt-in):** mem0 can BM25-re-rank Qdrant's dense
+> results server-side instead of relying only on cosine similarity. Enable it
+> with `pip install -r requirements-hybrid.txt` (adds `fastembed`), point
+> `config.yaml` at a **fresh** collection so mem0 creates its `bm25` sparse
+> slot, and reindex your corpus. Toggle with `RELIQUARY_NATIVE_HYBRID`
+> (`auto`/`on`/`off`); confirm it's live via `"search_mode": "hybrid"` on
+> `GET /status`. Reliquary still runs its exact-identifier lexical fallback
+> as a safety net either way. Full steps in
+> [`docs/GUIDE.md`](docs/GUIDE.md#native-hybrid-search).
+
 ## Upgrading to v0.3.0 (breaking)
 
 v0.3.0 renames Reliquary's own surface: Claude-endpoint tool names (old `mem0_*` prefix → `reliquary_*`),

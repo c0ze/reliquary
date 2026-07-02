@@ -1,0 +1,14 @@
+# Optional extra: enables mem0's server-side BM25 hybrid search on Qdrant.
+#
+# NOT installed by the default image — keeps the base image lean, since most
+# deployments don't need it. Installing this alone is not enough to activate
+# hybrid search: mem0 only creates the Qdrant `bm25` sparse-vector slot on a
+# FRESH collection, so switching this on also requires a one-time reindex into
+# a new `collection_name`. See docs/GUIDE.md ("Native hybrid search") for the
+# full enablement walkthrough.
+#
+#     pip install -r requirements-hybrid.txt
+#
+# mem0 loads this via fastembed's SparseTextEmbedding(model_name="Qdrant/bm25")
+# when it detects the package is importable.
+fastembed==0.7.4
