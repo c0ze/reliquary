@@ -4206,7 +4206,8 @@ def main() -> None:
         )
     if not settings.claude_token:
         LOG.warning(
-            "Claude MCP endpoint has no bearer token configured. "
+            "No master token configured: the Claude MCP endpoint cannot be authenticated "
+            "against, and OAuth authorization is disabled (no tokens can be minted). "
             "Set RELIQUARY_CLAUDE_MCP_TOKEN (or --claude-mcp-token) to require auth."
         )
     app = Mem0ChatProxy(settings)

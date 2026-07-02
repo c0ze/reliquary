@@ -217,6 +217,11 @@ class OAuthProvider:
         return parsed.netloc or "<unknown>"
 
     def verify_bearer(self, candidate: str) -> bool:
+        # An empty master_token means no RELIQUARY_CLAUDE_MCP_TOKEN was configured, i.e.
+        # OAuth is meant to be disabled. Without this guard, compare_digest("", "") on an
+        # empty-vs-empty candidate would return True and let anyone mint a write-scoped token.
+        if not self.master_token:
+            return False
         return secrets.compare_digest(candidate.strip(), self.master_token)
 
     def verify_client_id(self, candidate: str | None) -> bool:
