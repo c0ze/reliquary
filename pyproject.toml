@@ -1,6 +1,6 @@
 [project]
 name = "reliquary"
-version = "0.4.2"
+version = "0.5.0"
 description = "A personal memory server for AIs — Mem0 + Qdrant behind MCP, for Claude and ChatGPT"
 readme = "README.md"
 requires-python = ">=3.11"
