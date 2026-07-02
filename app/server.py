@@ -276,6 +276,20 @@ def append_source_writeback(
         handle.write(entry)
 
 
+def _bm25_encoder_usable(vector_store) -> bool:
+    """True only if mem0's BM25 encoder actually initializes. find_spec proves the
+    package imports; this confirms the Qdrant/bm25 model/native deps actually load.
+    Delegates to mem0's own _get_bm25_encoder() (returns None on any failure).
+    Fail-safe: a missing method or any exception -> False (-> dense + lexical fallback)."""
+    getter = getattr(vector_store, "_get_bm25_encoder", None)
+    if getter is None:
+        return False
+    try:
+        return getter() is not None
+    except Exception:
+        return False
+
+
 @dataclass
 class EndpointProfile:
     name: str
@@ -377,15 +391,18 @@ class Mem0ChatProxy:
             self._search_user_id_param,
             self._search_limit_param,
         ) = self._detect_search_api()
-        import importlib.util
         vector_store = getattr(self.memory, "vector_store", None)
         # _has_bm25_slot is a private mem0 attribute tied to the mem0ai==2.0.4 pin; if a
         # future rename drops it, getattr returns False and auto mode fails safe back to
         # dense + get_all lexical fallback.
         has_bm25_slot = bool(getattr(vector_store, "_has_bm25_slot", False))
-        fastembed_available = importlib.util.find_spec("fastembed") is not None
+        # find_spec proved only importability; probe the encoder so a broken fastembed
+        # isn't reported as hybrid. Only in auto mode - on/off skip the (model-loading)
+        # probe.
+        _mode = (settings.native_hybrid or "auto").strip().lower()
+        bm25_usable = has_bm25_slot and _mode not in ("on", "off") and _bm25_encoder_usable(vector_store)
         self._native_hybrid = native_hybrid_active(
-            settings.native_hybrid, has_bm25_slot=has_bm25_slot, fastembed_available=fastembed_available,
+            settings.native_hybrid, has_bm25_slot=has_bm25_slot, bm25_usable=bm25_usable,
         )
         LOG.info(
             "Search mode: %s",
@@ -4246,7 +4263,7 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("RELIQUARY_NATIVE_HYBRID", "auto"),
         choices=["auto", "on", "off"],
         help="Whether to rely on mem0's server-side BM25 hybrid search and skip reliquary's "
-        "get_all lexical fallback. auto=detect (bm25 collection slot + fastembed installed); "
+        "get_all lexical fallback. auto=detect (bm25 collection slot + a working fastembed BM25 encoder); "
         "on=assume active; off=always use the fallback.",
     )
     parser.add_argument("--upstream-base-url", default=None, help="Override the upstream LLM base URL.")

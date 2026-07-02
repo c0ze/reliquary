@@ -57,37 +57,37 @@ def test_non_dict_config_does_not_crash():
 
 
 def test_native_hybrid_off_forces_dense_only_even_when_both_present():
-    assert native_hybrid_active("off", has_bm25_slot=True, fastembed_available=True) is False
+    assert native_hybrid_active("off", has_bm25_slot=True, bm25_usable=True) is False
 
 
 def test_native_hybrid_on_forces_hybrid_even_when_both_absent():
-    assert native_hybrid_active("on", has_bm25_slot=False, fastembed_available=False) is True
+    assert native_hybrid_active("on", has_bm25_slot=False, bm25_usable=False) is True
 
 
 def test_native_hybrid_auto_true_only_when_both_present():
-    assert native_hybrid_active("auto", has_bm25_slot=True, fastembed_available=True) is True
+    assert native_hybrid_active("auto", has_bm25_slot=True, bm25_usable=True) is True
 
 
 def test_native_hybrid_auto_false_when_slot_missing():
-    assert native_hybrid_active("auto", has_bm25_slot=False, fastembed_available=True) is False
+    assert native_hybrid_active("auto", has_bm25_slot=False, bm25_usable=True) is False
 
 
-def test_native_hybrid_auto_false_when_fastembed_missing():
-    assert native_hybrid_active("auto", has_bm25_slot=True, fastembed_available=False) is False
+def test_native_hybrid_auto_false_when_bm25_not_usable():
+    assert native_hybrid_active("auto", has_bm25_slot=True, bm25_usable=False) is False
 
 
 def test_native_hybrid_auto_false_when_both_missing():
-    assert native_hybrid_active("auto", has_bm25_slot=False, fastembed_available=False) is False
+    assert native_hybrid_active("auto", has_bm25_slot=False, bm25_usable=False) is False
 
 
 def test_native_hybrid_none_or_unknown_mode_treated_as_auto():
-    assert native_hybrid_active(None, has_bm25_slot=True, fastembed_available=True) is True
-    assert native_hybrid_active(None, has_bm25_slot=False, fastembed_available=True) is False
-    assert native_hybrid_active("bogus", has_bm25_slot=True, fastembed_available=True) is True
-    assert native_hybrid_active("bogus", has_bm25_slot=False, fastembed_available=True) is False
+    assert native_hybrid_active(None, has_bm25_slot=True, bm25_usable=True) is True
+    assert native_hybrid_active(None, has_bm25_slot=False, bm25_usable=True) is False
+    assert native_hybrid_active("bogus", has_bm25_slot=True, bm25_usable=True) is True
+    assert native_hybrid_active("bogus", has_bm25_slot=False, bm25_usable=True) is False
     # case/whitespace tolerance, matching the other mode strings in this codebase
-    assert native_hybrid_active(" ON ", has_bm25_slot=False, fastembed_available=False) is True
-    assert native_hybrid_active(" OFF ", has_bm25_slot=True, fastembed_available=True) is False
+    assert native_hybrid_active(" ON ", has_bm25_slot=False, bm25_usable=False) is True
+    assert native_hybrid_active(" OFF ", has_bm25_slot=True, bm25_usable=True) is False
 
 
 # --------------------------- AsyncRWLock ---------------------------

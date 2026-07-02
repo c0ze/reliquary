@@ -501,6 +501,11 @@ Control detection with `RELIQUARY_NATIVE_HYBRID` (also `--native-hybrid`):
 | `on` | Assumes hybrid is active without probing — use once you're certain the collection + dependency are in place |
 | `off` | Always runs the `get_all` lexical fallback for every query, as if hybrid weren't available |
 
+In `auto` mode reliquary probes mem0's BM25 encoder at startup, so first boot
+may briefly load (and on first ever use, download) the `Qdrant/bm25` model; if
+the encoder can't load, reliquary fails safe to dense + the exact-id lexical
+fallback (and `/status` reports `dense+lexical-fallback`).
+
 **Verify it's live:** `GET /status` (or the `reliquary_status` MCP tool)
 reports `"search_mode": "hybrid"` when native hybrid is detected/assumed
 active, or `"search_mode": "dense+lexical-fallback"` otherwise.

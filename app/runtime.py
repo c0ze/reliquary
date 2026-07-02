@@ -33,17 +33,18 @@ def reads_can_be_concurrent(vector_store: dict[str, Any] | None) -> bool:
     return bool(config.get("url") or config.get("host") or config.get("port"))
 
 
-def native_hybrid_active(mode: str | None, *, has_bm25_slot: bool, fastembed_available: bool) -> bool:
+def native_hybrid_active(mode: str | None, *, has_bm25_slot: bool, bm25_usable: bool) -> bool:
     """Decide whether mem0's server-side BM25 hybrid is active, so reliquary can skip
     its redundant get_all lexical fallback. 'off' forces the fallback (never hybrid);
     'on' asserts hybrid (operator guarantees a bm25 collection + fastembed); 'auto'
-    (default) detects from the live collection slot + fastembed availability."""
+    (default) detects from the live collection slot + bm25_usable, where bm25_usable
+    means the BM25 encoder actually resolves (not mere importability of fastembed)."""
     m = (mode or "auto").strip().lower()
     if m == "off":
         return False
     if m == "on":
         return True
-    return bool(has_bm25_slot and fastembed_available)  # auto
+    return bool(has_bm25_slot and bm25_usable)  # auto
 
 
 class AsyncRWLock:

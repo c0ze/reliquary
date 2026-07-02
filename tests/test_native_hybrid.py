@@ -7,6 +7,9 @@ Covers:
 - The FakeMemory backend has no vector_store attribute, so auto-detection defaults to
   dense-only (no bm25 slot found) -> _native_hybrid is False by default.
 - /status and reliquary_status both surface the search_mode key.
+- auto-mode detection probes mem0's own _get_bm25_encoder() rather than trusting mere
+  fastembed importability, so a broken/incompatible fastembed install (encoder resolves
+  to None or raises) is correctly reported as dense+lexical-fallback, not hybrid.
 """
 
 from __future__ import annotations
@@ -15,6 +18,8 @@ import asyncio
 import types
 
 from conftest import FakeMemory
+
+from server import _bm25_encoder_usable
 
 
 def run(coro):
@@ -72,28 +77,97 @@ def test_native_hybrid_on_forces_hybrid_and_skips_fallback(make_proxy):
     assert proxy._should_run_lexical("some query", hits=[], limit=5) is False
 
 
-def test_native_hybrid_auto_true_when_backend_reports_bm25_slot_and_fastembed(make_proxy, monkeypatch):
+def test_native_hybrid_auto_true_when_encoder_resolves(make_proxy):
     memory = FakeMemory()
-    memory.vector_store = types.SimpleNamespace(_has_bm25_slot=True)
-
-    # native_hybrid_active() imports importlib.util locally inside __init__, so patching
-    # the real stdlib module's find_spec is what actually takes effect.
-    import importlib.util as real_importlib_util
-    monkeypatch.setattr(real_importlib_util, "find_spec", lambda name: object() if name == "fastembed" else None)
+    memory.vector_store = types.SimpleNamespace(
+        _has_bm25_slot=True, _get_bm25_encoder=lambda: object()
+    )
 
     proxy = make_proxy(memory=memory, native_hybrid="auto")
     assert proxy._native_hybrid is True
 
 
-def test_native_hybrid_auto_false_when_fastembed_missing_despite_slot(make_proxy, monkeypatch):
+def test_native_hybrid_auto_false_when_encoder_returns_none_despite_slot(make_proxy):
+    # THE regression this fixes: a broken/incompatible fastembed install is importable
+    # (find_spec would say yes) but mem0's own _get_bm25_encoder() resolves to None,
+    # meaning keyword_search will silently no-op. auto mode must NOT report hybrid.
     memory = FakeMemory()
-    memory.vector_store = types.SimpleNamespace(_has_bm25_slot=True)
-
-    import importlib.util as real_importlib_util
-    monkeypatch.setattr(real_importlib_util, "find_spec", lambda name: None)
+    memory.vector_store = types.SimpleNamespace(
+        _has_bm25_slot=True, _get_bm25_encoder=lambda: None
+    )
 
     proxy = make_proxy(memory=memory, native_hybrid="auto")
     assert proxy._native_hybrid is False
+
+    claude = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    result = run(proxy.call_mcp_tool(claude, "reliquary_status", {}, can_write=False))
+    assert result["structuredContent"]["search_mode"] == "dense+lexical-fallback"
+
+
+def test_native_hybrid_auto_false_when_encoder_getter_raises(make_proxy):
+    def _boom():
+        raise RuntimeError("native dep load failure")
+
+    memory = FakeMemory()
+    memory.vector_store = types.SimpleNamespace(_has_bm25_slot=True, _get_bm25_encoder=_boom)
+
+    proxy = make_proxy(memory=memory, native_hybrid="auto")
+    assert proxy._native_hybrid is False
+
+
+def test_native_hybrid_on_forces_hybrid_without_probing_encoder(make_proxy):
+    # 'on' asserts hybrid without paying for the (model-loading) probe; a
+    # _get_bm25_encoder that would raise/fail if invoked must not prevent hybrid,
+    # and must not even be called.
+    def _boom():
+        raise AssertionError("_get_bm25_encoder should not be called in 'on' mode")
+
+    memory = FakeMemory()
+    memory.vector_store = types.SimpleNamespace(_has_bm25_slot=True, _get_bm25_encoder=_boom)
+
+    proxy = make_proxy(memory=memory, native_hybrid="on")
+    assert proxy._native_hybrid is True
+
+
+def test_native_hybrid_off_does_not_probe_encoder(make_proxy):
+    def _boom():
+        raise AssertionError("_get_bm25_encoder should not be called in 'off' mode")
+
+    memory = FakeMemory()
+    memory.vector_store = types.SimpleNamespace(_has_bm25_slot=True, _get_bm25_encoder=_boom)
+
+    proxy = make_proxy(memory=memory, native_hybrid="off")
+    assert proxy._native_hybrid is False
+
+
+# --------------------------- _bm25_encoder_usable ---------------------------
+
+
+def test_bm25_encoder_usable_false_when_no_getter():
+    vector_store = types.SimpleNamespace()
+    assert _bm25_encoder_usable(vector_store) is False
+
+
+def test_bm25_encoder_usable_true_when_getter_returns_object():
+    vector_store = types.SimpleNamespace(_get_bm25_encoder=lambda: object())
+    assert _bm25_encoder_usable(vector_store) is True
+
+
+def test_bm25_encoder_usable_false_when_getter_returns_none():
+    vector_store = types.SimpleNamespace(_get_bm25_encoder=lambda: None)
+    assert _bm25_encoder_usable(vector_store) is False
+
+
+def test_bm25_encoder_usable_false_when_getter_raises():
+    def _boom():
+        raise RuntimeError("boom")
+
+    vector_store = types.SimpleNamespace(_get_bm25_encoder=_boom)
+    assert _bm25_encoder_usable(vector_store) is False
+
+
+def test_bm25_encoder_usable_false_for_none_vector_store():
+    assert _bm25_encoder_usable(None) is False
 
 
 # --------------------------- ops visibility ---------------------------
