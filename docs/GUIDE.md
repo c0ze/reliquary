@@ -395,11 +395,12 @@ Claude.ai Custom Connectors speak OAuth. Reliquary ships a small OAuth 2.1 shim:
 OAuth tokens are derived, resource-scoped, short-lived access tokens (default
 **5 days**, `RELIQUARY_OAUTH_ACCESS_TOKEN_TTL=432000`) paired with a **rotating,
 revocable refresh token** (non-expiring by default, with reuse detection), so the
-connector renews silently instead of re-authorizing. **Set `RELIQUARY_STATE_DIR`**
-so tokens persist across restarts — without it, every restart (e.g. a deploy)
-signs the connector out. Revoke via `/oauth/revoke`: revoking a refresh token
-drops the whole rotation family; revoking an access token removes just that
-token.
+connector renews silently instead of re-authorizing. The Docker Compose stack
+persists tokens across restarts by default (host dir `./data/state`, override
+with `STATE_HOST_DIR`); running outside Docker, **set `RELIQUARY_STATE_DIR`**
+yourself — without it, every restart (e.g. a deploy) signs the connector out.
+Revoke via `/oauth/revoke`: revoking a refresh token drops the whole rotation
+family; revoking an access token removes just that token.
 
 ---
 
@@ -651,10 +652,11 @@ sequence: `/.well-known/*` → `/oauth/register` → `/oauth/authorize` →
   grant both.
 - **OAuth tokens are derived & revocable.** A short-lived, resource-scoped access
   token (default 5 days) pairs with a **rotating refresh token** (non-expiring by
-  default, with reuse detection) so it renews silently. Set `RELIQUARY_STATE_DIR`
-  to persist tokens across restarts — without it, a restart signs connectors out.
-  Revoking a *refresh* token via `/oauth/revoke` drops the whole rotation family;
-  revoking an access token removes just that token.
+  default, with reuse detection) so it renews silently. The Docker Compose stack
+  persists tokens across restarts by default (see `STATE_HOST_DIR`); outside
+  Docker, set `RELIQUARY_STATE_DIR` yourself — without it, a restart signs
+  connectors out. Revoking a *refresh* token via `/oauth/revoke` drops the whole
+  rotation family; revoking an access token removes just that token.
 - **Publish only behind TLS**, and prefer narrowing your proxy to the
   `/claude/*`, `/openai/*`, `/uploads/*`, `/oauth/*`, `/.well-known/*`, `/healthz`
   paths. (`/uploads/*` requires the same write bearer as the MCP endpoint that
