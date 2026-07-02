@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import secrets
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -371,9 +372,23 @@ class Mem0ChatProxy:
         refresh_token_store = None
         session_store = None
         if settings.state_dir:
-            # Fail fast at startup on an unwritable mount, matching BlobStore/PageRegistry
-            # instead of deferring makedirs to JsonFileStore.save() and breaking OAuth mid-request.
+            # Fail fast at startup on a missing or unwritable mount, matching
+            # BlobStore/PageRegistry, instead of deferring the failure to the first
+            # JsonFileStore.save() and breaking OAuth mid-request. makedirs alone isn't
+            # enough: exist_ok=True succeeds silently on an existing-but-unwritable
+            # dir (e.g. a root-owned Docker bind mount), so probe with an actual write.
             os.makedirs(settings.state_dir, exist_ok=True)
+            try:
+                fd, probe_path = tempfile.mkstemp(dir=settings.state_dir)
+                os.write(fd, b"0")
+                os.close(fd)
+                os.unlink(probe_path)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"RELIQUARY_STATE_DIR {settings.state_dir!r} is not writable; "
+                    "fix ownership/permissions on the mounted state dir (OAuth tokens and "
+                    "MCP sessions cannot be persisted)"
+                ) from exc
             token_store = JsonFileStore(os.path.join(settings.state_dir, "oauth_tokens.json"))
             refresh_token_store = JsonFileStore(os.path.join(settings.state_dir, "oauth_refresh_tokens.json"))
             session_store = JsonFileStore(os.path.join(settings.state_dir, "mcp_sessions.json"))
