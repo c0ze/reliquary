@@ -392,8 +392,14 @@ Claude.ai Custom Connectors speak OAuth. Reliquary ships a small OAuth 2.1 shim:
 > isn't validated). The real credential is the token you paste on the authorize
 > page.
 
-OAuth tokens are derived, resource-scoped, 30-day, and held **in memory** — a
-restart invalidates them and clients re-authorize. Revoke via `/oauth/revoke`.
+OAuth tokens are derived, resource-scoped, short-lived access tokens (default
+**5 days**, `RELIQUARY_OAUTH_ACCESS_TOKEN_TTL=432000`) paired with a **rotating,
+revocable refresh token** (non-expiring by default, with reuse detection), so the
+connector renews silently instead of re-authorizing. **Set `RELIQUARY_STATE_DIR`**
+so tokens persist across restarts — without it, every restart (e.g. a deploy)
+signs the connector out. Revoke via `/oauth/revoke`: revoking a refresh token
+drops the whole rotation family; revoking an access token removes just that
+token.
 
 ---
 
@@ -643,10 +649,16 @@ sequence: `/.well-known/*` → `/oauth/register` → `/oauth/authorize` →
   Claude and OpenAI endpoints.
 - **Use distinct tokens** for the Claude and OpenAI endpoints so one leak doesn't
   grant both.
-- **OAuth tokens are derived & revocable** (resource-scoped, 30-day, in memory) —
-  a restart invalidates them.
+- **OAuth tokens are derived & revocable.** A short-lived, resource-scoped access
+  token (default 5 days) pairs with a **rotating refresh token** (non-expiring by
+  default, with reuse detection) so it renews silently. Set `RELIQUARY_STATE_DIR`
+  to persist tokens across restarts — without it, a restart signs connectors out.
+  Revoking a *refresh* token via `/oauth/revoke` drops the whole rotation family;
+  revoking an access token removes just that token.
 - **Publish only behind TLS**, and prefer narrowing your proxy to the
-  `/claude/*`, `/openai/*`, `/oauth/*`, `/.well-known/*`, `/healthz` paths.
+  `/claude/*`, `/openai/*`, `/uploads/*`, `/oauth/*`, `/.well-known/*`, `/healthz`
+  paths. (`/uploads/*` requires the same write bearer as the MCP endpoint that
+  minted the slot.)
 - **Don't commit secrets or your corpus.** `.env`, `config.yaml`, `*.jsonl`, and
   `qdrant_storage/` are gitignored.
 
