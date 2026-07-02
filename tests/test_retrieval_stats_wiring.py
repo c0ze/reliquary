@@ -46,6 +46,52 @@ def test_search_records_raw_hit_ids(make_proxy, tmp_path):
     assert agg["events"] >= 1
 
 
+def test_search_records_raw_hit_with_synthesis_kind_metadata(make_proxy, tmp_path):
+    # metadata.kind is caller/importer-controlled -- a raw, user-written memory that
+    # happens to carry metadata.kind == "synthesis" must still be recorded, because
+    # the server-set `route` (not the data-controlled kind) is what marks compiled
+    # pages. A filter keyed off metadata.kind would wrongly exclude this real catalog
+    # record from stats, and after the cold-event floor lint could flag it as a false
+    # "never retrieved" archive proposal.
+    stats_path = tmp_path / "stats.jsonl"
+    proxy = make_proxy(retrieval_stats_path=str(stats_path))
+    add_result = run(proxy.handle_add_memory_tool({
+        "text": "Frank keeps a spoofed synthesis-kind note",
+        "kind": "synthesis",
+    }))
+    raw_id = add_result["structuredContent"]["ids"][0]
+
+    result = run(proxy.handle_search_tool({"query": "Frank spoofed synthesis-kind note"}))
+    assert not result["isError"]
+    ids = [r["id"] for r in result["structuredContent"]["results"]]
+    assert raw_id in ids
+
+    assert stats_path.exists()
+    agg = aggregate(str(stats_path))
+    assert raw_id in agg["by_id"]
+
+
+def test_stat_items_filter_keys_off_route_not_metadata_kind(make_proxy, tmp_path):
+    # Focused unit-level check on the filter itself (mirrors the list comprehension in
+    # handle_search_tool): a compiled page (route == "synthesis") is excluded regardless
+    # of its metadata.kind, while a raw hit with metadata.kind == "synthesis" but a real
+    # route is kept -- proving the decision is keyed off the server-set route field.
+    results = [
+        {"id": "compiled-page-1", "route": "synthesis",
+         "metadata": {"kind": "synthesis", "domain": "outdoors"}},
+        {"id": "raw-spoofed-1", "route": "global",
+         "metadata": {"kind": "synthesis", "domain": "outdoors"}},
+    ]
+    stat_items = [
+        {"id": r.get("id"), "domain": (r.get("metadata") or {}).get("domain"),
+         "topic": (r.get("metadata") or {}).get("topic")}
+        for r in results
+        if r.get("id") and r.get("route") != "synthesis"
+    ]
+    recorded_ids = {item["id"] for item in stat_items}
+    assert recorded_ids == {"raw-spoofed-1"}
+
+
 def test_search_does_not_record_synthesis_results(make_proxy, tmp_path):
     stats_path = tmp_path / "stats.jsonl"
     proxy = make_proxy(retrieval_stats_path=str(stats_path))

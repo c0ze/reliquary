@@ -90,6 +90,14 @@ def aggregate(path: str | None) -> dict:
             ts = entry.get("ts")
             domain = entry.get("domain")
             topic = entry.get("topic")
+            # domain/topic are caller/importer-controlled (via metadata); a non-scalar
+            # value (list/dict) must not become an unhashable dict key below, which
+            # would crash lint and the live needs-review resource read. Treat it as
+            # absent, same as a missing value.
+            if not isinstance(domain, str):
+                domain = None
+            if not isinstance(topic, str):
+                topic = None
 
             record = result["by_id"].get(item_id)
             if record is None:

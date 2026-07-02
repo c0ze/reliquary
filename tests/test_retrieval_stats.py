@@ -240,6 +240,43 @@ def test_aggregate_tolerates_invalid_utf8_line(tmp_path):
     assert set(result["by_id"].keys()) == {"a", "b"}
 
 
+def test_aggregate_tolerates_non_scalar_domain_and_topic(tmp_path):
+    # domain/topic ultimately come from caller/importer-controlled metadata. If a
+    # retrieved memory's metadata.domain (or topic) is a list/dict, the event line
+    # persists it verbatim; aggregate() must not use it as a dict key (unhashable ->
+    # TypeError) and must treat it as absent instead, same as a missing value.
+    log_path = tmp_path / "stats.jsonl"
+    with open(log_path, "w", encoding="utf-8") as fh:
+        # well-formed event, should aggregate normally
+        fh.write(json.dumps({"ts": 1.0, "event": "search", "id": "a", "domain": "work", "topic": "billing"}) + "\n")
+        # domain is a list (unhashable) -- must not raise, must not be counted
+        fh.write(json.dumps({"ts": 2.0, "event": "search", "id": "b", "domain": ["work", "home"], "topic": "billing"}) + "\n")
+        # topic is a dict (unhashable) -- must not raise, must not be counted
+        fh.write(json.dumps({"ts": 3.0, "event": "search", "id": "c", "domain": "work", "topic": {"x": 1}}) + "\n")
+        # another well-formed event, should still aggregate normally
+        fh.write(json.dumps({"ts": 4.0, "event": "search", "id": "d", "domain": "home", "topic": "chores"}) + "\n")
+
+    result = aggregate(str(log_path))  # must not raise TypeError: unhashable type
+
+    assert result["events"] == 4
+
+    # well-formed events aggregate as usual
+    assert result["by_id"]["a"]["domain"] == "work"
+    assert result["by_id"]["a"]["topic"] == "billing"
+    assert result["by_id"]["d"]["domain"] == "home"
+    assert result["by_id"]["d"]["topic"] == "chores"
+
+    # non-scalar domain/topic are treated as absent: not stored on by_id...
+    assert result["by_id"]["b"]["domain"] is None
+    assert result["by_id"]["b"]["topic"] == "billing"  # topic on "b" was a valid string
+    assert result["by_id"]["c"]["domain"] == "work"  # domain on "c" was a valid string
+    assert result["by_id"]["c"]["topic"] is None
+
+    # ...and not counted in by_domain/by_topic.
+    assert result["by_domain"] == {"work": 2, "home": 1}  # "b"'s list-domain not counted
+    assert result["by_topic"] == {"work\tbilling": 1, "home\tchores": 1}  # "c"'s dict-topic not counted
+
+
 def test_aggregate_domain_topic_track_most_recent_by_ts_out_of_order(tmp_path):
     # Write lines out of ts order: the newer-by-ts event appears FIRST in the file.
     log_path = tmp_path / "stats.jsonl"
