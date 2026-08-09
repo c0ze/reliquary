@@ -19,6 +19,7 @@ venv/
 
 # OS / editor
 .DS_Store
+.claude/
 
 # Git worktrees for isolated feature work
 .worktrees/
