@@ -34,6 +34,10 @@ def validate_public_url(url: str) -> str | None:
             addr = ipaddress.ip_address(ip_text)
         except ValueError:
             return f"invalid resolved address {ip_text!r}"
+        # Classify IPv4-mapped IPv6 (::ffff:a.b.c.d) by its embedded IPv4
+        # address — older ipaddress versions mark mapped internals as global.
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
         if (
             not addr.is_global
             or addr.is_private

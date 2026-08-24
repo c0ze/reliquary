@@ -675,16 +675,20 @@ class Mem0ChatProxy:
                 await self.handle_debug_search(scope, receive, send)
                 return
 
-            if method == "POST" and path == "/v1/chat/completions":
-                await self.handle_chat_completions(scope, receive, send)
-                return
-
-            if path == "/v1/embeddings":
-                await self.handle_passthrough(scope, receive, send, base_url=self.settings.embedder_base_url)
-                return
-
             if path.startswith("/v1/"):
-                await self.handle_passthrough(scope, receive, send, base_url=self.settings.upstream_base_url)
+                # Defense-in-depth: /v1/chat/completions injects the owner's
+                # memories and /v1/* relays to upstreams. INGRESS.md blocks these
+                # at the proxy, but a single ingress slip must not expose them —
+                # require the same bearer as the MCP endpoint.
+                if not self._require_claude_auth(decode_headers(scope)):
+                    await self._send_unauthorized(send)
+                    return
+                if method == "POST" and path == "/v1/chat/completions":
+                    await self.handle_chat_completions(scope, receive, send)
+                elif path == "/v1/embeddings":
+                    await self.handle_passthrough(scope, receive, send, base_url=self.settings.embedder_base_url)
+                else:
+                    await self.handle_passthrough(scope, receive, send, base_url=self.settings.upstream_base_url)
                 return
 
             await self.send_json(send, 404, {"error": f"Unknown path: {path}"})
@@ -1019,12 +1023,18 @@ class Mem0ChatProxy:
                 self.metrics.record_tool(tool_name, ok=not result.get("isError"))
                 if category == "write" and not result.get("isError"):
                     structured = result.get("structuredContent") or {}
-                    self.audit.record(
-                        action=tool_name,
-                        endpoint=profile.name,
-                        user_id=tool_arguments.get("user_id") or self.settings.user_id,
-                        ids={k: structured.get(k) for k in ("ids", "id", "memory_id", "blob_id", "deleted", "updated") if k in structured},
-                    )
+                    try:
+                        self.audit.record(
+                            action=tool_name,
+                            endpoint=profile.name,
+                            user_id=tool_arguments.get("user_id") or self.settings.user_id,
+                            ids={k: structured.get(k) for k in ("ids", "id", "memory_id", "blob_id", "deleted", "updated") if k in structured},
+                        )
+                    except Exception:
+                        # The write already committed; an unwritable audit path
+                        # must not turn it into a 500 (the client would retry
+                        # and duplicate the write).
+                        LOG.exception("Audit log write failed (non-fatal)")
             await self.send_json(
                 send,
                 200,
@@ -1984,7 +1994,10 @@ class Mem0ChatProxy:
             arguments.get("limit"), default=self.settings.memory_limit, minimum=1, maximum=20
         )
         try:
-            offset = max(0, int(arguments.get("cursor") or 0))
+            # Cap the offset: result_cap below feeds search top_k and the O(n²)
+            # dedup pass, so an unbounded cursor is a resource-exhaustion vector.
+            # 400 = 20 pages at the max limit — far beyond any real pagination.
+            offset = max(0, min(int(arguments.get("cursor") or 0), 400))
         except (TypeError, ValueError):
             offset = 0
         threshold = (
@@ -2275,6 +2288,15 @@ class Mem0ChatProxy:
                 except Exception:
                     LOG.exception("Compiled re-index failed for slug=%s; adding fresh", info.slug)
             result = await asyncio.to_thread(self.compiled_memory.add, text, user_id=user_id, metadata=metadata, infer=False)
+            if info.memory_id:
+                # The failed update left the old vector behind; best-effort drop
+                # it so stale synthesis text can't outrank (and outlive) the
+                # fresh index — delete_page only removes the latest memory_id.
+                try:
+                    await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
+                except Exception:
+                    LOG.warning("Could not remove superseded compiled vector %s for slug=%s",
+                                info.memory_id, info.slug)
         ids = added_memory_ids(result)
         return ids[0] if ids else None
 
@@ -2297,8 +2319,23 @@ class Mem0ChatProxy:
             return self.mcp_tool_result(
                 text=f"`status` must be one of: {', '.join(VALID_STATUSES)}.",
                 structured={"error": "invalid_status", "valid": list(VALID_STATUSES)}, is_error=True)
-        derived_from = [str(x).strip() for x in (arguments.get("derived_from") or []) if str(x).strip()]
-        supersedes = [str(x).strip() for x in (arguments.get("supersedes") or []) if str(x).strip()]
+        # JSON schemas are advisory: a bare string here would iterate char-by-char
+        # and silently corrupt provenance (put_revision guards this, but the list
+        # comprehension below would explode the string before the guard fires).
+        id_lists: dict[str, list[str]] = {}
+        for key in ("derived_from", "supersedes"):
+            value = arguments.get(key)
+            if value is None:
+                value = []
+            elif isinstance(value, (str, bytes)):
+                value = [value]
+            elif not isinstance(value, (list, tuple)):
+                return self.mcp_tool_result(
+                    text=f"`{key}` must be an array of memory ids.",
+                    structured={"error": "invalid_argument", "key": key}, is_error=True)
+            id_lists[key] = [str(x).strip() for x in value if str(x).strip()]
+        derived_from = id_lists["derived_from"]
+        supersedes = id_lists["supersedes"]
         frontmatter: dict[str, Any] = {"title": title or slug, "status": status,
                                        "derived_from": derived_from, "supersedes": supersedes}
         for key in ("domain", "hall", "room", "topic"):
@@ -2373,7 +2410,10 @@ class Mem0ChatProxy:
         deleted_memory = None
         if info.memory_id and self.compiled_memory is not None:
             try:
-                await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
+                # Same lock every other compiled-store op takes: embedded local
+                # Qdrant is not safe under concurrent read/write.
+                async with self.memory_lock.write():
+                    await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
                 deleted_memory = info.memory_id
             except Exception as exc:
                 LOG.warning("delete_page: aborting; could not delete indexed memory %s for %s: %s",
@@ -2678,7 +2718,12 @@ class Mem0ChatProxy:
         if upload.expires_at <= time.time():
             self._drop_upload(upload_id)
             if upload.blob_id:
-                self.blobs.delete(upload.blob_id)
+                # Same guard as _cleanup_expired_uploads: a slot can outlive a
+                # successful commit (crash before drop); never delete bytes a
+                # committed memory owns.
+                blob_info = self.blobs.info(upload.blob_id)
+                if blob_info is not None and not blob_info.owners:
+                    self.blobs.delete(upload.blob_id)
             return self.mcp_tool_result(
                 text=f"Upload slot {upload_id} has expired.",
                 structured={"error": "upload_expired", "upload_id": upload_id},
@@ -2962,20 +3007,24 @@ class Mem0ChatProxy:
                 is_error=True,
             )
         data, mimetype = result
-        encoded = base64.b64encode(data).decode("ascii")
         url = self._signed_blob_url(blob_id)
         size = len(data)
         structured: dict[str, Any] = {"blob_id": blob_id, "url": url, "mimetype": mimetype, "size": size}
+        image: tuple[str, str] | None = None
         if size <= INLINE_IMAGE_MAX_BYTES:
+            encoded = base64.b64encode(data).decode("ascii")
             structured["image_base64"] = encoded
+            image = (encoded, mimetype)
             note = ""
         else:
+            # The cap must gate the MCP image content block too — otherwise the
+            # "omitted" text ships next to megabytes of base64 in content[].
             note = f" Inline bytes omitted (size {size} > {INLINE_IMAGE_MAX_BYTES}); download via the signed URL."
         self.retrieval_stats.record("fetch", [{"id": blob_id}])
         return self.mcp_tool_result(
             text=f"Image {blob_id} ({mimetype}, {size} bytes). Download: {url}{note}",
             structured=structured,
-            image=(encoded, mimetype),
+            image=image,
         )
 
     async def handle_delete_image_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
@@ -3068,6 +3117,17 @@ class Mem0ChatProxy:
                 "(imported corpus records are protected).",
                 structured={"error": "protected_record", "id": record_id,
                             "suggested_action": f"Imported records are read-only — file a correction with {tool_prefix}propose_update (target_id=<id>)."},
+                is_error=True,
+            )
+        if (existing.get("metadata") or {}).get("kind") == "image":
+            # Deleting the caption memory here would strand its blob forever:
+            # the blob's owner would be a dead memory id, and delete_image
+            # (the path that unlinks the bytes) requires a live memory.
+            return self.mcp_tool_result(
+                text=f"id={record_id} is an image memory; use {tool_prefix}delete_image "
+                "(memory_id=...) so its stored image bytes are unlinked too.",
+                structured={"error": "image_record", "id": record_id,
+                            "suggested_action": f"Call {tool_prefix}delete_image with memory_id={record_id}."},
                 is_error=True,
             )
         await self.delete_memory(record_id)
@@ -3995,7 +4055,9 @@ class Mem0ChatProxy:
             return f"Missing required parameters: {', '.join(missing)}"
         if params["response_type"] != "code":
             return f"Unsupported response_type: {params['response_type']}"
-        if params["code_challenge_method"].upper() not in {"S256", "PLAIN"}:
+        # S256 only, matching the advertised metadata: accepting PLAIN would let
+        # a tampered authorize request downgrade PKCE to a cleartext challenge.
+        if params["code_challenge_method"].upper() != "S256":
             return f"Unsupported code_challenge_method: {params['code_challenge_method']}"
         if not self.oauth.valid_redirect_uri(params["redirect_uri"]):
             return "redirect_uri must be https:// or http://localhost"

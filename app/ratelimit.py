@@ -21,6 +21,12 @@ class RateLimiter:
             return True
         now = self._clock()
         with self._lock:
+            # Prune expired buckets: keys are per-token hashes and OAuth tokens
+            # rotate on every refresh, so without eviction the dict grows
+            # monotonically for the life of the process.
+            if len(self._buckets) > 1024:
+                self._buckets = {k: b for k, b in self._buckets.items()
+                                 if (now - b[0]) < self.window}
             bucket = self._buckets.get(key)
             if bucket is None or (now - bucket[0]) >= self.window:
                 self._buckets[key] = [now, 1]
