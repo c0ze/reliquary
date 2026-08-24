@@ -67,8 +67,11 @@ def _fan_out_bulk(page_registry, touched_ids: set[str], touched_tax: set) -> Non
     """One-pass staleness fan-out after a bulk import (avoids O(records*pages))."""
     try:
         for page in page_registry.list(status="current"):
+            # A page that declares derived_from is judged on its sources alone;
+            # the domain+topic fallback applies only to provenance-less pages (#69).
             if (touched_ids & set(page.derived_from or [])) or (
-                page.domain and page.topic and (page.domain, page.topic) in touched_tax
+                not page.derived_from
+                and page.domain and page.topic and (page.domain, page.topic) in touched_tax
             ):
                 page_registry.set_status(page.slug, "stale")
     except Exception as exc:
