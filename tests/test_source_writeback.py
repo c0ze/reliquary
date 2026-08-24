@@ -203,7 +203,9 @@ def test_chat_proxy_uses_reliquary_payload_keys(tmp_path, monkeypatch):
                 "/v1/chat/completions",
                 content=json.dumps(payload).encode(),
                 headers={"content-type": "application/json",
-                         "authorization": "Bearer claude-secret"},
+                         "authorization": "Bearer claude-secret",
+                         # Redundant second credential — must not leak upstream.
+                         "x-reliquary-token": "claude-secret"},
             )
 
         assert resp.status_code == 200
@@ -218,9 +220,11 @@ def test_chat_proxy_uses_reliquary_payload_keys(tmp_path, monkeypatch):
         assert call_content.get("mem0_query") == "should be forwarded as-is"
         # And reliquary_query must have been consumed (not forwarded).
         assert "reliquary_query" not in call_content
-        # The consumed Reliquary bearer must never reach the upstream.
-        upstream_headers = proxy.client.request.call_args.kwargs["headers"]
-        assert "authorization" not in {k.lower() for k in upstream_headers}
+        # The consumed Reliquary bearer must never reach the upstream — and
+        # x-reliquary-token is always ours, even when unused for auth.
+        upstream_headers = {k.lower() for k in proxy.client.request.call_args.kwargs["headers"]}
+        assert "authorization" not in upstream_headers
+        assert "x-reliquary-token" not in upstream_headers
 
     asyncio.run(scenario())
 

@@ -701,7 +701,11 @@ class Mem0ChatProxy:
                     # passthrough relays arbitrary methods: write scope required.
                     await self._send_unauthorized(send)
                     return
-                scope = self._scope_without_header(scope, consumed_header)
+                # x-reliquary-token is always ours — never forward it, even when
+                # Authorization was the credential that authenticated.
+                scope = self._scope_without_header(scope, "x-reliquary-token")
+                if consumed_header == "authorization":
+                    scope = self._scope_without_header(scope, "authorization")
                 if method == "POST" and path == "/v1/chat/completions":
                     await self.handle_chat_completions(scope, receive, send)
                 elif path == "/v1/embeddings":
