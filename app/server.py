@@ -2210,9 +2210,11 @@ class Mem0ChatProxy:
         )
 
     def _fan_out_staleness(self, source_ids: list[str], metadata: dict[str, Any]) -> None:
-        """Flag current synthesis pages deriving from the same sources/topics as a
-        freshly-added raw memory. Bookkeeping only (queue, never rewrite); wrapped
-        so it can never break the write."""
+        """Flag current synthesis pages deriving from a freshly-added raw memory
+        (pages with no declared provenance fall back to a domain+topic match).
+        Flips the status flag only — never rewrites page content or mints a
+        revision; the page surfaces in needs-review for a human-driven recompile.
+        Wrapped so it can never break the write."""
         if self.pages is None:
             return
         try:

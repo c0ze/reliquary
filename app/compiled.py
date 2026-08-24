@@ -253,13 +253,15 @@ class PageRegistry:
 
     def pages_deriving_from(self, *, ids=(), domain: str | None = None,
                             topic: str | None = None) -> "list[PageInfo]":
-        """Pages whose synthesis derives from any of ``ids``, or (when there is no
-        id match) whose ``domain`` AND ``topic`` both match. Pass either or both."""
+        """Pages whose synthesis derives from any of ``ids``. Pages that declare
+        no ``derived_from`` at all fall back to a ``domain`` AND ``topic`` match;
+        a page that declares its sources is judged on them alone (#69)."""
         idset = set(ids)
         out = []
         for info in self._iter_pages():
             if idset and idset.intersection(info.derived_from or ()):
                 out.append(info)
-            elif domain and topic and info.domain == domain and info.topic == topic:
+            elif not info.derived_from and domain and topic \
+                    and info.domain == domain and info.topic == topic:
                 out.append(info)
         return out

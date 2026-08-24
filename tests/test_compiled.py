@@ -123,5 +123,24 @@ def test_list_history_status_provenance(tmp_path):
 
     by_id = {p.slug for p in reg.pages_deriving_from(ids=["r2"])}
     assert by_id == {"morrigan"}
+    # #69: all three pages declare derived_from, so the domain+topic fallback
+    # must not match any of them — provenance is judged on sources only.
     by_tax = {p.slug for p in reg.pages_deriving_from(domain="pagan", topic="deities")}
-    assert by_tax == {"brigid", "morrigan"}
+    assert by_tax == set()
+
+
+def test_taxonomy_fallback_only_for_pages_without_provenance(tmp_path):
+    """#69: a page that declares derived_from is judged on its sources; the
+    domain+topic fallback applies only to pages with no provenance at all."""
+    reg = _registry(tmp_path)
+    reg.put_revision("a", "a", {"domain": "archive", "topic": "salvage", "derived_from": ["m1"]})
+    reg.put_revision("b", "b", {"domain": "archive", "topic": "salvage", "derived_from": ["m2"]})
+    reg.put_revision("c", "c", {"domain": "archive", "topic": "salvage"})
+
+    # A fresh memory no page derives from: only the provenance-less page matches.
+    hits = {p.slug for p in reg.pages_deriving_from(ids=["m9"], domain="archive", topic="salvage")}
+    assert hits == {"c"}
+
+    # An id match still wins regardless of the fallback.
+    hits = {p.slug for p in reg.pages_deriving_from(ids=["m2"], domain="archive", topic="salvage")}
+    assert hits == {"b", "c"}
