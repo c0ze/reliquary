@@ -103,6 +103,12 @@ def test_identical_refile_is_noop_revision(tmp_path):
     b = reg.put_revision("p", "same", {"title": "P"})
     assert a.current_blob == b.current_blob
     assert b.history == []  # identical content => no new revision, even at a later time
+    # The no-op re-file must not leak a blob ref: the registry still holds one
+    # reference, so the store must still count exactly one.
+    assert reg.blobs.info(a.current_blob).ref_count == 1
+    # And a page delete must actually reclaim the blob.
+    reg.delete("p")
+    assert reg.blobs.info(a.current_blob) is None
 
 
 def test_list_history_status_provenance(tmp_path):

@@ -141,3 +141,17 @@ def test_delete_owner_mismatch_does_not_decrement(tmp_path):
     assert store.get(info.id) is not None
     assert store.info(info.id).ref_count == 1
     assert store.is_owner(info.id, "mem-1") is True
+
+
+def test_put_selfheals_missing_bytes(tmp_path):
+    """A stale sidecar (bytes lost to a crash window or out-of-band removal)
+    must not turn dedup puts into "successful" writes of unreadable blobs."""
+    import os
+    store = make_store(tmp_path)
+    info = store.put(PNG)
+    os.remove(store._blob_path(info.id, info.ext))
+    assert store.get(info.id) is None  # bytes gone, sidecar stale
+    healed = store.put(PNG)
+    assert healed.id == info.id and healed.ref_count == 2
+    got = store.get(info.id)
+    assert got is not None and got[0] == PNG

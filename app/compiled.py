@@ -157,6 +157,11 @@ class PageRegistry:
                 info.created_at = now
             blob_info = self.blobs.put(assemble_markdown(info, body).encode("utf-8"),
                                        mimetype="text/markdown")
+            if existing and existing.current_blob == blob_info.id:
+                # Identical re-file: put() bumped the ref for a blob this page
+                # already counts once; release the extra ref so delete() stays
+                # balanced and the blob can actually be reclaimed later.
+                self.blobs.delete(blob_info.id)
             if existing and existing.current_blob and existing.current_blob != blob_info.id:
                 info.history.append(existing.current_blob)
                 # Capture the superseded revision's timestamp + status so
