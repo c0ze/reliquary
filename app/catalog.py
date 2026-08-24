@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,21 +99,28 @@ class CorpusCatalog:
         records: list[CorpusRecord] = []
         for current_path in paths:
             with current_path.open("r", encoding="utf-8") as handle:
-                for line in handle:
+                for lineno, line in enumerate(handle, start=1):
                     line = line.strip()
                     if not line:
                         continue
-                    payload = json.loads(line)
-                    metadata = payload.get("metadata") or {}
-                    records.append(
-                        CorpusRecord(
+                    # Skip-and-warn per line: one truncated/malformed record must
+                    # not take down the whole catalog (the server would boot with
+                    # catalog=None and every imported-record fetch would 404).
+                    try:
+                        payload = json.loads(line)
+                        metadata = payload.get("metadata") or {}
+                        record = CorpusRecord(
                             import_record_id=str(payload["id"]),
                             title=str(metadata.get("title") or "<untitled>"),
                             text=str(payload.get("text") or ""),
                             metadata=metadata,
                             source_ref=str(metadata.get("source_ref") or ""),
                         )
-                    )
+                    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                        print(f"[catalog] skipping bad record {current_path}:{lineno}: {exc}",
+                              file=sys.stderr)
+                        continue
+                    records.append(record)
         return cls(records)
 
     def _build_indexes(self, records: list[CorpusRecord]) -> None:
