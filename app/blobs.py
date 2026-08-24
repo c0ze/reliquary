@@ -71,6 +71,7 @@ _MIME_EXT: dict[str, str] = {
     "image/webp": "webp",
     "application/pdf": "pdf",
     "image/svg+xml": "svg",
+    "text/markdown": "md",
 }
 
 
@@ -131,6 +132,16 @@ class BlobStore:
             existing = self.info(blob_id)
             if existing is not None:
                 existing.ref_count += 1
+                blob_path = self._blob_path(blob_id, existing.ext)
+                if not os.path.exists(blob_path):
+                    # Self-heal a stale sidecar (bytes lost to a crash window or
+                    # out-of-band removal) — otherwise this "successful" dedup
+                    # would keep pointing at bytes that no longer exist.
+                    os.makedirs(self._shard_dir(blob_id), exist_ok=True)
+                    tmp = f"{blob_path}.tmp"
+                    with open(tmp, "wb") as fh:
+                        fh.write(data)
+                    os.replace(tmp, blob_path)
                 self._write_sidecar(existing)
                 return existing
 
@@ -216,7 +227,10 @@ class BlobStore:
             if info.ref_count > 0:
                 self._write_sidecar(info)
                 return False
-            for path in (self._blob_path(blob_id, info.ext), self._sidecar_path(blob_id)):
+            # Sidecar first: a crash between the two unlinks must not leave a
+            # sidecar pointing at missing bytes (an orphaned bytes file is
+            # harmless and gets rewritten by the next put of the same content).
+            for path in (self._sidecar_path(blob_id), self._blob_path(blob_id, info.ext)):
                 try:
                     os.remove(path)
                 except FileNotFoundError:

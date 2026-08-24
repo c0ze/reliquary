@@ -160,6 +160,24 @@ def test_bulk_ingest_flags_page_by_derived_id(tmp_path):
     assert registry.get("brigid").status == "stale"
 
 
+def test_bulk_ingest_leaves_provenanced_sibling_current(tmp_path):
+    """#69 (bulk path): a page that declares derived_from must not be flagged
+    stale by a same-domain+topic import it does not derive from."""
+    registry = _page_registry(tmp_path)
+    registry.put_revision("salvage-domains", "salvage synthesis",
+                          {"domain": "archive", "topic": "salvage",
+                           "derived_from": ["rec-1"], "status": "current"})
+
+    memory = RecordingMemory()
+    ingest_records(
+        memory,
+        [_record_with_tax("rec-2", "unrelated salvage fact", domain="archive", topic="salvage")],
+        user_id="u",
+        page_registry=registry,
+    )
+    assert registry.get("salvage-domains").status == "current"
+
+
 def test_bulk_ingest_unrelated_taxonomy_leaves_page_current(tmp_path):
     registry = _page_registry(tmp_path)
     registry.put_revision("deities", "deities synthesis",

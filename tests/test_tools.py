@@ -154,6 +154,33 @@ def test_delete_image_succeeds(proxy):
     assert fetch_result["structuredContent"]["error"] == "not_found"
 
 
+def test_generic_delete_refuses_image_memory(proxy):
+    """Generic delete on an image memory would strand its blob forever (the
+    owner would be a dead memory id); it must redirect to delete_image."""
+    add_result = run(proxy.handle_add_image_tool({
+        "caption": "Guarded image",
+        "image_base64": _PNG_B64,
+    }))
+    assert not add_result["isError"]
+    sc = add_result["structuredContent"]
+    del_result = run(proxy.handle_delete_tool({"id": sc["memory_id"]}, allow_user_id=True))
+    assert del_result["isError"]
+    assert del_result["structuredContent"]["error"] == "image_record"
+    # The blob must still be fetchable — nothing was deleted.
+    fetch_result = run(proxy.handle_fetch_image_tool({"id": sc["blob_id"]}))
+    assert not fetch_result["isError"]
+
+
+def test_generic_delete_allows_orphan_image_memory(proxy):
+    """An image-kind memory with no owned blob (crash-inconsistent record) must
+    stay deletable through the generic path — delete_image would reject it."""
+    result = run(proxy.handle_add_memory_tool({"text": "orphan caption", "kind": "image"}))
+    memory_id = result["structuredContent"]["ids"][0]
+    del_result = run(proxy.handle_delete_tool({"id": memory_id}, allow_user_id=True))
+    assert not del_result["isError"], del_result
+    assert del_result["structuredContent"]["deleted"] is True
+
+
 # --------------------------------------------------------------------------- #
 # 4. Update cannot forge image metadata
 # --------------------------------------------------------------------------- #
@@ -395,6 +422,10 @@ def test_fetch_image_large_blob_omits_image_base64(proxy, monkeypatch):
     assert "image_base64" not in sc, "image_base64 must not appear for large blobs"
     # URL must still be present.
     assert "url" in sc
+    # The cap must gate the MCP image content block too, not just structuredContent.
+    assert all(item.get("type") != "image" for item in fetch_result["content"]), (
+        "content[] must not carry inline image bytes for large blobs"
+    )
 
 
 # ---------------------------------------------------------------------------

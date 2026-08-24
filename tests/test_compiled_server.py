@@ -588,6 +588,42 @@ def test_live_add_flags_matching_page_stale(proxy):
     assert proxy.pages.get("deities-overview").status == "stale"
 
 
+def test_compile_page_bare_string_derived_from_is_wrapped(proxy):
+    """A bare-string derived_from must become a one-element list, not explode
+    into per-character ids (schemas are advisory)."""
+    result = run(proxy.handle_compile_page_tool({
+        "markdown": "Body.", "slug": "prov-guard", "derived_from": "abc-123-uuid",
+    }))
+    assert not result.get("isError"), result
+    assert proxy.pages.get("prov-guard").derived_from == ["abc-123-uuid"]
+    # Non-sequence values are rejected outright.
+    bad = run(proxy.handle_compile_page_tool({
+        "markdown": "Body.", "slug": "prov-guard-2", "derived_from": 42,
+    }))
+    assert bad.get("isError")
+    assert bad["structuredContent"]["error"] == "invalid_argument"
+
+
+def test_live_add_leaves_provenanced_sibling_current(proxy):
+    """#69: a page that declares derived_from must NOT be flagged stale by a
+    same-domain+topic add that its synthesis does not derive from."""
+    r1 = run(proxy.handle_add_memory_tool(
+        {"text": "first fact", "domain": "archive", "topic": "salvage"}))
+    m1 = (r1["structuredContent"]["ids"] or ["m-first"])[0]
+    run(proxy.handle_compile_page_tool({
+        "markdown": "Salvaged domains.",
+        "slug": "salvage-domains",
+        "domain": "archive",
+        "topic": "salvage",
+        "derived_from": [m1],
+    }))
+    assert proxy.pages.get("salvage-domains").status == "current"
+    # A second, unrelated memory in the same domain/topic must not demote it.
+    run(proxy.handle_add_memory_tool(
+        {"text": "second fact", "domain": "archive", "topic": "salvage"}))
+    assert proxy.pages.get("salvage-domains").status == "current"
+
+
 def test_live_add_different_taxonomy_leaves_page_current(proxy):
     run(proxy.handle_compile_page_tool({
         "markdown": "Deities of the pagan domain.",

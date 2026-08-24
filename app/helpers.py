@@ -191,7 +191,11 @@ def coerce_threshold(value: Any) -> float | None:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
-    return parsed if math.isfinite(parsed) else None  # reject NaN / Inf
+    if not math.isfinite(parsed):
+        return None  # reject NaN / Inf
+    # Clamp into mem0's valid [0, 1] range: an out-of-range value would make
+    # mem0 raise, which the search wrapper swallows into "0 results".
+    return min(max(parsed, 0.0), 1.0)
 
 
 def trim_text(text: str, limit: int) -> str:

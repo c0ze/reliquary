@@ -91,6 +91,10 @@ def test_coerce_threshold():
     assert coerce_threshold("") is None
     assert coerce_threshold(None) is None
     assert coerce_threshold("nope") is None
+    # Out-of-range values clamp into mem0's valid [0, 1] range: passing them
+    # through would make mem0 raise, which search swallows into "0 results".
+    assert coerce_threshold(1.5) == 1.0
+    assert coerce_threshold(-0.5) == 0.0
 
 
 def test_coerce_threshold_rejects_non_finite():

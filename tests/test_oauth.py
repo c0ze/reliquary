@@ -497,3 +497,16 @@ if __name__ == "__main__":
                 failures += 1
                 print(f"FAIL {name}: {exc}")
     sys.exit(1 if failures else 0)
+
+
+def test_authorize_rejects_plain_pkce(proxy):
+    """Only S256 is advertised in the metadata; accepting PLAIN would let a
+    tampered authorize request downgrade PKCE to a cleartext challenge."""
+    error = proxy._validate_authorize_params({
+        "response_type": "code",
+        "client_id": "client-1",
+        "redirect_uri": "https://claude.ai/cb",
+        "code_challenge": "x" * 43,
+        "code_challenge_method": "PLAIN",
+    })
+    assert error is not None and "code_challenge_method" in error

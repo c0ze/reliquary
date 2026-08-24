@@ -64,7 +64,7 @@ from retrieval_quality import apply_retrieval_quality, retrieval_candidate_limit
 LOG = logging.getLogger("reliquary")
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_SERVER_NAME = "reliquary"
-MCP_SERVER_VERSION = "0.5.0"
+MCP_SERVER_VERSION = "0.5.1"
 MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
@@ -675,16 +675,43 @@ class Mem0ChatProxy:
                 await self.handle_debug_search(scope, receive, send)
                 return
 
-            if method == "POST" and path == "/v1/chat/completions":
-                await self.handle_chat_completions(scope, receive, send)
-                return
-
-            if path == "/v1/embeddings":
-                await self.handle_passthrough(scope, receive, send, base_url=self.settings.embedder_base_url)
-                return
-
             if path.startswith("/v1/"):
-                await self.handle_passthrough(scope, receive, send, base_url=self.settings.upstream_base_url)
+                # Defense-in-depth: /v1/chat/completions injects the owner's
+                # memories (and can write them back) and /v1/* relays to
+                # upstreams. INGRESS.md blocks these at the proxy, but a single
+                # ingress slip must not expose them. The Reliquary bearer may
+                # ride in Authorization (consumed here, never forwarded) or in
+                # x-reliquary-token — leaving Authorization free to carry the
+                # upstream's own API key, which is forwarded untouched.
+                headers = decode_headers(scope)
+                profile = self.endpoint_profiles.get(self.settings.claude_mcp_path)
+                v1_scope = None
+                consumed_header = None
+                if profile is not None:
+                    v1_scope = self.resolve_scope(profile, headers)
+                    if v1_scope is not None:
+                        consumed_header = "authorization"
+                    elif headers.get("x-reliquary-token", "").strip():
+                        alt = dict(headers)
+                        alt["authorization"] = f"Bearer {headers['x-reliquary-token'].strip()}"
+                        v1_scope = self.resolve_scope(profile, alt)
+                        consumed_header = "x-reliquary-token"
+                if v1_scope != "write":
+                    # Chat completions can write memories via writeback and the
+                    # passthrough relays arbitrary methods: write scope required.
+                    await self._send_unauthorized(send)
+                    return
+                # x-reliquary-token is always ours — never forward it, even when
+                # Authorization was the credential that authenticated.
+                scope = self._scope_without_header(scope, "x-reliquary-token")
+                if consumed_header == "authorization":
+                    scope = self._scope_without_header(scope, "authorization")
+                if method == "POST" and path == "/v1/chat/completions":
+                    await self.handle_chat_completions(scope, receive, send)
+                elif path == "/v1/embeddings":
+                    await self.handle_passthrough(scope, receive, send, base_url=self.settings.embedder_base_url)
+                else:
+                    await self.handle_passthrough(scope, receive, send, base_url=self.settings.upstream_base_url)
                 return
 
             await self.send_json(send, 404, {"error": f"Unknown path: {path}"})
@@ -1019,12 +1046,18 @@ class Mem0ChatProxy:
                 self.metrics.record_tool(tool_name, ok=not result.get("isError"))
                 if category == "write" and not result.get("isError"):
                     structured = result.get("structuredContent") or {}
-                    self.audit.record(
-                        action=tool_name,
-                        endpoint=profile.name,
-                        user_id=tool_arguments.get("user_id") or self.settings.user_id,
-                        ids={k: structured.get(k) for k in ("ids", "id", "memory_id", "blob_id", "deleted", "updated") if k in structured},
-                    )
+                    try:
+                        self.audit.record(
+                            action=tool_name,
+                            endpoint=profile.name,
+                            user_id=tool_arguments.get("user_id") or self.settings.user_id,
+                            ids={k: structured.get(k) for k in ("ids", "id", "memory_id", "blob_id", "deleted", "updated") if k in structured},
+                        )
+                    except Exception:
+                        # The write already committed; an unwritable audit path
+                        # must not turn it into a 500 (the client would retry
+                        # and duplicate the write).
+                        LOG.exception("Audit log write failed (non-fatal)")
             await self.send_json(
                 send,
                 200,
@@ -1987,6 +2020,16 @@ class Mem0ChatProxy:
             offset = max(0, int(arguments.get("cursor") or 0))
         except (TypeError, ValueError):
             offset = 0
+        # Reject (not clamp) offsets past the cap: result_cap below feeds search
+        # top_k and the O(n²) dedup pass, so an unbounded cursor is a resource-
+        # exhaustion vector — and silently clamping would return the same page
+        # with the same nextCursor forever. 400 = 20 pages at the max limit.
+        if offset > 400:
+            return self.mcp_tool_result(
+                text="Cursor is past the pagination cap (400); restart the search or narrow it with filters.",
+                structured={"error": "invalid_cursor", "max_cursor": 400},
+                is_error=True,
+            )
         threshold = (
             coerce_threshold(arguments.get("threshold", self.settings.memory_threshold))
             if allow_threshold
@@ -2210,9 +2253,11 @@ class Mem0ChatProxy:
         )
 
     def _fan_out_staleness(self, source_ids: list[str], metadata: dict[str, Any]) -> None:
-        """Flag current synthesis pages deriving from the same sources/topics as a
-        freshly-added raw memory. Bookkeeping only (queue, never rewrite); wrapped
-        so it can never break the write."""
+        """Flag current synthesis pages deriving from a freshly-added raw memory
+        (pages with no declared provenance fall back to a domain+topic match).
+        Flips the status flag only — never rewrites page content or mints a
+        revision; the page surfaces in needs-review for a human-driven recompile.
+        Wrapped so it can never break the write."""
         if self.pages is None:
             return
         try:
@@ -2273,6 +2318,15 @@ class Mem0ChatProxy:
                 except Exception:
                     LOG.exception("Compiled re-index failed for slug=%s; adding fresh", info.slug)
             result = await asyncio.to_thread(self.compiled_memory.add, text, user_id=user_id, metadata=metadata, infer=False)
+            if info.memory_id:
+                # The failed update left the old vector behind; best-effort drop
+                # it so stale synthesis text can't outrank (and outlive) the
+                # fresh index — delete_page only removes the latest memory_id.
+                try:
+                    await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
+                except Exception:
+                    LOG.warning("Could not remove superseded compiled vector %s for slug=%s",
+                                info.memory_id, info.slug)
         ids = added_memory_ids(result)
         return ids[0] if ids else None
 
@@ -2295,8 +2349,23 @@ class Mem0ChatProxy:
             return self.mcp_tool_result(
                 text=f"`status` must be one of: {', '.join(VALID_STATUSES)}.",
                 structured={"error": "invalid_status", "valid": list(VALID_STATUSES)}, is_error=True)
-        derived_from = [str(x).strip() for x in (arguments.get("derived_from") or []) if str(x).strip()]
-        supersedes = [str(x).strip() for x in (arguments.get("supersedes") or []) if str(x).strip()]
+        # JSON schemas are advisory: a bare string here would iterate char-by-char
+        # and silently corrupt provenance (put_revision guards this, but the list
+        # comprehension below would explode the string before the guard fires).
+        id_lists: dict[str, list[str]] = {}
+        for key in ("derived_from", "supersedes"):
+            value = arguments.get(key)
+            if value is None:
+                value = []
+            elif isinstance(value, (str, bytes)):
+                value = [value]
+            elif not isinstance(value, (list, tuple)):
+                return self.mcp_tool_result(
+                    text=f"`{key}` must be an array of memory ids.",
+                    structured={"error": "invalid_argument", "key": key}, is_error=True)
+            id_lists[key] = [str(x).strip() for x in value if str(x).strip()]
+        derived_from = id_lists["derived_from"]
+        supersedes = id_lists["supersedes"]
         frontmatter: dict[str, Any] = {"title": title or slug, "status": status,
                                        "derived_from": derived_from, "supersedes": supersedes}
         for key in ("domain", "hall", "room", "topic"):
@@ -2371,7 +2440,10 @@ class Mem0ChatProxy:
         deleted_memory = None
         if info.memory_id and self.compiled_memory is not None:
             try:
-                await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
+                # Same lock every other compiled-store op takes: embedded local
+                # Qdrant is not safe under concurrent read/write.
+                async with self.memory_lock.write():
+                    await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
                 deleted_memory = info.memory_id
             except Exception as exc:
                 LOG.warning("delete_page: aborting; could not delete indexed memory %s for %s: %s",
@@ -2465,12 +2537,14 @@ class Mem0ChatProxy:
         for upload_id in expired:
             upload = self.pending_uploads.pop(upload_id, None)
             if upload and upload.blob_id:
-                # Only reclaim a truly orphaned blob (uploaded but never committed).
-                # If a memory owns it, this slot outlived a successful commit (e.g. a
-                # crash before the slot was dropped); deleting would destroy bytes
-                # backing a committed memory.
+                # Reclaim the slot's ref only when one is actually unaccounted
+                # for: each owner holds one ref, so ref_count > len(owners) means
+                # the extra ref is this uncommitted upload's (covers bytes that
+                # deduped onto an already-owned blob). ref_count <= owners means
+                # the slot outlived a successful commit (crash before drop) and
+                # its ref now backs a committed memory — never delete those.
                 info = self.blobs.info(upload.blob_id)
-                if info is not None and not info.owners:
+                if info is not None and info.ref_count > len(info.owners):
                     self.blobs.delete(upload.blob_id)
         if expired:
             self._save_pending_uploads()
@@ -2676,7 +2750,12 @@ class Mem0ChatProxy:
         if upload.expires_at <= time.time():
             self._drop_upload(upload_id)
             if upload.blob_id:
-                self.blobs.delete(upload.blob_id)
+                # Same guard as _cleanup_expired_uploads: release the slot's ref
+                # only when one is unaccounted for (ref_count > owners); a slot
+                # that outlived a successful commit backs a committed memory.
+                blob_info = self.blobs.info(upload.blob_id)
+                if blob_info is not None and blob_info.ref_count > len(blob_info.owners):
+                    self.blobs.delete(upload.blob_id)
             return self.mcp_tool_result(
                 text=f"Upload slot {upload_id} has expired.",
                 structured={"error": "upload_expired", "upload_id": upload_id},
@@ -2960,20 +3039,24 @@ class Mem0ChatProxy:
                 is_error=True,
             )
         data, mimetype = result
-        encoded = base64.b64encode(data).decode("ascii")
         url = self._signed_blob_url(blob_id)
         size = len(data)
         structured: dict[str, Any] = {"blob_id": blob_id, "url": url, "mimetype": mimetype, "size": size}
+        image: tuple[str, str] | None = None
         if size <= INLINE_IMAGE_MAX_BYTES:
+            encoded = base64.b64encode(data).decode("ascii")
             structured["image_base64"] = encoded
+            image = (encoded, mimetype)
             note = ""
         else:
+            # The cap must gate the MCP image content block too — otherwise the
+            # "omitted" text ships next to megabytes of base64 in content[].
             note = f" Inline bytes omitted (size {size} > {INLINE_IMAGE_MAX_BYTES}); download via the signed URL."
         self.retrieval_stats.record("fetch", [{"id": blob_id}])
         return self.mcp_tool_result(
             text=f"Image {blob_id} ({mimetype}, {size} bytes). Download: {url}{note}",
             structured=structured,
-            image=(encoded, mimetype),
+            image=image,
         )
 
     async def handle_delete_image_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
@@ -3068,6 +3151,29 @@ class Mem0ChatProxy:
                             "suggested_action": f"Imported records are read-only — file a correction with {tool_prefix}propose_update (target_id=<id>)."},
                 is_error=True,
             )
+        existing_meta = existing.get("metadata") or {}
+        if existing_meta.get("kind") == "image":
+            # Deleting the caption memory here would strand its owned blob
+            # forever: the owner would be a dead memory id, and delete_image
+            # (the path that unlinks the bytes) requires a live memory. Only
+            # refuse when this memory actually owns a blob — a crash-
+            # inconsistent image record (owner never registered, or blob gone)
+            # must stay deletable through the generic path.
+            blob_ref = str(existing_meta.get("blob_ref") or "")
+            owns_blob = False
+            if blob_ref:
+                try:
+                    owns_blob = self.blobs.is_owner(blob_ref, record_id)
+                except ValueError:
+                    owns_blob = False
+            if owns_blob:
+                return self.mcp_tool_result(
+                    text=f"id={record_id} is an image memory; use {tool_prefix}delete_image "
+                    "(memory_id=...) so its stored image bytes are unlinked too.",
+                    structured={"error": "image_record", "id": record_id,
+                                "suggested_action": f"Call {tool_prefix}delete_image with memory_id={record_id}."},
+                    is_error=True,
+                )
         await self.delete_memory(record_id)
         return self.mcp_tool_result(
             text=f"Deleted memory {existing.get('title', record_id)} (id={record_id}).",
@@ -3657,6 +3763,16 @@ class Mem0ChatProxy:
         exp, sig = self.blobs.sign(blob_id, self.settings.blob_url_ttl)
         return self._absolute_url(f"/blobs/{blob_id}?exp={exp}&sig={sig}")
 
+    @staticmethod
+    def _scope_without_header(scope: dict[str, Any], name: str | None) -> dict[str, Any]:
+        """Copy an ASGI scope with one header removed (the consumed Reliquary
+        credential must never be forwarded to an upstream)."""
+        if not name:
+            return scope
+        needle = name.lower().encode("latin-1")
+        return {**scope,
+                "headers": [(k, v) for k, v in scope.get("headers", []) if k.lower() != needle]}
+
     def _require_claude_auth(self, headers: dict[str, str]) -> bool:
         """True only when the request carries the Claude endpoint's bearer (or a
         valid derived OAuth token for it). Used to gate the privileged HTTP
@@ -3993,7 +4109,9 @@ class Mem0ChatProxy:
             return f"Missing required parameters: {', '.join(missing)}"
         if params["response_type"] != "code":
             return f"Unsupported response_type: {params['response_type']}"
-        if params["code_challenge_method"].upper() not in {"S256", "PLAIN"}:
+        # S256 only, matching the advertised metadata: accepting PLAIN would let
+        # a tampered authorize request downgrade PKCE to a cleartext challenge.
+        if params["code_challenge_method"].upper() != "S256":
             return f"Unsupported code_challenge_method: {params['code_challenge_method']}"
         if not self.oauth.valid_redirect_uri(params["redirect_uri"]):
             return "redirect_uri must be https:// or http://localhost"

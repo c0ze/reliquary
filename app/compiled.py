@@ -157,6 +157,11 @@ class PageRegistry:
                 info.created_at = now
             blob_info = self.blobs.put(assemble_markdown(info, body).encode("utf-8"),
                                        mimetype="text/markdown")
+            if existing and existing.current_blob == blob_info.id:
+                # Identical re-file: put() bumped the ref for a blob this page
+                # already counts once; release the extra ref so delete() stays
+                # balanced and the blob can actually be reclaimed later.
+                self.blobs.delete(blob_info.id)
             if existing and existing.current_blob and existing.current_blob != blob_info.id:
                 info.history.append(existing.current_blob)
                 # Capture the superseded revision's timestamp + status so
@@ -253,13 +258,15 @@ class PageRegistry:
 
     def pages_deriving_from(self, *, ids=(), domain: str | None = None,
                             topic: str | None = None) -> "list[PageInfo]":
-        """Pages whose synthesis derives from any of ``ids``, or (when there is no
-        id match) whose ``domain`` AND ``topic`` both match. Pass either or both."""
+        """Pages whose synthesis derives from any of ``ids``. Pages that declare
+        no ``derived_from`` at all fall back to a ``domain`` AND ``topic`` match;
+        a page that declares its sources is judged on them alone (#69)."""
         idset = set(ids)
         out = []
         for info in self._iter_pages():
             if idset and idset.intersection(info.derived_from or ()):
                 out.append(info)
-            elif domain and topic and info.domain == domain and info.topic == topic:
+            elif not info.derived_from and domain and topic \
+                    and info.domain == domain and info.topic == topic:
                 out.append(info)
         return out
