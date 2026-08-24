@@ -218,6 +218,9 @@ def test_chat_proxy_uses_reliquary_payload_keys(tmp_path, monkeypatch):
         assert call_content.get("mem0_query") == "should be forwarded as-is"
         # And reliquary_query must have been consumed (not forwarded).
         assert "reliquary_query" not in call_content
+        # The consumed Reliquary bearer must never reach the upstream.
+        upstream_headers = proxy.client.request.call_args.kwargs["headers"]
+        assert "authorization" not in {k.lower() for k in upstream_headers}
 
     asyncio.run(scenario())
 
@@ -260,6 +263,44 @@ def test_chat_proxy_writeback_source_is_reliquary_chat_proxy(tmp_path, monkeypat
         # Writeback must have fired; inspect the source tag.
         assert len(memory.added) == 1
         assert memory.added[0]["metadata"]["source"] == "reliquary_chat_proxy"
+
+    asyncio.run(scenario())
+
+
+def test_chat_proxy_reliquary_token_header_preserves_upstream_auth(tmp_path, monkeypatch):
+    """With the Reliquary bearer in x-reliquary-token, the Authorization header
+    is the upstream's own API key and must be forwarded untouched."""
+
+    async def scenario():
+        proxy, _memory = _make_chat_proxy(tmp_path, monkeypatch)
+
+        async def fake_search(query, *, user_id, limit, threshold, filters):
+            return []
+
+        monkeypatch.setattr(proxy, "search_memories", fake_search)
+        upstream_body = {
+            "choices": [{"message": {"role": "assistant", "content": "OK."}, "finish_reason": "stop"}],
+            "model": "gpt-mock",
+        }
+        proxy.client.request = AsyncMock(return_value=_fake_upstream_response(upstream_body))
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy),
+            base_url="http://testserver",
+        ) as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                content=json.dumps({"model": "m", "messages": [
+                    {"role": "user", "content": "hi"}]}).encode(),
+                headers={"content-type": "application/json",
+                         "authorization": "Bearer upstream-api-key",
+                         "x-reliquary-token": "claude-secret"},
+            )
+
+        assert resp.status_code == 200
+        upstream_headers = {k.lower(): v for k, v in proxy.client.request.call_args.kwargs["headers"].items()}
+        assert upstream_headers.get("authorization") == "Bearer upstream-api-key"
+        assert "x-reliquary-token" not in upstream_headers
 
     asyncio.run(scenario())
 

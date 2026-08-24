@@ -171,6 +171,16 @@ def test_generic_delete_refuses_image_memory(proxy):
     assert not fetch_result["isError"]
 
 
+def test_generic_delete_allows_orphan_image_memory(proxy):
+    """An image-kind memory with no owned blob (crash-inconsistent record) must
+    stay deletable through the generic path — delete_image would reject it."""
+    result = run(proxy.handle_add_memory_tool({"text": "orphan caption", "kind": "image"}))
+    memory_id = result["structuredContent"]["ids"][0]
+    del_result = run(proxy.handle_delete_tool({"id": memory_id}, allow_user_id=True))
+    assert not del_result["isError"], del_result
+    assert del_result["structuredContent"]["deleted"] is True
+
+
 # --------------------------------------------------------------------------- #
 # 4. Update cannot forge image metadata
 # --------------------------------------------------------------------------- #

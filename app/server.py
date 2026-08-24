@@ -677,12 +677,31 @@ class Mem0ChatProxy:
 
             if path.startswith("/v1/"):
                 # Defense-in-depth: /v1/chat/completions injects the owner's
-                # memories and /v1/* relays to upstreams. INGRESS.md blocks these
-                # at the proxy, but a single ingress slip must not expose them —
-                # require the same bearer as the MCP endpoint.
-                if not self._require_claude_auth(decode_headers(scope)):
+                # memories (and can write them back) and /v1/* relays to
+                # upstreams. INGRESS.md blocks these at the proxy, but a single
+                # ingress slip must not expose them. The Reliquary bearer may
+                # ride in Authorization (consumed here, never forwarded) or in
+                # x-reliquary-token — leaving Authorization free to carry the
+                # upstream's own API key, which is forwarded untouched.
+                headers = decode_headers(scope)
+                profile = self.endpoint_profiles.get(self.settings.claude_mcp_path)
+                v1_scope = None
+                consumed_header = None
+                if profile is not None:
+                    v1_scope = self.resolve_scope(profile, headers)
+                    if v1_scope is not None:
+                        consumed_header = "authorization"
+                    elif headers.get("x-reliquary-token", "").strip():
+                        alt = dict(headers)
+                        alt["authorization"] = f"Bearer {headers['x-reliquary-token'].strip()}"
+                        v1_scope = self.resolve_scope(profile, alt)
+                        consumed_header = "x-reliquary-token"
+                if v1_scope != "write":
+                    # Chat completions can write memories via writeback and the
+                    # passthrough relays arbitrary methods: write scope required.
                     await self._send_unauthorized(send)
                     return
+                scope = self._scope_without_header(scope, consumed_header)
                 if method == "POST" and path == "/v1/chat/completions":
                     await self.handle_chat_completions(scope, receive, send)
                 elif path == "/v1/embeddings":
@@ -1994,12 +2013,19 @@ class Mem0ChatProxy:
             arguments.get("limit"), default=self.settings.memory_limit, minimum=1, maximum=20
         )
         try:
-            # Cap the offset: result_cap below feeds search top_k and the O(n²)
-            # dedup pass, so an unbounded cursor is a resource-exhaustion vector.
-            # 400 = 20 pages at the max limit — far beyond any real pagination.
-            offset = max(0, min(int(arguments.get("cursor") or 0), 400))
+            offset = max(0, int(arguments.get("cursor") or 0))
         except (TypeError, ValueError):
             offset = 0
+        # Reject (not clamp) offsets past the cap: result_cap below feeds search
+        # top_k and the O(n²) dedup pass, so an unbounded cursor is a resource-
+        # exhaustion vector — and silently clamping would return the same page
+        # with the same nextCursor forever. 400 = 20 pages at the max limit.
+        if offset > 400:
+            return self.mcp_tool_result(
+                text="Cursor is past the pagination cap (400); restart the search or narrow it with filters.",
+                structured={"error": "invalid_cursor", "max_cursor": 400},
+                is_error=True,
+            )
         threshold = (
             coerce_threshold(arguments.get("threshold", self.settings.memory_threshold))
             if allow_threshold
@@ -2507,12 +2533,14 @@ class Mem0ChatProxy:
         for upload_id in expired:
             upload = self.pending_uploads.pop(upload_id, None)
             if upload and upload.blob_id:
-                # Only reclaim a truly orphaned blob (uploaded but never committed).
-                # If a memory owns it, this slot outlived a successful commit (e.g. a
-                # crash before the slot was dropped); deleting would destroy bytes
-                # backing a committed memory.
+                # Reclaim the slot's ref only when one is actually unaccounted
+                # for: each owner holds one ref, so ref_count > len(owners) means
+                # the extra ref is this uncommitted upload's (covers bytes that
+                # deduped onto an already-owned blob). ref_count <= owners means
+                # the slot outlived a successful commit (crash before drop) and
+                # its ref now backs a committed memory — never delete those.
                 info = self.blobs.info(upload.blob_id)
-                if info is not None and not info.owners:
+                if info is not None and info.ref_count > len(info.owners):
                     self.blobs.delete(upload.blob_id)
         if expired:
             self._save_pending_uploads()
@@ -2718,11 +2746,11 @@ class Mem0ChatProxy:
         if upload.expires_at <= time.time():
             self._drop_upload(upload_id)
             if upload.blob_id:
-                # Same guard as _cleanup_expired_uploads: a slot can outlive a
-                # successful commit (crash before drop); never delete bytes a
-                # committed memory owns.
+                # Same guard as _cleanup_expired_uploads: release the slot's ref
+                # only when one is unaccounted for (ref_count > owners); a slot
+                # that outlived a successful commit backs a committed memory.
                 blob_info = self.blobs.info(upload.blob_id)
-                if blob_info is not None and not blob_info.owners:
+                if blob_info is not None and blob_info.ref_count > len(blob_info.owners):
                     self.blobs.delete(upload.blob_id)
             return self.mcp_tool_result(
                 text=f"Upload slot {upload_id} has expired.",
@@ -3119,17 +3147,29 @@ class Mem0ChatProxy:
                             "suggested_action": f"Imported records are read-only — file a correction with {tool_prefix}propose_update (target_id=<id>)."},
                 is_error=True,
             )
-        if (existing.get("metadata") or {}).get("kind") == "image":
-            # Deleting the caption memory here would strand its blob forever:
-            # the blob's owner would be a dead memory id, and delete_image
-            # (the path that unlinks the bytes) requires a live memory.
-            return self.mcp_tool_result(
-                text=f"id={record_id} is an image memory; use {tool_prefix}delete_image "
-                "(memory_id=...) so its stored image bytes are unlinked too.",
-                structured={"error": "image_record", "id": record_id,
-                            "suggested_action": f"Call {tool_prefix}delete_image with memory_id={record_id}."},
-                is_error=True,
-            )
+        existing_meta = existing.get("metadata") or {}
+        if existing_meta.get("kind") == "image":
+            # Deleting the caption memory here would strand its owned blob
+            # forever: the owner would be a dead memory id, and delete_image
+            # (the path that unlinks the bytes) requires a live memory. Only
+            # refuse when this memory actually owns a blob — a crash-
+            # inconsistent image record (owner never registered, or blob gone)
+            # must stay deletable through the generic path.
+            blob_ref = str(existing_meta.get("blob_ref") or "")
+            owns_blob = False
+            if blob_ref:
+                try:
+                    owns_blob = self.blobs.is_owner(blob_ref, record_id)
+                except ValueError:
+                    owns_blob = False
+            if owns_blob:
+                return self.mcp_tool_result(
+                    text=f"id={record_id} is an image memory; use {tool_prefix}delete_image "
+                    "(memory_id=...) so its stored image bytes are unlinked too.",
+                    structured={"error": "image_record", "id": record_id,
+                                "suggested_action": f"Call {tool_prefix}delete_image with memory_id={record_id}."},
+                    is_error=True,
+                )
         await self.delete_memory(record_id)
         return self.mcp_tool_result(
             text=f"Deleted memory {existing.get('title', record_id)} (id={record_id}).",
@@ -3718,6 +3758,16 @@ class Mem0ChatProxy:
     def _signed_blob_url(self, blob_id: str) -> str:
         exp, sig = self.blobs.sign(blob_id, self.settings.blob_url_ttl)
         return self._absolute_url(f"/blobs/{blob_id}?exp={exp}&sig={sig}")
+
+    @staticmethod
+    def _scope_without_header(scope: dict[str, Any], name: str | None) -> dict[str, Any]:
+        """Copy an ASGI scope with one header removed (the consumed Reliquary
+        credential must never be forwarded to an upstream)."""
+        if not name:
+            return scope
+        needle = name.lower().encode("latin-1")
+        return {**scope,
+                "headers": [(k, v) for k, v in scope.get("headers", []) if k.lower() != needle]}
 
     def _require_claude_auth(self, headers: dict[str, str]) -> bool:
         """True only when the request carries the Claude endpoint's bearer (or a
