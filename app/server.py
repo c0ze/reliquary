@@ -31,7 +31,7 @@ from ratelimit import RateLimiter
 from metrics import Metrics
 from audit import AuditLog
 from retrieval_stats import RetrievalStatsLog, aggregate
-from urlfetch import validate_public_url
+from urlfetch import resolve_public_url
 from helpers import (
     OPENAI_SNIPPET_CHAR_CAP,
     SEARCH_PREVIEW_CHAR_CAP,
@@ -81,9 +81,10 @@ EXACT_FIELD_BONUS = 0.5  # query == topic/room slug, or query is a substring of 
 # is the exact-recall case the live lexical fallback was built for (#28); used to
 # gate that fallback so healthy searches avoid the broad get_all scroll (#30).
 _EXACT_ID_RE = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+){2,}")
-# Minimum vector score for a current synthesis page to lead search results.
-# 0.0 = lead whenever a current synthesis matches at all (simple MVP; tunable).
+# Minimum vector score for a current synthesis candidate. Final ranking gives
+# syntheses a small preference while keeping stronger raw matches ahead.
 COMPILED_LEAD_MIN_SCORE = 0.0
+COMPILED_RANK_BONUS = 0.05
 # Max blob size (bytes) to include image_base64 inline in fetch_image structuredContent.
 # Above this cap, the field is omitted and the text notes the signed URL instead.
 INLINE_IMAGE_MAX_BYTES = 1_000_000
@@ -373,10 +374,16 @@ class Mem0ChatProxy:
             self.memory = Memory.from_config(self.config)
         timeout = httpx.Timeout(connect=10.0, read=settings.request_timeout, write=30.0, pool=30.0)
         self.client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        # URL ingest uses pinned IPs. Disable proxy env and connection reuse so
+        # two virtual hosts sharing an IP never reuse the wrong TLS session.
+        self.image_client = httpx.AsyncClient(
+            timeout=20.0, trust_env=False, limits=httpx.Limits(max_keepalive_connections=0))
         # Readers-writer lock. Reads run concurrently only when the backing store
         # is safe for it (server-backed Qdrant); embedded/local Qdrant is not
         # read-thread-safe, so reads fall back to exclusive (mutex) behavior.
         self.memory_lock = AsyncRWLock()
+        # A page write spans both the filesystem registry and the vector index.
+        self.page_write_lock = asyncio.Lock()
         override = settings.memory_concurrent_reads
         self._concurrent_reads = override if override is not None else reads_can_be_concurrent(
             self.config.get("vector_store")
@@ -483,6 +490,9 @@ class Mem0ChatProxy:
             max_bytes=settings.blob_max_bytes,
         )
         self.pending_uploads: dict[str, PendingUpload] = {}
+        # Single event loop: claim a slot before any await. Cleanup must not
+        # reclaim bytes while a POST or caption commit is in flight.
+        self._busy_uploads: set[str] = set()
         self.pending_upload_store = (
             JsonFileStore(os.path.join(settings.state_dir, "pending_uploads.json"))
             if settings.state_dir
@@ -743,6 +753,7 @@ class Mem0ChatProxy:
                 await send({"type": "lifespan.startup.complete"})
             elif message_type == "lifespan.shutdown":
                 await self.client.aclose()
+                await self.image_client.aclose()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
@@ -2115,6 +2126,15 @@ class Mem0ChatProxy:
         # dedupe is a safety guard, not a real overlap risk.
         synthesis_ids = {str(s.get("id")) for s in synthesis_results}
         combined = synthesis_results + [r for r in raw_results if str(r.get("id")) not in synthesis_ids]
+        # A synthesis wins close relevance comparisons, not every comparison.
+        # Unconditional concatenation buried exact raw matches beneath unrelated
+        # pages, even when their vector scores were much lower.
+        combined.sort(key=lambda item: (
+            -(self._numeric_score(item.get("score")) + self._context_bonus(item, context)
+              + self._exact_match_bonus(item, query)
+              + (COMPILED_RANK_BONUS if item.get("route") == "synthesis" else 0.0)),
+            str(item.get("id") or ""),
+        ))
         next_cursor = str(offset + limit) if len(combined) > offset + limit else None
         results = combined[offset:offset + limit]
         filter_header = (f" [filters: {', '.join(f'{k}={v}' for k, v in explicit.items())}]" if explicit else "")
@@ -2253,7 +2273,7 @@ class Mem0ChatProxy:
         )
 
     def _fan_out_staleness(self, source_ids: list[str], metadata: dict[str, Any]) -> None:
-        """Flag current synthesis pages deriving from a freshly-added raw memory
+        """Flag current synthesis pages deriving from a changed raw memory
         (pages with no declared provenance fall back to a domain+topic match).
         Flips the status flag only — never rewrites page content or mints a
         revision; the page surfaces in needs-review for a human-driven recompile.
@@ -2331,6 +2351,10 @@ class Mem0ChatProxy:
         return ids[0] if ids else None
 
     async def handle_compile_page_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
+        async with self.page_write_lock:
+            return await self._compile_page(arguments, allow_user_id=allow_user_id)
+
+    async def _compile_page(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
         if self.pages is None or self.compiled_memory is None:
             return self.mcp_tool_result(text="The compiled layer is not configured.",
                                         structured={"error": "compiled_disabled"}, is_error=True)
@@ -2423,6 +2447,10 @@ class Mem0ChatProxy:
                         "history": detailed})
 
     async def handle_delete_page_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        async with self.page_write_lock:
+            return await self._delete_page(arguments)
+
+    async def _delete_page(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.pages is None:
             return self.mcp_tool_result(text="The compiled layer is not configured.",
                                         structured={"error": "compiled_disabled"}, is_error=True)
@@ -2532,7 +2560,7 @@ class Mem0ChatProxy:
         expired = [
             upload_id
             for upload_id, upload in self.pending_uploads.items()
-            if upload.expires_at <= now
+            if upload.expires_at <= now and upload_id not in self._busy_uploads
         ]
         for upload_id in expired:
             upload = self.pending_uploads.pop(upload_id, None)
@@ -2633,7 +2661,7 @@ class Mem0ChatProxy:
         while True:
             message = await receive()
             if message["type"] == "http.disconnect":
-                break
+                return b""  # Never accept a truncated request as a complete upload.
             if message["type"] != "http.request":
                 continue
             chunk = message.get("body", b"")
@@ -2662,13 +2690,25 @@ class Mem0ChatProxy:
         if profile is None or not profile.allow_write or self.resolve_scope(profile, headers) != "write":
             await self._send_unauthorized(send)
             return
+        if upload_id in self._busy_uploads:
+            await self.send_json(send, 409, {"error": "upload_in_progress", "upload_id": upload_id})
+            return
         if upload.expires_at <= time.time():
-            self._drop_upload(upload_id)
+            self._cleanup_expired_uploads()
             await self.send_json(send, 410, {"error": "upload_expired", "upload_id": upload_id})
             return
         if upload.blob_id:
             await self.send_json(send, 409, {"error": "upload_already_used", "upload_id": upload_id})
             return
+
+        self._busy_uploads.add(upload_id)
+        try:
+            await self._receive_upload(upload, headers, receive, send)
+        finally:
+            self._busy_uploads.discard(upload_id)
+
+    async def _receive_upload(self, upload: PendingUpload, headers, receive, send) -> None:
+        upload_id = upload.id
 
         max_bytes = self.settings.blob_max_bytes
         if max_bytes:
@@ -2687,6 +2727,14 @@ class Mem0ChatProxy:
             return
         if not data:
             await self.send_json(send, 400, {"error": "empty_upload", "upload_id": upload_id})
+            return
+        if upload.expires_at <= time.time():
+            self._drop_upload(upload_id)
+            await self.send_json(send, 410, {"error": "upload_expired", "upload_id": upload_id})
+            return
+        if upload.expected_size is not None and len(data) != upload.expected_size:
+            await self.send_json(send, 400, {"error": "size_mismatch", "expected_size": upload.expected_size,
+                                           "size": len(data), "upload_id": upload_id})
             return
         content_type = headers.get("content-type") or upload.expected_mimetype
         try:
@@ -2747,6 +2795,10 @@ class Mem0ChatProxy:
                 structured={"error": "forbidden_endpoint", "upload_id": upload_id},
                 is_error=True,
             )
+        if upload_id in self._busy_uploads:
+            return self.mcp_tool_result(
+                text="This upload is already being processed; retry shortly.",
+                structured={"error": "upload_in_progress", "upload_id": upload_id}, is_error=True)
         if upload.expires_at <= time.time():
             self._drop_upload(upload_id)
             if upload.blob_id:
@@ -2791,6 +2843,14 @@ class Mem0ChatProxy:
             if value is not None and str(value).strip():
                 metadata[key] = str(value).strip()
 
+        self._busy_uploads.add(upload_id)
+        try:
+            return await self._commit_upload(upload, caption, user_id, metadata)
+        finally:
+            self._busy_uploads.discard(upload_id)
+
+    async def _commit_upload(self, upload: PendingUpload, caption: str, user_id: str, metadata: dict) -> dict[str, Any]:
+        upload_id = upload.id
         try:
             result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)
         except Exception:
@@ -2856,15 +2916,22 @@ class Mem0ChatProxy:
         max_bytes = self.settings.blob_max_bytes
         current = url
         for _ in range(4):  # initial + up to 3 redirects
-            reason = validate_public_url(current)
-            if reason is not None:
+            try:
+                original_url = httpx.URL(current)
+                address = await asyncio.to_thread(resolve_public_url, str(original_url))
+            except (ValueError, httpx.InvalidURL) as exc:
+                reason = str(exc)
                 return self.mcp_tool_result(
                     text=f"Refusing to fetch URL: {reason}.",
                     structured={"error": "unsafe_url", "reason": reason},
                     is_error=True,
                 )
             try:
-                async with self.client.stream("GET", current, follow_redirects=False, timeout=20.0) as resp:
+                async with self.image_client.stream(
+                    "GET", original_url.copy_with(host=address), follow_redirects=False,
+                    headers={"Host": original_url.netloc.decode("ascii")},
+                    extensions={"sni_hostname": original_url.raw_host.decode("ascii")},
+                ) as resp:
                     if resp.is_redirect:
                         location = resp.headers.get("location") or ""
                         if not location:
@@ -3099,6 +3166,7 @@ class Mem0ChatProxy:
                 is_error=True,
             )
         await self.delete_memory(memory_id)
+        self._fan_out_staleness([memory_id], metadata)
         unlinked = self.blobs.delete(str(blob_ref), owner=memory_id)
         return self.mcp_tool_result(
             text=f"Deleted image memory_id={memory_id} (blob_id={blob_ref}, blob_unlinked={bool(unlinked)}).",
@@ -3175,6 +3243,7 @@ class Mem0ChatProxy:
                     is_error=True,
                 )
         await self.delete_memory(record_id)
+        self._fan_out_staleness([record_id], existing_meta)
         return self.mcp_tool_result(
             text=f"Deleted memory {existing.get('title', record_id)} (id={record_id}).",
             structured={"deleted": True, "id": record_id, "title": existing.get("title")},
@@ -3244,6 +3313,9 @@ class Mem0ChatProxy:
                 metadata.pop(key, None)
         metadata["source_group"] = "user-write"
         await self.update_memory(record_id, new_text, metadata=metadata)
+        self._fan_out_staleness([record_id], existing_metadata)
+        if metadata != existing_metadata:
+            self._fan_out_staleness([record_id], metadata)
         return self.mcp_tool_result(
             text=f"Updated memory id={record_id}: {trim_text(new_text, 160)}",
             structured={"updated": True, "id": record_id, "metadata": metadata},

@@ -244,7 +244,7 @@ folder layout — see [`docs/GUIDE.md`](docs/GUIDE.md) for a full walkthrough.
 ## Development
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt pytest
 python -m pytest            # or: python tests/test_helpers.py
 python -m py_compile app/*.py
 ```

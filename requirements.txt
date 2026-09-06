@@ -8,9 +8,12 @@
 # The Docker image installs the fully-resolved transitive set from
 # requirements.lock for reproducible builds. Regenerate both after a bump:
 #
-#     pip install -r requirements.txt && pip freeze > requirements.lock
+#     uv pip compile requirements.txt --python-version 3.12 --no-annotate -o requirements.lock
+#     uv lock
 mem0ai==2.0.4
 qdrant-client==1.18.0
 httpx==0.28.1
 uvicorn==0.48.0
 PyYAML==6.0.3
+# Security floor for the transitive HTTP/2 implementation (CVE-2026-71554).
+h2==4.4.1

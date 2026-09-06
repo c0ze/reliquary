@@ -137,7 +137,8 @@ class PageRegistry:
         now = time.time()
         with _REGISTRY_LOCK:
             existing = self.get(slug)
-            info = existing or PageInfo(slug=slug, current_blob="", created_at=now)
+            # Keep the superseded revision intact while constructing its successor.
+            info = PageInfo(**asdict(existing)) if existing else PageInfo(slug=slug, current_blob="", created_at=now)
             for key in ("title", "domain", "hall", "room", "topic", "status", "kind"):
                 if frontmatter.get(key) is not None:
                     if key == "status" and frontmatter[key] not in VALID_STATUSES:
@@ -209,9 +210,12 @@ class PageRegistry:
             return None
         rows = [{"blob": info.current_blob, "ts": info.updated_at,
                  "status": info.status, "current": True}]
-        meta_by_blob = {m.get("blob"): m for m in info.revisions_meta}
-        for blob in reversed(info.history):
-            m = meta_by_blob.get(blob, {})
+        # Metadata covers the newest suffix of history for legacy registries.
+        # Match by occurrence: reverting to old bytes repeats a blob id.
+        missing = len(info.history) - len(info.revisions_meta)
+        for index in reversed(range(len(info.history))):
+            blob = info.history[index]
+            m = info.revisions_meta[index - missing] if index >= missing else {}
             rows.append({"blob": blob, "ts": m.get("ts"),
                          "status": m.get("status"), "current": False})
         return rows

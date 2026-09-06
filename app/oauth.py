@@ -56,6 +56,7 @@ class RefreshToken:
     created_at: float
     expires_at: float | None = None  # None = non-expiring
     consumed: bool = False
+    consumed_at: float | None = None
 
 
 class OAuthProvider:
@@ -270,6 +271,8 @@ class OAuthProvider:
         if self.fixed_client_id is not None:
             if not self.verify_client_id(form.get("client_id") or entry.client_id or None):
                 return None, (400, "invalid_client", "client_id does not match the configured OAuth client")
+        if form.get("client_id") != entry.client_id:
+            return None, (400, "invalid_grant", "client_id does not match authorization request")
         code_verifier = form.get("code_verifier") or ""
         if not self._verify_pkce(code_verifier, entry.code_challenge, entry.code_challenge_method):
             return None, (400, "invalid_grant", "PKCE verification failed")
@@ -390,6 +393,10 @@ class OAuthProvider:
         entry = self._refresh_tokens.get(presented)
         if entry is None or (entry.expires_at is not None and entry.expires_at < time.time()):
             return None, (400, "invalid_grant", "invalid or expired refresh token")
+        # Older clients may omit client_id on refresh, but an explicit identity
+        # must match the token's owner even when no fixed client is configured.
+        if form.get("client_id") is not None and form["client_id"] != entry.client_id:
+            return None, (400, "invalid_grant", "client_id does not match refresh token")
         if entry.consumed:
             self._revoke_family(entry.family_id)  # replay of a rotated token => theft; kill the family
             return None, (400, "invalid_grant", "refresh token reuse detected; session revoked")
@@ -399,6 +406,7 @@ class OAuthProvider:
             client_id=entry.client_id, scope=entry.scope, resource=entry.resource, family_id=entry.family_id,
         )
         entry.consumed = True
+        entry.consumed_at = time.time()
         self._persist_refresh_tokens()
         return (
             {"access_token": access_token, "token_type": "Bearer",
@@ -417,7 +425,7 @@ class OAuthProvider:
         drop = [
             t for t, e in self._refresh_tokens.items()
             if (e.expires_at is not None and e.expires_at < now)
-            or (e.consumed and e.created_at + REFRESH_REUSE_GRACE < now)
+            or (e.consumed and (e.consumed_at if e.consumed_at is not None else e.created_at) + REFRESH_REUSE_GRACE < now)
         ]
         for t in drop:
             self._refresh_tokens.pop(t, None)
@@ -481,6 +489,7 @@ class OAuthProvider:
                     created_at=float(entry["created_at"]),
                     expires_at=(float(entry["expires_at"]) if entry.get("expires_at") is not None else None),
                     consumed=bool(entry.get("consumed", False)),
+                    consumed_at=(float(entry["consumed_at"]) if entry.get("consumed_at") is not None else None),
                 )
             except (KeyError, TypeError, ValueError):
                 continue

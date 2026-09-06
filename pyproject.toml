@@ -6,11 +6,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "mem0ai>=0.1.0",
-    "qdrant-client>=1.7.0",
-    "httpx>=0.27.0",
-    "uvicorn>=0.30.0",
-    "PyYAML>=6.0",
+    "mem0ai==2.0.4",
+    "qdrant-client==1.18.0",
+    "httpx==0.28.1",
+    "uvicorn==0.48.0",
+    "PyYAML==6.0.3",
+    "h2==4.4.1",
 ]
 
 [tool.pytest.ini_options]

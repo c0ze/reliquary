@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -44,7 +45,18 @@ def _memory_results(result: Any) -> list[dict[str, Any]]:
 def existing_import_index(memory: Any, *, user_id: str) -> dict[str, dict[str, Any]]:
     if not hasattr(memory, "get_all"):
         return {}
-    result = memory.get_all(user_id=user_id)
+    params = inspect.signature(memory.get_all).parameters
+    kwargs = {"user_id": user_id} if "user_id" in params else {"filters": {"user_id": user_id}}
+    # Mem0 2.x defaults to just 20 records and rejects top-level user_id.
+    # Its public API has no cursor; grow the prefix until it contains the whole
+    # corpus, so incremental imports cannot duplicate records beyond page one.
+    limit_key = "top_k" if "top_k" in params else "limit" if "limit" in params else None
+    limit = 1000
+    while True:
+        result = memory.get_all(**kwargs, **({limit_key: limit} if limit_key else {}))
+        if limit_key is None or len(_memory_results(result)) < limit:
+            break
+        limit *= 2
     index: dict[str, dict[str, Any]] = {}
     for hit in _memory_results(result):
         metadata = hit.get("metadata") or {}
