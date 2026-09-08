@@ -11,7 +11,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import server  # noqa: E402
-from server import Mem0ChatProxy, ProxySettings  # noqa: E402
+from server import ReliquaryChatProxy, ProxySettings  # noqa: E402
 from conftest import FakeMemory  # noqa: E402
 
 
@@ -60,7 +60,7 @@ def test_writeback_turn_appends_source_note_when_configured(tmp_path, monkeypatc
     }))
     output = tmp_path / "Writeback.md"
     memory = RecordingMemory()
-    proxy = Mem0ChatProxy(
+    proxy = ReliquaryChatProxy(
         ProxySettings(
             config_path=str(cfg),
             user_id="default",
@@ -101,7 +101,7 @@ def test_writeback_turn_swallows_source_note_errors(tmp_path, monkeypatch):
         "vector_store": {"provider": "qdrant", "config": {"host": "x", "port": 6333}},
         "embedder": {"provider": "openai", "config": {"model": "text-embedding-3-small"}},
     }))
-    proxy = Mem0ChatProxy(
+    proxy = ReliquaryChatProxy(
         ProxySettings(
             config_path=str(cfg),
             user_id="default",
@@ -129,7 +129,7 @@ def test_writeback_turn_swallows_source_note_errors(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _make_chat_proxy(tmp_path, monkeypatch):
-    """Build a Mem0ChatProxy with writeback enabled and a fake upstream URL."""
+    """Build a ReliquaryChatProxy with writeback enabled and a fake upstream URL."""
     async def inline_to_thread(func, /, *args, **kwargs):
         return func(*args, **kwargs)
 
@@ -140,7 +140,7 @@ def _make_chat_proxy(tmp_path, monkeypatch):
         "embedder": {"provider": "openai", "config": {"model": "text-embedding-3-small"}},
     }))
     memory = RecordingMemory()
-    proxy = Mem0ChatProxy(
+    proxy = ReliquaryChatProxy(
         ProxySettings(
             config_path=str(cfg),
             user_id="default",

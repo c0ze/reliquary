@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import pytest  # noqa: E402
 
-from server import Mem0ChatProxy, ProxySettings  # noqa: E402
+from server import ReliquaryChatProxy, ProxySettings  # noqa: E402
 
 
 class FakeMemory:
@@ -95,7 +95,7 @@ def proxy(tmp_path, fake_memory, monkeypatch):
         blob_signing_key="test-signing-key",
         compiled_dir=str(tmp_path / "compiled"),
     )
-    return Mem0ChatProxy(settings, memory=fake_memory, compiled_memory=FakeMemory())
+    return ReliquaryChatProxy(settings, memory=fake_memory, compiled_memory=FakeMemory())
 
 
 @pytest.fixture
@@ -125,7 +125,7 @@ def make_proxy(tmp_path, monkeypatch):
         )
         compiled_memory = overrides.pop("compiled_memory", None) or FakeMemory()
         opts.update(overrides)
-        return Mem0ChatProxy(ProxySettings(**opts), memory=memory or FakeMemory(),
+        return ReliquaryChatProxy(ProxySettings(**opts), memory=memory or FakeMemory(),
                              compiled_memory=compiled_memory)
 
     return _make

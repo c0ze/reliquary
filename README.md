@@ -103,7 +103,18 @@ resource URIs (old scheme → `reliquary://`), and env vars (old prefix → `REL
 2. Reconnect the Claude.ai connector once so it re-reads the updated tool list.
 3. No data migration — your vectors and compiled pages are untouched.
 
-The Mem0 library brand (prose, links, `config.yaml` library keys) is unchanged; only Reliquary's own artifacts were renamed.
+A follow-up pass finished the job on the parts v0.3.0 left behind: the MCP **tool
+descriptions** agents actually read ("the local Mem0 store" → "the local Reliquary store"),
+the `--writeback` / `--user-id` / `--mcp-only` CLI help, the status response text, and the
+`Mem0ChatProxy` class (now `ReliquaryChatProxy`). Descriptions and help text only — no tool
+names, endpoints, env vars or behaviour changed.
+
+What deliberately still says Mem0 is the **upstream library**, because that is what it is:
+the [mem0ai/mem0](https://github.com/mem0ai/mem0) dependency, its `~/.mem0/config.yaml`
+config format, its `user_id` filter semantics, its server-side BM25 hybrid search, and the
+internal comments explaining how Reliquary drives it. The `LEGACY_ENV_RENAMES` table also
+keeps the old `MEM0_*` names on purpose — it is what warns you that a stale var is being
+ignored, so removing it would make the rename *less* enforced, not more.
 
 ## MCP endpoints & tools
 

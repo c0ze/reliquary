@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import pytest  # noqa: E402
 
-from server import Mem0ChatProxy, ProxySettings  # noqa: E402
+from server import ReliquaryChatProxy, ProxySettings  # noqa: E402
 from conftest import FakeMemory  # noqa: E402
 
 
@@ -43,7 +43,7 @@ def _proxy_with_static_tokens(tmp_path, fake_memory, static_tokens):
         static_tokens=static_tokens,
         compiled_dir=str(tmp_path / "compiled"),
     )
-    return Mem0ChatProxy(settings, memory=fake_memory, compiled_memory=FakeMemory())
+    return ReliquaryChatProxy(settings, memory=fake_memory, compiled_memory=FakeMemory())
 
 
 # ---------------------------------------------------------------------------

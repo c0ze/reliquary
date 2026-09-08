@@ -363,7 +363,7 @@ class PendingUpload:
     profile: str | None = None
 
 
-class Mem0ChatProxy:
+class ReliquaryChatProxy:
     def __init__(self, settings: ProxySettings, *, memory: Any = None, compiled_memory: Any = None) -> None:
         self.settings = settings
         self.config = load_config(settings.config_path)
@@ -787,7 +787,7 @@ class Mem0ChatProxy:
                 "catalog_domains": self.catalog.routeable_domains if self.catalog else [],
                 "vector_store_path": ((self.config.get("vector_store") or {}).get("config") or {}).get("path"),
                 "approx_memory_count": await self.get_memory_count(),
-                "note": "Embedded local Qdrant allows only one Mem0 process at a time.",
+                "note": "Embedded local Qdrant allows only one Reliquary process at a time.",
             },
         )
 
@@ -1394,7 +1394,7 @@ class Mem0ChatProxy:
                 {
                     "name": "search",
                     "title": "Search Memory Corpus",
-                    "description": "Search the routed Mem0 corpus for relevant memories. Returns short "
+                    "description": "Search the routed Reliquary corpus for relevant memories. Returns short "
                     "snippets with an id, title and url; call `fetch` with an id for the full document."
                     + routing_hint,
                     "annotations": read_only,
@@ -1570,14 +1570,14 @@ class Mem0ChatProxy:
             {
                 "name": "reliquary_status",
                 "title": "Reliquary Status",
-                "description": "Inspect the local Mem0 store, endpoints, and approximate memory count.",
+                "description": "Inspect the local Reliquary store, endpoints, and approximate memory count.",
                 "annotations": read_only,
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             },
             {
                 "name": "reliquary_search",
                 "title": "Reliquary Search",
-                "description": "Search the Mem0 store with optional domain/hall/room-aware routing." + routing_hint,
+                "description": "Search the Reliquary store with optional domain/hall/room-aware routing." + routing_hint,
                 "annotations": read_only,
                 "inputSchema": {
                     "type": "object",
@@ -1591,7 +1591,7 @@ class Mem0ChatProxy:
                         "threshold": {"type": "number", "description": "Optional minimum similarity threshold."},
                         "max_chars": {"type": "integer", "minimum": 100, "maximum": SEARCH_PREVIEW_CHAR_CAP_MAX,
                                       "description": f"Per-hit body preview cap (default {SEARCH_PREVIEW_CHAR_CAP}). Lower it for compact results; full text via fetch."},
-                        "user_id": {"type": "string", "description": "Optional Mem0 user_id override."},
+                        "user_id": {"type": "string", "description": "Optional Reliquary user_id override."},
                         "context": {"type": "object", "description": "Optional caller context (client, cwd, git_root, repo) for project-aware routing."},
                         "domain": {"type": "string", "description": "Hard metadata filter: restrict results to this domain (e.g. 'dev', 'life'). Bypasses query-text routing."},
                         "hall": {"type": "string", "description": "Hard metadata filter: restrict results to this hall."},
@@ -1661,13 +1661,13 @@ class Mem0ChatProxy:
                 {
                     "name": "reliquary_add_memory",
                     "title": "Reliquary Add Memory",
-                    "description": "Store a new memory in the local Mem0 collection.",
+                    "description": "Store a new memory in the local Reliquary collection.",
                     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "text": {"type": "string", "description": "The text to store."},
-                            "user_id": {"type": "string", "description": "Optional Mem0 user_id override."},
+                            "user_id": {"type": "string", "description": "Optional Reliquary user_id override."},
                             "title": {"type": "string"},
                             "source": {"type": "string"},
                             "source_ref": {"type": "string"},
@@ -1693,7 +1693,7 @@ class Mem0ChatProxy:
                         "type": "object",
                         "properties": {
                             "id": {"type": "string", "description": "Memory id from reliquary_search or reliquary_add_memory."},
-                            "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
+                            "user_id": {"type": "string", "description": "Optional Reliquary user_id override (must own the record)."},
                         },
                         "required": ["id"],
                         "additionalProperties": False,
@@ -1712,7 +1712,7 @@ class Mem0ChatProxy:
                             "id": {"type": "string", "description": "Memory id from reliquary_search or reliquary_add_memory."},
                             "text": {"type": "string", "description": "The new memory text."},
                             "metadata": {"type": "object", "description": "Optional metadata fields to merge into the record."},
-                            "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
+                            "user_id": {"type": "string", "description": "Optional Reliquary user_id override (must own the record)."},
                         },
                         "required": ["id", "text"],
                         "additionalProperties": False,
@@ -1755,7 +1755,7 @@ class Mem0ChatProxy:
                         "type": "object",
                         "properties": {
                             "memory_id": {"type": "string", "description": "memory_id returned by reliquary_add_image."},
-                            "user_id": {"type": "string", "description": "Optional Mem0 user_id override (must own the record)."},
+                            "user_id": {"type": "string", "description": "Optional Reliquary user_id override (must own the record)."},
                         },
                         "required": ["memory_id"],
                         "additionalProperties": False,
@@ -1930,7 +1930,7 @@ class Mem0ChatProxy:
                     "search_mode": "hybrid" if self._native_hybrid else "dense+lexical-fallback",
                 }
                 return self.mcp_tool_result(
-                    text=f"Mem0 is available. Approximate memory count: {status['approx_memory_count']}.",
+                    text=f"Reliquary is available. Approximate memory count: {status['approx_memory_count']}.",
                     structured=status,
                 )
             if tool_name == "reliquary_list_domains":
@@ -4257,7 +4257,7 @@ class Mem0ChatProxy:
     async def send_asset(send, filename: str, content_type: str) -> None:
         data = load_asset(filename)
         if data is None:
-            await Mem0ChatProxy.send_json(send, 404, {"error": f"Asset not found: {filename}"})
+            await ReliquaryChatProxy.send_json(send, 404, {"error": f"Asset not found: {filename}"})
             return
         headers = [
             (b"content-type", content_type.encode("latin-1")),
@@ -4433,11 +4433,11 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a local Mem0-backed chat + MCP proxy with an OAuth shim.")
+    parser = argparse.ArgumentParser(description="Run the local Reliquary chat + MCP proxy with an OAuth shim.")
     parser.add_argument("--config", default="~/.mem0/config.yaml", help="Path to the Mem0 config file.")
     parser.add_argument("--host", default="127.0.0.1", help="Listen host for the proxy.")
     parser.add_argument("--port", default=8787, type=int, help="Listen port for the proxy.")
-    parser.add_argument("--user-id", default="default", help="Default Mem0 user_id for retrieval.")
+    parser.add_argument("--user-id", default="default", help="Default Reliquary user_id for retrieval.")
     parser.add_argument("--memory-limit", default=5, type=int, help="Maximum number of memories to inject.")
     parser.add_argument("--memory-threshold", default=None, type=float, help="Optional minimum similarity score for memory hits.")
     parser.add_argument("--memory-max-chars", default=500, type=int, help="Maximum characters per injected memory snippet.")
@@ -4462,10 +4462,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-chat-upstream",
         action="store_true",
-        help="Run only the Mem0 debug/MCP endpoints and disable OpenAI chat-completion passthrough.",
+        help="Run only the Reliquary debug/MCP endpoints and disable OpenAI chat-completion passthrough.",
     )
     parser.add_argument("--embedder-base-url", default=None, help="Override the upstream embeddings base URL.")
-    parser.add_argument("--writeback", action="store_true", help="Write the latest user+assistant turn back into Mem0 after each successful completion.")
+    parser.add_argument("--writeback", action="store_true", help="Write the latest user+assistant turn back into Reliquary after each successful completion.")
     parser.add_argument(
         "--writeback-path",
         default=os.getenv("RELIQUARY_WRITEBACK_PATH"),
@@ -4599,7 +4599,7 @@ def main() -> None:
             "against, and OAuth authorization is disabled (no tokens can be minted). "
             "Set RELIQUARY_CLAUDE_MCP_TOKEN (or --claude-mcp-token) to require auth."
         )
-    app = Mem0ChatProxy(settings)
+    app = ReliquaryChatProxy(settings)
     import uvicorn
     uvicorn.run(app, host=settings.host, port=settings.port, log_level=args.log_level.lower())
 
