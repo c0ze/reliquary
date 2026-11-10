@@ -2702,11 +2702,12 @@ class ReliquaryChatProxy:
         )
         self._save_pending_uploads()
         upload_url = self._absolute_url(f"/uploads/{upload_id}")
+        commit_tool = "commit_image_upload" if profile and profile.name == "openai" else "reliquary_commit_image_upload"
         return self.mcp_tool_result(
             text=(
                 f"Created upload slot {upload_id}. POST the raw bytes to {upload_url} with the SAME "
                 "`Authorization: Bearer <token>` header you use for this MCP endpoint (anonymous "
-                "uploads are rejected), then call commit_image_upload with the upload_id and caption."
+                f"uploads are rejected), then call {commit_tool} with the upload_id and caption."
             ),
             structured={
                 "upload_id": upload_id,

@@ -302,3 +302,12 @@ def test_metrics_record_unknown_tool_names_as_unknown(proxy):
     _rpc(proxy, s.claude_mcp_path, "claude-secret", "reliquary_search", {"query": "x"})
     tools = {tool for tool, _status in proxy.metrics._tool_calls}
     assert tools == {"unknown", "reliquary_search"}
+
+
+# --- 5. upload instructions name the endpoint's commit tool -------------------
+
+def test_upload_instructions_name_the_endpoint_commit_tool(proxy):
+    claude = call(proxy, "claude", "reliquary_create_image_upload", {})["content"][0]["text"]
+    lean = call(proxy, "openai", "create_image_upload", {})["content"][0]["text"]
+    assert "call reliquary_commit_image_upload" in claude
+    assert "call commit_image_upload" in lean
