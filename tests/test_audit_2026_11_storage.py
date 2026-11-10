@@ -610,3 +610,42 @@ def test_resources_read_runs_off_the_event_loop(proxy, monkeypatch):
     assert response.status_code == 200, response.text
     assert "unindexed" in response.json()["result"]["contents"][0]["text"]
     assert "read_resource" in offloaded
+
+
+# 14 -- cancelling a waiting writer wakes the readers it was blocking --------
+
+def test_cancelled_waiting_writer_wakes_blocked_readers():
+    from runtime import AsyncRWLock
+
+    async def scenario():
+        lock = AsyncRWLock()
+        release_first = asyncio.Event()
+        second_in = asyncio.Event()
+
+        async def first_reader():
+            async with lock.read():
+                await release_first.wait()
+
+        async def writer():
+            async with lock.write():
+                pass
+
+        async def second_reader():
+            async with lock.read():
+                second_in.set()
+
+        reader = asyncio.create_task(first_reader())
+        await asyncio.sleep(0.01)
+        waiting_writer = asyncio.create_task(writer())
+        await asyncio.sleep(0.01)
+        blocked = asyncio.create_task(second_reader())
+        await asyncio.sleep(0.01)
+        assert not second_in.is_set()
+        waiting_writer.cancel()
+        await asyncio.wait_for(second_in.wait(), timeout=1)
+        release_first.set()
+        await asyncio.gather(reader, blocked)
+        with pytest.raises(asyncio.CancelledError):
+            await waiting_writer
+
+    run(scenario())
