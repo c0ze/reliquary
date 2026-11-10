@@ -3443,7 +3443,8 @@ class ReliquaryChatProxy:
         if not isinstance(result, dict):
             return None
         metadata = dict(result.get("metadata") or {})
-        title = str(metadata.get("title") or result.get("memory") or "<untitled>").strip() or "<untitled>"
+        # Same fallback as search: the body is never reused as the title.
+        title = str(metadata.get("title") or "").strip() or "<untitled>"
         memory_text = str(result.get("memory") or "").strip()
         return {
             "id": str(result.get("id") or record_id),

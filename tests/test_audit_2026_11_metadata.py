@@ -311,3 +311,23 @@ def test_upload_instructions_name_the_endpoint_commit_tool(proxy):
     lean = call(proxy, "openai", "create_image_upload", {})["content"][0]["text"]
     assert "call reliquary_commit_image_upload" in claude
     assert "call commit_image_upload" in lean
+
+
+# --- 6. untitled user-writes do not use the body as the title -----------------
+
+def test_untitled_user_write_fetch_and_delete_do_not_echo_the_body(proxy):
+    text = "word " * 400
+    mid = call(proxy, "claude", "reliquary_add_memory", {"text": text})["structuredContent"]["ids"][0]
+    hit = call(proxy, "claude", "reliquary_search", {"query": "word"})["structuredContent"]["results"][0]
+    fetched = call(proxy, "claude", "reliquary_fetch", {"id": mid})
+    assert fetched["structuredContent"]["title"] == hit["title"] == "<untitled>"
+    assert len(fetched["content"][0]["text"]) < len(text) + 100
+    deleted = call(proxy, "claude", "reliquary_delete", {"id": mid})
+    assert len(deleted["content"][0]["text"]) < 200
+
+
+def test_titled_user_write_keeps_its_title(proxy):
+    mid = call(proxy, "claude", "reliquary_add_memory",
+               {"text": "body", "title": "My note"})["structuredContent"]["ids"][0]
+    assert call(proxy, "claude", "reliquary_fetch", {"id": mid})["structuredContent"]["title"] == "My note"
+    assert "My note" in call(proxy, "claude", "reliquary_delete", {"id": mid})["content"][0]["text"]
