@@ -6,10 +6,14 @@
 # unpinned floor silently drifts the runtime out from under the code.
 #
 # The Docker image installs the fully-resolved transitive set from
-# requirements.lock for reproducible builds. Regenerate both after a bump:
+# requirements.lock for reproducible builds. Regenerate both after a bump.
+# --python-platform resolves for the image (linux/amd64) on any host: without
+# it, running this on an arm64 Mac silently drops greenlet from the lock.
 #
-#     uv pip compile requirements.txt --python-version 3.12 --no-annotate -o requirements.lock
+#     uv pip compile requirements.txt --python-version 3.12 --python-platform x86_64-unknown-linux-gnu --no-annotate -o requirements.lock
 #     uv lock
+#
+# To move a transitive package past an advisory, add -P 'name==version' to both.
 mem0ai==2.0.4
 qdrant-client==1.18.0
 httpx==0.28.1
