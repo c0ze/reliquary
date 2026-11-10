@@ -100,3 +100,58 @@ def test_upload_path_keeps_its_own_limit(proxy):
     resp = _call(proxy, "POST", slot["upload_url"], body=data,
                  headers={**CLAUDE, "content-type": "image/png", "content-length": str(len(data))})
     assert resp["status"] in (200, 201), resp["body"]
+
+
+# --- 2. consent page host spoofing ------------------------------------------
+
+
+@pytest.mark.parametrize("uri", [
+    "https://claude.ai@evil.example/cb",
+    "https://user:pass@evil.example/cb",
+    "https://@evil.example/cb",
+    "http://evil.example\\@127.0.0.1/cb",
+    "https://evil.example\\.claude.ai/cb",
+    "https://claude.ai/cb\r\nSet-Cookie: x=1",
+    "https://claude.ai/c\tb",
+    "https://claude.ai/cb\x00",
+    "https://claude.ai:99999/cb",
+])
+def test_redirect_uri_rejects_userinfo_backslash_and_controls(uri):
+    from oauth import OAuthProvider
+    assert OAuthProvider.valid_redirect_uri(uri) is False
+
+
+@pytest.mark.parametrize("uri", [
+    "https://claude.ai/api/mcp/auth_callback",
+    "http://localhost:6274/oauth/callback",
+    "http://127.0.0.1/cb?x=1",
+    "http://[::1]:8080/cb",
+])
+def test_redirect_uri_still_accepts_legitimate_callbacks(uri):
+    from oauth import OAuthProvider
+    assert OAuthProvider.valid_redirect_uri(uri) is True
+
+
+def test_consent_page_shows_hostname_client_and_scope(proxy):
+    _verifier, challenge = _pkce()
+    params = {
+        "response_type": "code", "client_id": "mcp-<b>x</b>", "redirect_uri": "https://claude.ai/api/cb",
+        "code_challenge": challenge, "code_challenge_method": "S256", "scope": "read",
+    }
+    resp = _call(proxy, "GET", "/oauth/authorize", query=urlencode(params).encode())
+    page = resp["body"].decode()
+    assert resp["status"] == 200
+    assert '<span class="host">claude.ai</span>' in page
+    assert "mcp-&lt;b&gt;x&lt;/b&gt;" in page and "mcp-<b>" not in page
+    assert "read-only" in page
+    params["scope"] = "write"
+    page = _call(proxy, "GET", "/oauth/authorize", query=urlencode(params).encode())["body"].decode()
+    assert "read and write" in page
+
+
+def test_consent_page_never_shows_userinfo(proxy):
+    from oauth import OAuthProvider
+    page = OAuthProvider(master_token="m", mcp_resource_path="/claude/mcp").authorize_form_html(
+        {"redirect_uri": "https://claude.ai@evil.example/cb"}, error="bad")
+    assert '<span class="host">claude.ai' not in page
+    assert '<span class="host">evil.example</span>' in page

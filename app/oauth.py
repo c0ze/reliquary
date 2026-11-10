@@ -164,12 +164,21 @@ class OAuthProvider:
 
     @staticmethod
     def valid_redirect_uri(uri: str) -> bool:
+        # Browsers treat '\' as '/' and strip tabs/newlines, while urlparse does
+        # not (or silently drops them), so the host we check would not be the
+        # host the browser visits. Controls (CR/LF) also reach the Location header.
+        if "\\" in uri or any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in uri):
+            return False
         try:
             parsed = urlparse(uri)
+            parsed.port  # raises ValueError on a malformed port
         except ValueError:
             return False
         # No fragments in a redirect URI (RFC 6749 §3.1.2).
         if parsed.fragment:
+            return False
+        # Userinfo makes "https://claude.ai@evil.example" read as claude.ai.
+        if "@" in parsed.netloc:
             return False
         if parsed.scheme == "https":
             return bool(parsed.hostname)
@@ -183,6 +192,10 @@ class OAuthProvider:
         )
         error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
         redirect_host = html.escape(self._host_from_uri(params.get("redirect_uri", "")))
+        client_id = html.escape(params.get("client_id") or "<unknown>")
+        access = "read and write" if scope_is_write(params.get("scope")) else "read-only"
+        requested_scope = params.get("scope")
+        scope_note = f' (scope <span class="host">{html.escape(requested_scope)}</span>)' if requested_scope else ""
         return (
             "<!doctype html>\n"
             '<html lang="en"><head><meta charset="utf-8">'
@@ -197,6 +210,8 @@ class OAuthProvider:
             "</style></head><body>"
             "<h1>Reliquary</h1>"
             f'<p>Authorize <span class="host">{redirect_host}</span> to access your memories.</p>'
+            f'<p>Client <span class="host">{client_id}</span> requests '
+            f"<strong>{access}</strong> access{scope_note}.</p>"
             f"{error_html}"
             '<form method="post" action="/oauth/authorize">'
             f"{hidden}"
@@ -215,7 +230,8 @@ class OAuthProvider:
             parsed = urlparse(uri)
         except ValueError:
             return "<unknown>"
-        return parsed.netloc or "<unknown>"
+        # hostname, never netloc: netloc includes userinfo ("claude.ai@evil.example").
+        return parsed.hostname or "<unknown>"
 
     def verify_bearer(self, candidate: str) -> bool:
         # An empty master_token means no RELIQUARY_CLAUDE_MCP_TOKEN was configured, i.e.
