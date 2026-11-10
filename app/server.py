@@ -1209,6 +1209,7 @@ class ReliquaryChatProxy:
                                     cold_min_events=self.settings.lint_cold_min_events)
             payload = {
                 "stale": [self._page_summary(p) for p in pages if p.status == "stale"],
+                "unindexed": report["unindexed_pages"],
                 "coverage_gaps": report["coverage_gaps"],
                 "cold_records": report["cold_records"],
                 "hot_topics": report["hot_topics"],
@@ -2444,6 +2445,7 @@ class ReliquaryChatProxy:
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 frontmatter[key] = str(value).strip()
+        previous = self.pages.get(slug)
         try:
             info = await asyncio.to_thread(self.pages.put_revision, slug, markdown, frontmatter)
         except BlobTooLarge as exc:
@@ -2454,9 +2456,20 @@ class ReliquaryChatProxy:
         for key in ("domain", "hall", "room", "topic"):
             if getattr(info, key):
                 metadata[key] = getattr(info, key)
-        memory_id = await self._index_compiled_page(info, markdown, user_id=user_id, metadata=metadata)
-        if memory_id:
-            self.pages.set_memory_id(slug, memory_id)
+        try:
+            memory_id = await self._index_compiled_page(info, markdown, user_id=user_id, metadata=metadata)
+        except Exception:
+            LOG.exception("Compiled indexing failed for slug=%s; restoring the previous page state", slug)
+            memory_id = None
+        if not memory_id:
+            # The registry commits before the index write; without this, a
+            # failure left a current revision that search never sees (or, for
+            # an existing page, registry text that diverges from the index).
+            await asyncio.to_thread(self.pages.rollback_revision, slug, previous, info.current_blob)
+            return self.mcp_tool_result(
+                text=f"Could not index page slug={slug}; nothing was changed. Retry later.",
+                structured={"error": "index_failed", "slug": slug}, is_error=True)
+        self.pages.set_memory_id(slug, memory_id)
         url = self._signed_blob_url(info.current_blob)
         return self.mcp_tool_result(
             text=f"Filed synthesis page slug={slug} (revision {info.current_blob[:12]}, status={status}).",

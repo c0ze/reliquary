@@ -176,6 +176,22 @@ class PageRegistry:
             self._save(info)
             return info
 
+    def rollback_revision(self, slug: str, previous: "PageInfo | None", new_blob: str) -> None:
+        """Undo a put_revision whose index write failed: restore the previous
+        registry entry (or remove a page that did not exist before) and release
+        the reference put_revision took on ``new_blob``."""
+        with _REGISTRY_LOCK:
+            if previous is None:
+                try:
+                    os.remove(self._path(slug))
+                except FileNotFoundError:
+                    pass
+            else:
+                self._save(previous)
+            # An identical re-file already balanced its own reference.
+            if new_blob and (previous is None or previous.current_blob != new_blob):
+                self.blobs.delete(new_blob)
+
     def _iter_pages(self):
         for shard in os.listdir(self.registry_dir):
             shard_path = os.path.join(self.registry_dir, shard)

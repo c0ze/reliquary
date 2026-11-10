@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -22,6 +23,10 @@ def claude(proxy):
 
 async def call(proxy, tool, args):
     return await proxy.call_mcp_tool(claude(proxy), tool, args, can_write=True)
+
+
+def sidecars(proxy):
+    return sorted(p.stem for p in Path(proxy.blobs.blob_dir).rglob("*.json"))
 
 
 async def post_bytes(proxy, upload_id, data=PNG):
@@ -59,3 +64,47 @@ def test_delete_page_still_aborts_when_vector_survives_a_failed_delete(proxy, mo
     result = run(scenario())
     assert result["structuredContent"]["error"] == "index_delete_failed"
     assert proxy.pages.get("p") is not None
+
+
+# 2 -- an indexing failure must not leave a committed, unindexed revision ---
+
+def _fail_compiled_index(proxy, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("embedder unavailable")
+
+    monkeypatch.setattr(proxy.compiled_memory, "add", boom)
+    monkeypatch.setattr(proxy.compiled_memory, "update", boom)
+
+
+def test_compile_index_failure_does_not_create_a_new_page(proxy, monkeypatch):
+    _fail_compiled_index(proxy, monkeypatch)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "newpage", "markdown": "body", "domain": "d"}))
+    assert result["isError"] is True
+    assert proxy.pages.get("newpage") is None
+    assert result["structuredContent"]["error"] == "index_failed"
+    # The revision blob's reference was released, not leaked.
+    assert sidecars(proxy) == []
+
+
+def test_compile_index_failure_restores_the_existing_page(proxy, monkeypatch):
+    first = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "old text"}))
+    before = proxy.pages.get("pg")
+    _fail_compiled_index(proxy, monkeypatch)
+    second = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "new text"}))
+    assert proxy.pages.get("pg") == before
+    assert "old text" in proxy.pages.read_body("pg")[0]
+    assert second["structuredContent"]["error"] == "index_failed"
+    assert "old text" in proxy.compiled_memory._store[first["structuredContent"]["memory_id"]]["memory"]
+    assert sidecars(proxy) == [before.current_blob]  # the new revision's bytes were released
+    assert proxy.blobs.info(before.current_blob).ref_count == 1
+
+
+def test_needs_review_and_lint_report_current_page_without_index(proxy, tmp_path):
+    proxy.pages.put_revision("broken", "body", {"status": "current"})  # e.g. filed before this fix
+    payload = json.loads(proxy.read_resource("reliquary://needs-review")["contents"][0]["text"])
+    assert [item["slug"] for item in payload["unindexed"]] == ["broken"]
+
+    import lint
+    report = lint.build_report(compiled_dir=proxy.settings.compiled_dir, blob_dir=proxy.settings.blob_dir,
+                               dataset_path=None, min_count=8)
+    assert [item["slug"] for item in report["unindexed_pages"]] == ["broken"]

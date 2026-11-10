@@ -37,6 +37,15 @@ def stale_pages(pages: Iterable[Any]) -> list[dict[str, Any]]:
     ]
 
 
+def unindexed_pages(pages: Iterable[Any]) -> list[dict[str, Any]]:
+    """Current pages with no vector-index record: invisible to search."""
+    return [
+        {"kind": "unindexed_page", "slug": p.slug,
+         "reason": "current page has no index record (not searchable); re-file it with compile_page"}
+        for p in pages if getattr(p, "status", None) == "current" and not getattr(p, "memory_id", None)
+    ]
+
+
 def coverage_gaps(pages: Iterable[Any], raw_counts: dict[str, int], *, min_count: int) -> list[dict[str, Any]]:
     pages = list(pages)
     covered = {p.domain for p in pages if p.status == "current" and p.domain}
@@ -132,6 +141,7 @@ def run_all(pages: Iterable[Any], *, raw_counts: dict[str, int], min_count: int,
     cold_floor = cold_min_events if cold_min_events is not None else COLD_RECORD_MIN_EVENTS
     return {
         "stale_pages": stale_pages(pages),
+        "unindexed_pages": unindexed_pages(pages),
         "coverage_gaps": coverage_gaps(pages, raw_counts, min_count=min_count),
         "supersession": supersession(pages),
         "orphans": orphans(records),
