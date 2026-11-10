@@ -227,7 +227,10 @@ def test_synthesis_preference_respects_relevance(proxy, monkeypatch, synthesis_s
     async def raw(*args, **kwargs):
         return [{"id": "raw", "memory": "Reliquary MCP architecture", "score": 0.9}]
     async def synthesis(*args, **kwargs):
-        return [{"id": "compiled", "text": "summary", "score": synthesis_score, "route": "synthesis"}]
+        # Search orders by the quality key (vector score plus lexical and recency
+        # bonuses); the page matches the query terms as fully as the raw hit.
+        return [{"id": "compiled", "text": "Reliquary MCP architecture summary",
+                 "score": synthesis_score, "route": "synthesis"}]
     monkeypatch.setattr(proxy, "search_memories", raw)
     monkeypatch.setattr(proxy, "_synthesis_first_hits", synthesis)
     result = asyncio.run(proxy.handle_search_tool({"query": "Reliquary MCP architecture", "limit": 1}))

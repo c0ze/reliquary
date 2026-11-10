@@ -17,6 +17,12 @@ success output schemas. Errors, including rate limits, retain their error flag
 and use the same JSON representation. Claude responses and other tools keep
 their existing format.
 
+Later change (2026-11): error results from OpenAI search/fetch now carry the
+JSON in the text content only, without `structuredContent`. Error payloads
+cannot match the advertised output schemas, and the TypeScript MCP SDK client
+validates `structuredContent` even on error results, so it threw -32602
+instead of returning the error. Success results are unchanged.
+
 ## Verification
 
 - New regression tests against unchanged application code: **20 failed,

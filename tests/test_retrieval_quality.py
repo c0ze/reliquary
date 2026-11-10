@@ -234,7 +234,8 @@ def test_search_memories_lexical_fallback_scans_beyond_get_all_default(proxy, mo
     )
 
     assert [hit["id"] for hit in result] == ["older-image"]
-    assert captured["filters"] == {"user_id": "my_lord"}
+    # The scan asks the store for user-writes only (2026-11 audit finding 4).
+    assert captured["filters"] == {"user_id": "my_lord", "source_group": "user-write"}
     assert captured["top_k"] > 20
 
 

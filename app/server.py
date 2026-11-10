@@ -59,7 +59,7 @@ from helpers import (
     safe_mcp_headers,
     trim_text,
 )
-from retrieval_quality import apply_retrieval_quality, retrieval_candidate_limit
+from retrieval_quality import apply_retrieval_quality, quality_score, retrieval_candidate_limit
 
 
 LOG = logging.getLogger("reliquary")
@@ -73,6 +73,11 @@ MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
 LIVE_LEXICAL_SCAN_LIMIT = 5000
+LIVE_LEXICAL_SCAN_MAX = 80_000  # the scan grows 4x per full page up to this
+# Search ranks one pool of up to this many hits per route, whatever the cursor,
+# and every page is a slice of that one ranking (which bounds the depth).
+SEARCH_RANKING_DEPTH = 100
+SEARCH_CURSOR_CAP = 400  # 20 pages at the max limit
 # Soft score bonus that floats project-matching memory up when caller context is
 # supplied (#42). Additive, excludes nothing; a no-op when context is absent.
 CONTEXT_MATCH_BONUS = 0.1
@@ -421,6 +426,7 @@ class ReliquaryChatProxy:
             if self._native_hybrid else "dense + get_all lexical fallback",
         )
         self._count_cache: tuple[float, int | None] | None = None
+        self._count_probe_failed = False  # last memory-count probe raised
         token_store = None
         refresh_token_store = None
         session_store = None
@@ -783,11 +789,14 @@ class ReliquaryChatProxy:
         await self.send_json(send, 200, {"status": "ok", "name": MCP_SERVER_NAME})
 
     async def handle_status(self, send) -> None:
+        memory_count = await self.get_memory_count()
         await self.send_json(
             send,
             200,
             {
-                "status": "ok",
+                # A failed count probe means the memory backend did not answer.
+                "status": "degraded" if self._count_probe_failed else "ok",
+                "memory_backend": "unavailable" if self._count_probe_failed else "ok",
                 "upstream_base_url": self.settings.upstream_base_url,
                 "embedder_base_url": self.settings.embedder_base_url,
                 "default_user_id": self.settings.user_id,
@@ -806,7 +815,7 @@ class ReliquaryChatProxy:
                 "catalog_records": len(self.catalog.records_by_id) if self.catalog else 0,
                 "catalog_domains": self.catalog.routeable_domains if self.catalog else [],
                 "vector_store_path": ((self.config.get("vector_store") or {}).get("config") or {}).get("path"),
-                "approx_memory_count": await self.get_memory_count(),
+                "approx_memory_count": memory_count,
                 "note": "Embedded local Qdrant allows only one Reliquary process at a time.",
             },
         )
@@ -1469,6 +1478,10 @@ class ReliquaryChatProxy:
                                         "id": {"type": "string"},
                                         "title": {"type": "string"},
                                         "url": {"type": "string"},
+                                        # Present only on proposed corrections.
+                                        "kind": {"type": "string"},
+                                        "status": {"type": "string"},
+                                        "target_id": {"type": "string"},
                                     },
                                     "required": ["id", "title", "url"],
                                 },
@@ -1933,6 +1946,15 @@ class ReliquaryChatProxy:
         # and every other tool's existing presentation unchanged.
         if profile.name != "openai" or tool_name not in {"search", "fetch"}:
             return result
+        if result.get("isError"):
+            # structuredContent must conform to the advertised outputSchema, and
+            # error payloads do not (no results / id,title,text,url). Clients
+            # that validate (the TypeScript SDK) would throw instead of showing
+            # the error, so errors carry the JSON as text only.
+            return {
+                "content": [{"type": "text", "text": json.dumps(result["structuredContent"], ensure_ascii=False)}],
+                "isError": True,
+            }
         return {
             **result,
             "content": [{"type": "text", "text": json.dumps(result["structuredContent"], ensure_ascii=False)}],
@@ -2011,9 +2033,13 @@ class ReliquaryChatProxy:
             if tool_name == "reliquary_capabilities":
                 return self.handle_capabilities_tool(profile, context=context, can_write=can_write)
             if tool_name == "reliquary_status":
+                memory_count = await self.get_memory_count()
+                degraded = self._count_probe_failed
                 status = {
+                    "status": "degraded" if degraded else "ok",
+                    "memory_backend": "unavailable" if degraded else "ok",
                     "user_id": self.settings.user_id,
-                    "approx_memory_count": await self.get_memory_count(),
+                    "approx_memory_count": memory_count,
                     "claude_mcp_path": self.settings.claude_mcp_path,
                     "openai_mcp_path": self.settings.openai_mcp_path,
                     "catalog_loaded": self.catalog is not None,
@@ -2022,7 +2048,11 @@ class ReliquaryChatProxy:
                     "search_mode": "hybrid" if self._native_hybrid else "dense+lexical-fallback",
                 }
                 return self.mcp_tool_result(
-                    text=f"Reliquary is available. Approximate memory count: {status['approx_memory_count']}.",
+                    text=(
+                        "Reliquary is degraded: the memory backend did not answer the count probe."
+                        if degraded
+                        else f"Reliquary is available. Approximate memory count: {status['approx_memory_count']}."
+                    ),
                     structured=status,
                 )
             if tool_name == "reliquary_list_domains":
@@ -2083,11 +2113,20 @@ class ReliquaryChatProxy:
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_propose_update_tool(arguments, allow_user_id=True)
-        except Exception as exc:
-            LOG.exception("MCP tool failed: %s", tool_name)
+        except MemoryBackendUnavailable:
             return self.mcp_tool_result(
-                text=f"{tool_name} failed: {exc}",
-                structured={"error": str(exc)},
+                text=f"{tool_name} could not reach the memory backend; retry shortly.",
+                structured={"error": "backend_unavailable"},
+                is_error=True,
+            )
+        except Exception:
+            # The exception text can carry backend hosts or credentials in URLs;
+            # log it under an id and give the client only the id.
+            error_id = secrets.token_hex(6)
+            LOG.exception("MCP tool failed [%s]: %s", error_id, tool_name)
+            return self.mcp_tool_result(
+                text=f"{tool_name} failed with an internal error (error_id={error_id}); see the server log.",
+                structured={"error": "internal_error", "error_id": error_id},
                 is_error=True,
             )
 
@@ -2123,14 +2162,12 @@ class ReliquaryChatProxy:
             offset = max(0, int(arguments.get("cursor") or 0))
         except (TypeError, ValueError):
             offset = 0
-        # Reject (not clamp) offsets past the cap: result_cap below feeds search
-        # top_k and the O(n²) dedup pass, so an unbounded cursor is a resource-
-        # exhaustion vector — and silently clamping would return the same page
-        # with the same nextCursor forever. 400 = 20 pages at the max limit.
-        if offset > 400:
+        # Reject (not clamp) offsets past the cap: silently clamping would return
+        # the same page with the same nextCursor forever.
+        if offset > SEARCH_CURSOR_CAP:
             return self.mcp_tool_result(
                 text="Cursor is past the pagination cap (400); restart the search or narrow it with filters.",
-                structured={"error": "invalid_cursor", "max_cursor": 400},
+                structured={"error": "invalid_cursor", "max_cursor": SEARCH_CURSOR_CAP},
                 is_error=True,
             )
         threshold = (
@@ -2146,7 +2183,14 @@ class ReliquaryChatProxy:
                 minimum=100, maximum=SEARCH_PREVIEW_CHAR_CAP_MAX,
             )
 
-        result_cap = offset + limit + 1
+        # The candidate pool must not depend on the cursor: a pool that grew with
+        # the offset was re-ranked on every page, so pages repeated and skipped
+        # records. Every page ranks the same pool and slices it.
+        result_cap = max(SEARCH_RANKING_DEPTH, limit + 1)
+        # Order by the key apply_retrieval_quality selected by (vector score plus
+        # lexical and recency bonuses), computed on the raw hit before enrichment.
+        rank_now = time.time()
+        rank_scores: dict[str, float] = {}
 
         # Build explicit metadata filters from caller-supplied taxonomy params.
         # When any are present, bypass catalog routing and run a single hard-filtered
@@ -2159,13 +2203,16 @@ class ReliquaryChatProxy:
         if explicit:
             # Hard-filter path: one search with the explicit filters; no catalog routing.
             hits = await self.search_memories(
-                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=explicit
+                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=explicit,
+                lexical_min_hits=limit,
             )
+            raw_routes, failed_routes = 1, int(isinstance(hits, _BackendFailure))
             by_key: dict[str, dict[str, Any]] = {}
             for hit in hits:
                 enriched = self._enrich_hit(hit, route="explicit-filter")
                 key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
                 by_key[key] = enriched
+                rank_scores[key] = quality_score(query, hit, now=rank_now)
             raw_results = sorted(
                 by_key.values(),
                 key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)
@@ -2174,11 +2221,10 @@ class ReliquaryChatProxy:
             )
             # Synthesis-first: apply ALL explicit filters so every taxonomy dimension
             # (domain, hall, room, topic) enforces the same hard-restrict guarantee (Fix 1).
-            synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
-            synthesis_results = [
-                s for s in synthesis_results
-                if all((s.get("metadata") or {}).get(k) == v for k, v in explicit.items())
-            ]
+            # Filtered inside, before the limit cut, so out-of-scope pages that
+            # score higher cannot crowd the matching page out.
+            synthesis_results = await self._synthesis_first_hits(
+                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=explicit)
             routes_used = [f"explicit-filter({', '.join(f'{k}={v}' for k, v in explicit.items())})"]
         else:
             routes = self.catalog.build_routes(query) if self.catalog else [_GlobalRoute()]
@@ -2188,16 +2234,20 @@ class ReliquaryChatProxy:
             # while the global route matches the same record strongly (e.g. an exact
             # lexical hit at score ~2.0). Route priority must not shadow the better copy.
             by_key = {}
+            raw_routes, failed_routes = len(routes), 0
             for route in routes:
                 hits = await self.search_memories(
-                    query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters
+                    query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters,
+                    lexical_min_hits=limit,
                 )
+                failed_routes += isinstance(hits, _BackendFailure)
                 for hit in hits:
                     enriched = self._enrich_hit(hit, route=route.description)
                     key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
                     existing = by_key.get(key)
                     if existing is None or self._numeric_score(enriched.get("score")) > self._numeric_score(existing.get("score")):
                         by_key[key] = enriched
+                        rank_scores[key] = quality_score(query, hit, now=rank_now)
 
             # Order by relevance score across ALL routes, not by route priority, so the
             # best hit (e.g. an exact lexical match) ranks first wherever it came from.
@@ -2210,24 +2260,43 @@ class ReliquaryChatProxy:
                                   str(item.get("id") or "")),
             )
             # Synthesis-first (#50): a current synthesis leads; raw hits follow as evidence.
-            synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
+            synthesis_results = await self._synthesis_first_hits(
+                query, user_id=user_id, limit=result_cap, threshold=threshold)
             routes_used = [route.description for route in routes]
 
+        if raw_routes and failed_routes == raw_routes and not synthesis_results:
+            # Every memory route raised and no synthesis answered: report the
+            # outage rather than a successful search with no results. (One
+            # route down while others answer is still a result.)
+            return self.mcp_tool_result(
+                text="The memory backend is unavailable, so the search could not run; retry shortly.",
+                structured={"error": "backend_unavailable"},
+                is_error=True,
+            )
         # Use result_cap (not limit) so paginated pages past the first still see syntheses.
         # synthesis ids are slugs, raw ids are mem0 uuids — disjoint namespaces, so this
         # dedupe is a safety guard, not a real overlap risk.
         synthesis_ids = {str(s.get("id")) for s in synthesis_results}
         combined = synthesis_results + [r for r in raw_results if str(r.get("id")) not in synthesis_ids]
+        for synthesis in synthesis_results:
+            rank_scores[str(synthesis.get("id"))] = quality_score(query, synthesis, now=rank_now)
         # A synthesis wins close relevance comparisons, not every comparison.
         # Unconditional concatenation buried exact raw matches beneath unrelated
         # pages, even when their vector scores were much lower.
         combined.sort(key=lambda item: (
-            -(self._numeric_score(item.get("score")) + self._context_bonus(item, context)
+            -(rank_scores.get(str(item.get("id") or item.get("url") or item.get("title")),
+                              self._numeric_score(item.get("score")))
+              + self._context_bonus(item, context)
               + self._exact_match_bonus(item, query)
               + (COMPILED_RANK_BONUS if item.get("route") == "synthesis" else 0.0)),
             str(item.get("id") or ""),
         ))
-        next_cursor = str(offset + limit) if len(combined) > offset + limit else None
+        # Never hand out a cursor that the next call would reject.
+        next_cursor = (
+            str(offset + limit)
+            if len(combined) > offset + limit and offset + limit <= SEARCH_CURSOR_CAP
+            else None
+        )
         results = combined[offset:offset + limit]
         filter_header = (f" [filters: {', '.join(f'{k}={v}' for k, v in explicit.items())}]" if explicit else "")
         lines = [f"Search for {query!r} returned {len(results)} result(s).{filter_header}"]
@@ -2264,6 +2333,13 @@ class ReliquaryChatProxy:
                     "truncated": truncated,
                     "char_count": len(full_text),
                 }
+                if metadata.get("kind") == "correction":
+                    # Without these a proposed correction reads like any
+                    # other record on the lean endpoint.
+                    structured_item["kind"] = "correction"
+                    structured_item["status"] = str(metadata.get("status") or "proposed")
+                    if metadata.get("target_id"):
+                        structured_item["target_id"] = str(metadata["target_id"])
             else:
                 # Mirror the preview cap in structuredContent so the full corpus
                 # text cannot blow out context here; full text stays behind fetch.
@@ -3544,9 +3620,18 @@ class ReliquaryChatProxy:
         try:
             async with self._read_lock():
                 result = await asyncio.to_thread(self.memory.get, record_id)
-        except Exception:
+        except Exception as exc:
             LOG.exception("Could not fetch live memory id=%s", record_id)
-            return None
+            # Vector ids are UUIDs (or integers); the store rejects any other
+            # id, so that is a plain miss. A well-formed id that raised means
+            # the backend is down: say so rather than "not found".
+            import uuid
+            try:
+                uuid.UUID(record_id)
+            except ValueError:
+                if not record_id.isdigit():
+                    return None
+            raise MemoryBackendUnavailable(str(exc)) from exc
         if not isinstance(result, dict):
             return None
         metadata = dict(result.get("metadata") or {})
@@ -3708,6 +3793,7 @@ class ReliquaryChatProxy:
         limit: int,
         threshold: float | None,
         filters: dict[str, Any] | None,
+        lexical_min_hits: int | None = None,
     ) -> list[dict[str, Any]]:
         candidate_limit = retrieval_candidate_limit(limit)
         kwargs: dict[str, Any] = {self._search_limit_param: candidate_limit}
@@ -3729,7 +3815,7 @@ class ReliquaryChatProxy:
                 result = await asyncio.to_thread(self.memory.search, query, **kwargs)
         except Exception:
             LOG.exception("Mem0 search failed for user_id=%s", user_id)
-            return []
+            return _BackendFailure()
 
         if not isinstance(result, dict):
             return []
@@ -3737,7 +3823,9 @@ class ReliquaryChatProxy:
         if not isinstance(hits, list):
             return []
         live_hits: list[dict[str, Any]] = []
-        if self._should_run_lexical(query, hits, limit):
+        # The "thin results" gate compares with the page size, not the ranking
+        # pool, so a deep pool does not turn the fallback on for every query.
+        if self._should_run_lexical(query, hits, limit if lexical_min_hits is None else lexical_min_hits):
             live_hits = await self.live_lexical_matches(
                 query,
                 user_id=user_id,
@@ -3794,15 +3882,27 @@ class ReliquaryChatProxy:
         get_all = getattr(self.memory, "get_all", None)
         if get_all is None:
             return []
+        # Ask the store for user-writes only (every server write stamps
+        # source_group="user-write"; imports carry "imported"), so the scan cap
+        # is not spent on the imported corpus. get_all has no offset, so a page
+        # that comes back exactly full is fetched again with a larger cap.
+        scan_limit = LIVE_LEXICAL_SCAN_LIMIT
         try:
-            kwargs = self._get_all_kwargs(get_all, user_id=user_id, top_k=LIVE_LEXICAL_SCAN_LIMIT)
-            async with self._read_lock():
-                result = await asyncio.to_thread(get_all, **kwargs)
+            while True:
+                kwargs = self._get_all_kwargs(get_all, user_id=user_id, top_k=scan_limit,
+                                              metadata_filters={"source_group": "user-write"})
+                async with self._read_lock():
+                    result = await asyncio.to_thread(get_all, **kwargs)
+                records = self._memory_results(result)
+                if len(records) != scan_limit or scan_limit >= LIVE_LEXICAL_SCAN_MAX:
+                    break
+                scan_limit = min(scan_limit * 4, LIVE_LEXICAL_SCAN_MAX)
         except Exception:
             LOG.debug("Live lexical fallback failed for user_id=%s", user_id, exc_info=True)
             return []
+        if len(records) >= LIVE_LEXICAL_SCAN_MAX:
+            LOG.warning("Live lexical fallback scanned only the first %d user-written memories", len(records))
 
-        records = self._memory_results(result)
         matches: list[dict[str, Any]] = []
         for record in records:
             if not isinstance(record, dict):
@@ -3823,7 +3923,10 @@ class ReliquaryChatProxy:
         matches.sort(key=lambda hit: (-self._numeric_score(hit.get("score")), str(hit.get("id") or "")))
         return matches[:limit]
 
-    async def _synthesis_first_hits(self, query: str, *, user_id: str, limit: int) -> list[dict[str, Any]]:
+    async def _synthesis_first_hits(
+        self, query: str, *, user_id: str, limit: int,
+        threshold: float | None = None, filters: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Compiled-layer pre-pass for synthesis-first retrieval (#50).
 
         Returns current (non-stale) synthesis pages matching the query, shaped like
@@ -3833,16 +3936,25 @@ class ReliquaryChatProxy:
         if self.compiled_memory is None or self.pages is None or limit <= 0:
             return []
         kwargs: dict[str, Any] = {self._search_limit_param: retrieval_candidate_limit(limit)}
+        if threshold is not None:
+            kwargs["threshold"] = threshold
+        # Taxonomy filters go into the vector search too (the compiled index
+        # carries domain/hall/room/topic), so the candidate pool is in scope;
+        # the registry check below stays authoritative.
+        search_filters: dict[str, Any] = dict(filters or {})
         if self._search_user_id_param:
             kwargs["user_id"] = user_id
+            if search_filters and self._search_supports_filters:
+                kwargs["filters"] = search_filters
         else:
-            kwargs["filters"] = {"user_id": user_id}
+            search_filters["user_id"] = user_id
+            kwargs["filters"] = search_filters
         try:
             async with self._read_lock():
                 result = await asyncio.to_thread(self.compiled_memory.search, query, **kwargs)
         except Exception:
             LOG.exception("Compiled search failed for user_id=%s", user_id)
-            return []
+            return _BackendFailure()
         hits = result.get("results") if isinstance(result, dict) else None
         if not isinstance(hits, list):
             return []
@@ -3858,6 +3970,11 @@ class ReliquaryChatProxy:
             if page is None or page.status != "current":
                 continue
             if self._numeric_score(hit.get("score")) < COMPILED_LEAD_MIN_SCORE:
+                continue
+            score = hit.get("score")
+            if threshold is not None and isinstance(score, (int, float)) and score < threshold:
+                continue
+            if filters and any(getattr(page, key, None) != value for key, value in filters.items()):
                 continue
             body_result = self.pages.read_body(slug)
             text = body_result[0] if body_result else str(hit.get("memory") or "")
@@ -3890,8 +4007,14 @@ class ReliquaryChatProxy:
         return []
 
     @staticmethod
-    def _get_all_kwargs(get_all: Any, *, user_id: str, top_k: int) -> dict[str, Any]:
-        """Build kwargs that work across Mem0 1.x and 2.x get_all signatures."""
+    def _get_all_kwargs(
+        get_all: Any, *, user_id: str, top_k: int, metadata_filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build kwargs that work across Mem0 1.x and 2.x get_all signatures.
+
+        Both versions pass metadata keys in ``filters`` through to the vector
+        store's payload filter; where ``filters`` is not accepted they are
+        dropped and the caller must filter the records itself."""
         kwargs: dict[str, Any] = {}
         try:
             parameters = inspect.signature(get_all).parameters
@@ -3899,7 +4022,7 @@ class ReliquaryChatProxy:
             parameters = {}
         has_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
         if "filters" in parameters or has_var_kwargs:
-            kwargs["filters"] = {"user_id": user_id}
+            kwargs["filters"] = {"user_id": user_id, **(metadata_filters or {})}
         if "user_id" in parameters:
             kwargs["user_id"] = user_id
         elif not kwargs:
@@ -4324,7 +4447,9 @@ class ReliquaryChatProxy:
             count = int(getattr(result, "count", 0))
         except Exception:
             LOG.debug("Could not read memory count for collection=%s; returning None", collection_name)
+            self._count_probe_failed = True
             return None
+        self._count_probe_failed = False
         self._count_cache = (time.monotonic(), count)
         return count
 
@@ -4599,6 +4724,18 @@ class RequestBodyTooLarge(Exception):
 
 
 @dataclass
+class _BackendFailure(list):
+    """An empty search result recording that the memory backend raised.
+
+    Callers that must never fail on memory (the chat proxy) use it as the
+    empty list it is; the MCP search tool checks for it to report an outage
+    instead of a successful empty search."""
+
+
+class MemoryBackendUnavailable(RuntimeError):
+    """The memory store could not be reached for a record lookup."""
+
+
 class _GlobalRoute:
     filters: dict[str, Any] | None = None
     description: str = "global"
