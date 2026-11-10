@@ -570,6 +570,11 @@ class ReliquaryChatProxy:
             method = scope["method"].upper()
             path = scope["path"]
 
+            body_cap = self._body_cap_for_path(path)
+            declared = decode_headers(scope).get("content-length", "").strip()
+            if body_cap and declared.isdigit() and int(declared) > body_cap:
+                raise RequestBodyTooLarge(body_cap)  # refuse before reading a byte
+
             if method == "OPTIONS":
                 await self.send_empty(send, 204)
                 return
@@ -725,6 +730,8 @@ class ReliquaryChatProxy:
                 return
 
             await self.send_json(send, 404, {"error": f"Unknown path: {path}"})
+        except RequestBodyTooLarge as exc:
+            await self.send_json(send, 413, {"error": "request_too_large", "max_bytes": exc.max_bytes})
         except Exception:
             # Only HTTP scopes can receive an http.response.* reply. For lifespan or
             # any other scope, sending one would emit invalid ASGI messages and mask
@@ -797,7 +804,7 @@ class ReliquaryChatProxy:
         payload: dict[str, Any] = {}
 
         if scope["method"].upper() == "POST":
-            body = await self.read_body(receive)
+            body = await self.read_body(receive, self.request_body_max_bytes())
             if body:
                 try:
                     payload = json.loads(body)
@@ -885,7 +892,7 @@ class ReliquaryChatProxy:
             await self.send_empty(send, 405, extra_headers={"allow": "POST, DELETE"})
             return
 
-        body = await self.read_body(receive)
+        body = await self.read_body(receive, self.request_body_max_bytes())
         if profile.name == "openai":
             # Request bodies + identifiers are sensitive; only at debug level.
             LOG.debug(
@@ -3423,7 +3430,7 @@ class ReliquaryChatProxy:
 
     async def handle_chat_completions(self, scope: dict[str, Any], receive, send) -> None:
         request_headers = decode_headers(scope)
-        body = await self.read_body(receive)
+        body = await self.read_body(receive, self.request_body_max_bytes())
         try:
             payload = json.loads(body or b"{}")
         except json.JSONDecodeError:
@@ -3533,7 +3540,7 @@ class ReliquaryChatProxy:
             return
 
         headers = decode_headers(scope)
-        body = await self.read_body(receive)
+        body = await self.read_body(receive, self.request_body_max_bytes())
         url = self.url_for(scope, base_url)
         response = await self.client.request(scope["method"], url, headers=self.forward_headers(headers), content=body)
         await send(
@@ -4274,21 +4281,31 @@ class ReliquaryChatProxy:
         }
         return {key: value for key, value in headers.items() if key not in excluded}
 
+    # /oauth/* forms and DCR metadata are tiny; they are read before any auth.
+    OAUTH_BODY_MAX_BYTES = 64 * 1024
+
+    def request_body_max_bytes(self) -> int:
+        """Cap for the authenticated JSON routes (MCP, /v1, debug search): an
+        inline base64 image at the blob limit plus 1 MiB for the JSON envelope.
+        0 (unlimited) only when the operator disabled the blob limit too."""
+        blob_max = self.settings.blob_max_bytes
+        if not blob_max:
+            return 0
+        return 4 * -(-blob_max // 3) + 1024 * 1024
+
+    def _body_cap_for_path(self, path: str) -> int:
+        if path.startswith("/oauth/"):
+            return self.OAUTH_BODY_MAX_BYTES
+        if UPLOAD_PATH_RE.fullmatch(path):
+            return 0  # the raw upload route enforces blob_max_bytes itself
+        return self.request_body_max_bytes()
+
     @staticmethod
-    async def read_body(receive) -> bytes:
-        chunks: list[bytes] = []
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                break  # client went away; stop instead of waiting forever
-            if message["type"] != "http.request":
-                continue
-            chunk = message.get("body", b"")
-            if chunk:
-                chunks.append(chunk)
-            if not message.get("more_body", False):
-                break
-        return b"".join(chunks)
+    async def read_body(receive, max_bytes: int = OAUTH_BODY_MAX_BYTES) -> bytes:
+        data = await ReliquaryChatProxy._read_body_limited(receive, max_bytes)
+        if data is None:
+            raise RequestBodyTooLarge(max_bytes)
+        return data
 
     @staticmethod
     async def send_empty(send, status: int, extra_headers: dict[str, str] | None = None) -> None:
@@ -4383,6 +4400,14 @@ class ReliquaryChatProxy:
         ]
         await send({"type": "http.response.start", "status": 302, "headers": headers})
         await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
+class RequestBodyTooLarge(Exception):
+    """Raised by read_body once a request body passes its cap; answered with 413."""
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(f"request body exceeds {max_bytes} bytes")
+        self.max_bytes = max_bytes
 
 
 @dataclass
