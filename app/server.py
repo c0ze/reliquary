@@ -3927,10 +3927,10 @@ class ReliquaryChatProxy:
         token = token.strip()
         if scheme.lower() != "bearer" or not token:
             return None
-        if profile.token and secrets.compare_digest(token, profile.token):
+        if profile.token and secrets.compare_digest(token.encode("utf-8"), profile.token.encode("utf-8")):
             return "write"
         for static_token, scope in self._static_tokens.items():
-            if secrets.compare_digest(token, static_token):
+            if secrets.compare_digest(token.encode("utf-8"), static_token.encode("utf-8")):
                 return scope
         resource = f"{self.oauth.base_url(headers)}{profile.path}"
         oauth_scope = self.oauth.access_token_scope(token, resource=resource)

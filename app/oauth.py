@@ -250,14 +250,15 @@ class OAuthProvider:
         # empty-vs-empty candidate would return True and let anyone mint a write-scoped token.
         if not self.master_token:
             return False
-        return secrets.compare_digest(candidate.strip(), self.master_token)
+        # Bytes, not str: compare_digest raises TypeError on non-ASCII str input.
+        return secrets.compare_digest(candidate.strip().encode("utf-8"), self.master_token.encode("utf-8"))
 
     def verify_client_id(self, candidate: str | None) -> bool:
         if self.fixed_client_id is None:
             return bool(candidate)
         if not candidate:
             return False
-        return secrets.compare_digest(candidate, self.fixed_client_id)
+        return secrets.compare_digest(candidate.encode("utf-8"), self.fixed_client_id.encode("utf-8"))
 
     def issue_code(self, params: dict[str, str]) -> str:
         code = secrets.token_urlsafe(32)
@@ -535,9 +536,9 @@ class OAuthProvider:
                 return False  # untrusted input; treat as PKCE failure, not a 500
             digest = hashlib.sha256(encoded).digest()
             computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-            return secrets.compare_digest(computed, challenge)
+            return secrets.compare_digest(computed.encode("utf-8"), challenge.encode("utf-8"))
         if method == "PLAIN":
-            return secrets.compare_digest(verifier, challenge)
+            return secrets.compare_digest(verifier.encode("utf-8"), challenge.encode("utf-8"))
         return False
 
 

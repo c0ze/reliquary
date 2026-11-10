@@ -190,3 +190,45 @@ def test_static_token_unknown_scope_is_read_and_warns(caplog):
     warned = " ".join(r.getMessage() for r in caplog.records)
     assert "a" in warned and "ro" in warned
     assert "t1" not in warned  # never log the token itself
+
+
+# --- 4. non-ASCII credentials -------------------------------------------------
+
+
+def _call_raw_headers(app, method, path, raw_headers, body=b""):
+    scope = {"type": "http", "method": method, "path": path, "query_string": b"", "headers": raw_headers}
+    sent = {"status": None}
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            sent["status"] = message["status"]
+
+    asyncio.run(app(scope, receive, send))
+    return sent["status"]
+
+
+@pytest.mark.parametrize("raw", ["café".encode("utf-8"), "café".encode("latin-1"), "東京".encode("utf-8")])
+def test_non_ascii_bearer_is_401_not_500(make_proxy, raw):
+    p = make_proxy(static_tokens=(("ro", "read", "static-tok"),))
+    status = _call_raw_headers(p, "POST", "/claude/mcp", [(b"authorization", b"Bearer " + raw)], _rpc("ping"))
+    assert status == 401
+
+
+def test_non_ascii_oauth_inputs_fail_cleanly():
+    from oauth import OAuthProvider
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", fixed_client_id="pinned")
+    assert p.verify_bearer("café") is False
+    assert p.verify_client_id("café") is False
+    assert p._verify_pkce("v" * 50, "défi", "S256") is False
+    assert p._verify_pkce("défi", "défi", "plain") is True
+
+
+def test_non_ascii_bearer_on_authorize_form_is_401(proxy):
+    _verifier, challenge = _pkce()
+    form = {"response_type": "code", "client_id": "c", "redirect_uri": "https://claude.ai/cb",
+            "code_challenge": challenge, "code_challenge_method": "S256", "bearer_token": "café"}
+    resp = _call(proxy, "POST", "/oauth/authorize", body=urlencode(form).encode())
+    assert resp["status"] == 401
