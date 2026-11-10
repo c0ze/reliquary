@@ -248,3 +248,47 @@ def test_page_json_without_the_invalidation_counter_loads(tmp_path):
     path.write_text(json.dumps(data))
     assert registry.get("pg").invalidations == 0
     assert registry.set_status("pg", "stale").invalidations == 1
+
+
+# e -- a failed add whose vector landed leaves no untracked vector -----------
+
+def _add_lands_then_fails(proxy, monkeypatch):
+    real_add = proxy.compiled_memory.add
+
+    def add(*args, **kwargs):
+        real_add(*args, **kwargs)  # Mem0 inserts the vector, then its history write fails
+        raise RuntimeError("history database is locked")
+
+    monkeypatch.setattr(proxy.compiled_memory, "add", add)
+
+
+def test_failed_first_compile_removes_the_vector_that_landed(proxy, monkeypatch):
+    _add_lands_then_fails(proxy, monkeypatch)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "newpage", "markdown": "body"}))
+    assert result["structuredContent"]["error"] == "index_failed"
+    assert proxy.pages.get("newpage") is None
+    assert proxy.compiled_memory._store == {}
+    assert result["structuredContent"]["index_confirmed"] is True
+
+
+def test_failed_first_compile_is_unconfirmed_when_the_index_cannot_be_listed(proxy, monkeypatch):
+    _add_lands_then_fails(proxy, monkeypatch)
+
+    def unavailable(*args, **kwargs):
+        raise ConnectionError("qdrant down")
+
+    monkeypatch.setattr(proxy.compiled_memory, "get_all", unavailable)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "newpage", "markdown": "body"}))
+    assert result["structuredContent"]["index_confirmed"] is False
+    assert "may remain" in result["content"][0]["text"]
+
+
+def test_failed_replacement_add_for_an_existing_page_is_cleaned_up(proxy, monkeypatch):
+    first = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "old"}))["structuredContent"]
+    del proxy.compiled_memory._store[first["memory_id"]]  # its record vanished (collection restored)
+    _add_lands_then_fails(proxy, monkeypatch)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "new"}))
+    assert result["structuredContent"]["error"] == "index_failed"
+    tracked = proxy.pages.get("pg").memory_id
+    assert [mid for mid, rec in proxy.compiled_memory._store.items() if rec["metadata"]["slug"] == "pg"] in ([], [tracked])
+    assert result["structuredContent"]["index_confirmed"] is False  # the restored revision is not indexed

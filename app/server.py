@@ -2633,16 +2633,28 @@ class ReliquaryChatProxy:
                 text = (f"Could not index page slug={slug}; another writer changed the page meanwhile, "
                         "so it was left as that writer filed it.")
             elif previous is None or not previous.memory_id:
-                confirmed = True
-                text = f"Could not index page slug={slug}; the page was not filed. Retry later."
+                # Mem0 inserts the vector before it can fail, so a failed add may
+                # still have left one behind; remove it.
+                confirmed = await self._purge_untracked_vectors(slug, user_id=user_id, keep=None)
+                if previous is None:
+                    text = (f"Could not index page slug={slug}; the page was not filed. Retry later."
+                            if confirmed else
+                            f"Could not index page slug={slug}; the page was not filed, but an index entry "
+                            "for it may remain (search ignores it while no page has this slug).")
+                else:
+                    text = f"Could not index page slug={slug}; the page was left as it was."
             else:
                 # The failed write may still have changed the index entry.
                 confirmed = await self._reindex_restored_page(slug, user_id=user_id)
+                restored = self.pages.get(slug)
+                purged = await self._purge_untracked_vectors(
+                    slug, user_id=user_id, keep=restored.memory_id if restored else None)
+                confirmed = confirmed and purged
                 text = (f"Could not index page slug={slug}; the page and its index entry are back at the "
                         "previous revision. Retry later." if confirmed else
                         f"Could not index page slug={slug}. Its previous revision was restored, but its index "
                         "entry could not be confirmed to match it.")
-            if not confirmed:
+            if not confirmed and previous is not None:
                 await asyncio.to_thread(self.pages.set_index_unconfirmed, slug)
                 text += " The page is listed under `unindexed` in reliquary://needs-review until it is re-filed."
             return self.mcp_tool_result(
@@ -2663,6 +2675,30 @@ class ReliquaryChatProxy:
             if getattr(info, key):
                 metadata[key] = getattr(info, key)
         return metadata
+
+    async def _purge_untracked_vectors(self, slug: str, *, user_id: str, keep: str | None) -> bool:
+        """Delete compiled vectors that carry ``slug`` in their metadata but are
+        not the page's tracked record ``keep`` (a failed add can land its vector
+        before Mem0 raises). True once none is left; False when the index could
+        not be listed or a stray could not be removed."""
+        try:
+            async with self.memory_lock.write():
+                get_all = self.compiled_memory.get_all
+                result = await asyncio.to_thread(get_all, **self._get_all_kwargs(
+                    get_all, user_id=user_id, top_k=100, metadata_filters={"slug": slug}))
+                strays = [str(record["id"]) for record in self._memory_results(result)
+                          if isinstance(record, dict) and record.get("id") and str(record["id"]) != keep
+                          and (record.get("metadata") or {}).get("slug") == slug]
+                for memory_id in strays:
+                    try:
+                        await asyncio.to_thread(self.compiled_memory.delete, memory_id)
+                    except Exception:
+                        if await asyncio.to_thread(self.compiled_memory.get, memory_id) is not None:
+                            raise
+        except Exception:
+            LOG.exception("Could not check the compiled index for stray vectors of slug=%s", slug)
+            return False
+        return True
 
     async def _reindex_restored_page(self, slug: str, *, user_id: str) -> bool:
         """After a failed compile was rolled back, make the page's index entry
