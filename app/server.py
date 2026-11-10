@@ -4903,7 +4903,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=os.getenv("RELIQUARY_OAUTH_VERBATIM_TOKEN", "false").lower() in {"1", "true", "yes"},
         help="Return the master bearer itself as the OAuth access_token (old behavior) instead of a "
-        "derived, revocable token. Default false.",
+        "derived, revocable token. Read-only grants still get a derived read token. Default false.",
     )
     parser.add_argument("--oauth-access-token-ttl", type=int, default=_env_int("RELIQUARY_OAUTH_ACCESS_TOKEN_TTL", 432000),
                         help="Access-token lifetime in seconds (default 5 days). Refresh rotation renews it.")

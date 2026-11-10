@@ -86,7 +86,8 @@ class OAuthProvider:
     keeps it in an in-memory store, so individual clients can be expired or
     revoked without touching the master bearer. Set ``issue_verbatim_token`` to
     fall back to the old behavior (return the master bearer as the access token)
-    for the simple single-user case.
+    for the simple single-user case; a read-only grant still gets a derived,
+    read-scoped token, because the master bearer always grants write.
 
     Optional hardening:
     - ``fixed_client_id``: if set, only this client_id is ever valid. DCR returns
@@ -322,7 +323,9 @@ class OAuthProvider:
             return None, (400, "invalid_grant", "PKCE verification failed")
 
         scope = entry.scope or "mcp"
-        if self.issue_verbatim_token:
+        # The master bearer always resolves to write, so a read-only grant
+        # gets a derived, read-scoped token even in verbatim mode.
+        if self.issue_verbatim_token and scope_is_write(scope):
             return (
                 {"access_token": self.master_token, "token_type": "Bearer", "scope": scope},
                 None,

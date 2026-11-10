@@ -228,7 +228,7 @@ file** (`config.yaml`). Run `python app/server.py --help` for every flag.
 | `RELIQUARY_OPENAI_MCP_TOKEN` | — | Bearer for `/openai/mcp` (OAuth also works; required for any access, write-capable by scope) |
 | `RELIQUARY_OAUTH_CLIENT_ID` | — | Pin the OAuth client id; only this id is accepted |
 | `RELIQUARY_OAUTH_ALLOW_REGISTRATION` | `true` | Allow `POST /oauth/register` (DCR). Disable after the connector registers once |
-| `RELIQUARY_OAUTH_VERBATIM_TOKEN` | `false` | Return the master bearer verbatim instead of a derived, revocable token |
+| `RELIQUARY_OAUTH_VERBATIM_TOKEN` | `false` | Return the master bearer verbatim instead of a derived, revocable token. A read-only grant (`scope=read`) still gets a derived read token, since the master bearer always grants write |
 | `RELIQUARY_DATASET_PATH` | — | Curated JSONL (or dir) enabling taxonomy routing + `fetch` bootstrap docs |
 | `RELIQUARY_EMBEDDER_PROVIDER` / `_MODEL` / `_BASE_URL` / `_API_KEY` / `_DIMS` | — | Synthesize an embedder block without editing `config.yaml` |
 | `RELIQUARY_NATIVE_HYBRID` | `auto` | `auto`/`on`/`off` — detect/assume/disable mem0's server-side BM25 hybrid; see [Native hybrid search](#native-hybrid-search) |
@@ -449,7 +449,10 @@ Claude.ai Custom Connectors speak OAuth. Reliquary ships a small OAuth 2.1 shim:
    Claude registers itself via DCR.
 2. Claude opens a browser authorize page (`/oauth/authorize`). **Paste your
    `RELIQUARY_CLAUDE_MCP_TOKEN`** there and authorize. The connector receives a
-   **derived, revocable** token (not the master). The page shows the redirect
+   **derived, revocable** token (not the master; with
+   `RELIQUARY_OAUTH_VERBATIM_TOKEN=true` a write grant receives the master
+   bearer itself, but a read-only grant still gets a derived read token).
+   The page shows the redirect
    host, the client_id, the raw scope and the access it will get (read-only or
    read and write); redirect URIs with userinfo (`user@host`), backslashes or
    control characters are refused.
