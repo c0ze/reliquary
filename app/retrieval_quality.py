@@ -104,6 +104,12 @@ def apply_retrieval_quality(
     return selected
 
 
+def quality_score(query: str, hit: dict[str, Any], *, now: float | None = None) -> float:
+    """The ranking key ``apply_retrieval_quality`` selects by, for one hit."""
+    current_time = time.time() if now is None else now
+    return _quality_score(hit, query_terms=_content_terms(query), now=current_time)
+
+
 def _is_correction(hit: dict[str, Any]) -> bool:
     metadata = hit.get("metadata")
     return isinstance(metadata, dict) and metadata.get("kind") == "correction"

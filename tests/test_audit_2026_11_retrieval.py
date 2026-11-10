@@ -5,11 +5,79 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 
+import server
 from catalog import CorpusCatalog, CorpusRecord
+
+
+class ScoredMemory:
+    """In-memory fake with Mem0 2.x call shapes: the entity id travels inside
+    ``filters``, ``top_k`` caps results, scores come from ``scorer`` and
+    metadata keys in ``filters`` match the stored metadata (as the Qdrant
+    payload filter does). ``threshold`` is ignored unless honour_threshold."""
+
+    def __init__(self, scorer=None, *, honour_threshold=False):
+        self._store: dict[str, dict] = {}
+        self._n = 0
+        self.scorer = scorer or (lambda query, record: 0.5)
+        self.honour_threshold = honour_threshold
+        self.search_calls: list[dict] = []
+        self.get_all_calls: list[dict] = []
+
+    def _match(self, record, filters):
+        filters = dict(filters or {})
+        user_id = filters.pop("user_id", None)
+        if user_id is not None and record["user_id"] != user_id:
+            return False
+        metadata = record.get("metadata") or {}
+        return all(metadata.get(key) == value for key, value in filters.items())
+
+    def search(self, query, *, top_k=20, filters=None, threshold=None):
+        self.search_calls.append({"top_k": top_k, "filters": filters, "threshold": threshold})
+        hits = []
+        for record in self._store.values():
+            if not self._match(record, filters):
+                continue
+            score = self.scorer(query, record)
+            if self.honour_threshold and threshold is not None and score < threshold:
+                continue
+            hits.append(dict(record, score=score))
+        hits.sort(key=lambda hit: -hit["score"])
+        return {"results": hits[:top_k]}
+
+    def get(self, memory_id):
+        record = self._store.get(memory_id)
+        return dict(record) if record else None
+
+    def get_all(self, *, filters=None, top_k=20):
+        self.get_all_calls.append({"filters": filters, "top_k": top_k})
+        records = [dict(r) for r in self._store.values() if self._match(r, filters)]
+        return {"results": records[:top_k]}
+
+    def add(self, text, *, user_id=None, metadata=None, infer=False, created_at=None):
+        self._n += 1
+        memory_id = f"00000000-0000-4000-8000-{self._n:012d}"
+        self._store[memory_id] = {
+            "id": memory_id, "memory": text, "metadata": dict(metadata or {}), "user_id": user_id,
+            "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+        }
+        return {"results": [{"id": memory_id, "event": "ADD"}]}
+
+    def delete(self, memory_id):
+        if memory_id not in self._store:
+            raise ValueError(f"Memory with id {memory_id} not found")
+        del self._store[memory_id]
+
+    def update(self, memory_id, data, metadata=None):
+        record = self._store[memory_id]
+        record["memory"] = data
+        if metadata is not None:
+            record["metadata"] = dict(metadata)
+        return {"message": "ok"}
 
 
 def call(proxy, name, arguments, *, endpoint="openai", can_write=True):
@@ -266,3 +334,51 @@ def test_lean_search_shows_correction_beside_its_original_with_status(proxy):
     assert items[correction_id]["status"] == "proposed"
     assert items[correction_id]["target_id"] == "nas-1"
     assert "kind" not in items["nas-1"] and "status" not in items["nas-1"]
+
+
+# ---------------------------------------------------------------------------
+# 6. Cursor pagination must partition one stable ranking
+# ---------------------------------------------------------------------------
+
+def _paginate(proxy, query, *, limit, pages, endpoint="openai", **extra):
+    tool = "search" if endpoint == "openai" else "reliquary_search"
+    seen, cursor = [], None
+    for _ in range(pages):
+        arguments = {"query": query, "limit": limit, **extra}
+        if cursor:
+            arguments["cursor"] = cursor
+        structured = call(proxy, tool, arguments, endpoint=endpoint)["structuredContent"]
+        seen += [item["id"] for item in structured["results"]]
+        cursor = structured["nextCursor"]
+        if not cursor:
+            break
+    return seen
+
+
+def test_pagination_pages_partition_one_ranking(make_proxy):
+    old = (datetime.now(timezone.utc) - timedelta(days=900)).isoformat()
+    words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet",
+             "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango"]
+    boosted = {8, 20, 22, 30, 40}
+    scores: dict[str, float] = {}
+    memory = ScoredMemory(lambda query, record: scores[record["id"]])
+    for i in range(60):
+        unique = " ".join(words[(i * 7 + j * 3) % 20] + str(i) for j in range(8))
+        added = memory.add(
+            f"record{i} {unique}" + (" zeppelin hangar" if i in boosted else ""),
+            user_id="my_lord", created_at=None if i in boosted else old,
+            metadata={"title": f"r{i}", "source_group": "imported", "import_record_id": f"r{i}"},
+        )
+        scores[added["results"][0]["id"]] = 0.90 - i * 0.004
+    proxy = make_proxy(memory=memory)
+
+    by_five = _paginate(proxy, "zeppelin hangar", limit=5, pages=6)
+    assert len(by_five) == 30
+    assert len(set(by_five)) == 30, "a record repeated across pages"
+    # The same ranking, sliced differently, gives the same sequence.
+    assert _paginate(proxy, "zeppelin hangar", limit=15, pages=2) == by_five
+    # The vector pool is the same size on every page.
+    assert len({c["top_k"] for c in memory.search_calls}) == 1
+    # The quality key (lexical + recency bonus) orders the pages, not just the cut:
+    # the fresh records that match the query lead.
+    assert by_five[:4] == ["r8", "r20", "r22", "r30"]

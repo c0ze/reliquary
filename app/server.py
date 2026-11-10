@@ -58,7 +58,7 @@ from helpers import (
     safe_mcp_headers,
     trim_text,
 )
-from retrieval_quality import apply_retrieval_quality, retrieval_candidate_limit
+from retrieval_quality import apply_retrieval_quality, quality_score, retrieval_candidate_limit
 
 
 LOG = logging.getLogger("reliquary")
@@ -69,6 +69,9 @@ MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
 LIVE_LEXICAL_SCAN_LIMIT = 5000
+# Search ranks one pool of up to this many hits per route, whatever the cursor,
+# and every page is a slice of that one ranking (which bounds the depth).
+SEARCH_RANKING_DEPTH = 100
 # Soft score bonus that floats project-matching memory up when caller context is
 # supplied (#42). Additive, excludes nothing; a no-op when context is absent.
 CONTEXT_MATCH_BONUS = 0.1
@@ -2095,10 +2098,9 @@ class ReliquaryChatProxy:
             offset = max(0, int(arguments.get("cursor") or 0))
         except (TypeError, ValueError):
             offset = 0
-        # Reject (not clamp) offsets past the cap: result_cap below feeds search
-        # top_k and the O(n²) dedup pass, so an unbounded cursor is a resource-
-        # exhaustion vector — and silently clamping would return the same page
-        # with the same nextCursor forever. 400 = 20 pages at the max limit.
+        # Reject (not clamp) offsets past the cap: silently clamping would return
+        # the same page with the same nextCursor forever. 400 = 20 pages at the
+        # max limit.
         if offset > 400:
             return self.mcp_tool_result(
                 text="Cursor is past the pagination cap (400); restart the search or narrow it with filters.",
@@ -2118,7 +2120,14 @@ class ReliquaryChatProxy:
                 minimum=100, maximum=SEARCH_PREVIEW_CHAR_CAP_MAX,
             )
 
-        result_cap = offset + limit + 1
+        # The candidate pool must not depend on the cursor: a pool that grew with
+        # the offset was re-ranked on every page, so pages repeated and skipped
+        # records. Every page ranks the same pool and slices it.
+        result_cap = max(SEARCH_RANKING_DEPTH, limit + 1)
+        # Order by the key apply_retrieval_quality selected by (vector score plus
+        # lexical and recency bonuses), computed on the raw hit before enrichment.
+        rank_now = time.time()
+        rank_scores: dict[str, float] = {}
 
         # Build explicit metadata filters from caller-supplied taxonomy params.
         # When any are present, bypass catalog routing and run a single hard-filtered
@@ -2131,13 +2140,15 @@ class ReliquaryChatProxy:
         if explicit:
             # Hard-filter path: one search with the explicit filters; no catalog routing.
             hits = await self.search_memories(
-                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=explicit
+                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=explicit,
+                lexical_min_hits=limit,
             )
             by_key: dict[str, dict[str, Any]] = {}
             for hit in hits:
                 enriched = self._enrich_hit(hit, route="explicit-filter")
                 key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
                 by_key[key] = enriched
+                rank_scores[key] = quality_score(query, hit, now=rank_now)
             raw_results = sorted(
                 by_key.values(),
                 key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)
@@ -2162,7 +2173,8 @@ class ReliquaryChatProxy:
             by_key = {}
             for route in routes:
                 hits = await self.search_memories(
-                    query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters
+                    query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters,
+                    lexical_min_hits=limit,
                 )
                 for hit in hits:
                     enriched = self._enrich_hit(hit, route=route.description)
@@ -2170,6 +2182,7 @@ class ReliquaryChatProxy:
                     existing = by_key.get(key)
                     if existing is None or self._numeric_score(enriched.get("score")) > self._numeric_score(existing.get("score")):
                         by_key[key] = enriched
+                        rank_scores[key] = quality_score(query, hit, now=rank_now)
 
             # Order by relevance score across ALL routes, not by route priority, so the
             # best hit (e.g. an exact lexical match) ranks first wherever it came from.
@@ -2190,11 +2203,15 @@ class ReliquaryChatProxy:
         # dedupe is a safety guard, not a real overlap risk.
         synthesis_ids = {str(s.get("id")) for s in synthesis_results}
         combined = synthesis_results + [r for r in raw_results if str(r.get("id")) not in synthesis_ids]
+        for synthesis in synthesis_results:
+            rank_scores[str(synthesis.get("id"))] = quality_score(query, synthesis, now=rank_now)
         # A synthesis wins close relevance comparisons, not every comparison.
         # Unconditional concatenation buried exact raw matches beneath unrelated
         # pages, even when their vector scores were much lower.
         combined.sort(key=lambda item: (
-            -(self._numeric_score(item.get("score")) + self._context_bonus(item, context)
+            -(rank_scores.get(str(item.get("id") or item.get("url") or item.get("title")),
+                              self._numeric_score(item.get("score")))
+              + self._context_bonus(item, context)
               + self._exact_match_bonus(item, query)
               + (COMPILED_RANK_BONUS if item.get("route") == "synthesis" else 0.0)),
             str(item.get("id") or ""),
@@ -3576,6 +3593,7 @@ class ReliquaryChatProxy:
         limit: int,
         threshold: float | None,
         filters: dict[str, Any] | None,
+        lexical_min_hits: int | None = None,
     ) -> list[dict[str, Any]]:
         candidate_limit = retrieval_candidate_limit(limit)
         kwargs: dict[str, Any] = {self._search_limit_param: candidate_limit}
@@ -3605,7 +3623,9 @@ class ReliquaryChatProxy:
         if not isinstance(hits, list):
             return []
         live_hits: list[dict[str, Any]] = []
-        if self._should_run_lexical(query, hits, limit):
+        # The "thin results" gate compares with the page size, not the ranking
+        # pool, so a deep pool does not turn the fallback on for every query.
+        if self._should_run_lexical(query, hits, limit if lexical_min_hits is None else lexical_min_hits):
             live_hits = await self.live_lexical_matches(
                 query,
                 user_id=user_id,

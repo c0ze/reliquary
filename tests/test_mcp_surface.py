@@ -143,7 +143,7 @@ def test_search_pagination(proxy, monkeypatch):
         for index in range(5)
     ]
 
-    async def fake_search_memories(query, *, user_id, limit, threshold, filters):
+    async def fake_search_memories(query, *, user_id, limit, threshold, filters, **_):
         assert query == "memory"
         assert user_id == "my_lord"
         return hits[:limit]
