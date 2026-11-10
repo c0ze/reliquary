@@ -649,3 +649,47 @@ def test_cancelled_waiting_writer_wakes_blocked_readers():
             await waiting_writer
 
     run(scenario())
+
+
+# 16 -- vault export prunes the files it wrote earlier, and only those -------
+
+def test_export_vault_prunes_its_own_stale_files_only(tmp_path):
+    import export_vault
+    from blobs import BlobStore
+    from compiled import PageRegistry
+
+    registry = PageRegistry(str(tmp_path / "compiled"), BlobStore(str(tmp_path / "blobs"), b"k"))
+    registry.put_revision("moved", "body", {"domain": "pagan"})
+    registry.put_revision("gone", "body", {"domain": "infra"})
+    registry.put_revision("kept", "body", {"domain": "pagan"})
+    out = tmp_path / "vault"
+    assert export_vault.export_vault(registry, str(out)) == 3
+    (out / "pagan" / "my-own-note.md").write_text("written by the user")
+    (out / "notes").mkdir()
+    (out / "notes" / "gone.md").write_text("same name, not exported")
+
+    registry.put_revision("moved", "body", {"domain": "music"})
+    registry.delete("gone")
+    assert export_vault.export_vault(registry, str(out)) == 2
+
+    assert (out / "music" / "moved.md").exists()
+    assert not (out / "pagan" / "moved.md").exists()
+    assert not (out / "infra").exists()
+    assert (out / "pagan" / "kept.md").exists()
+    assert (out / "pagan" / "my-own-note.md").read_text() == "written by the user"
+    assert (out / "notes" / "gone.md").exists()
+
+
+def test_export_vault_ignores_hostile_manifest_entries(tmp_path):
+    import export_vault
+    from blobs import BlobStore
+    from compiled import PageRegistry
+
+    registry = PageRegistry(str(tmp_path / "compiled"), BlobStore(str(tmp_path / "blobs"), b"k"))
+    out = tmp_path / "vault"
+    out.mkdir()
+    victim = tmp_path / "victim.md"
+    victim.write_text("outside the vault")
+    (out / export_vault.MANIFEST_NAME).write_text(json.dumps({"files": ["../victim.md", "x/../../victim.md"]}))
+    export_vault.export_vault(registry, str(out))
+    assert victim.exists()
