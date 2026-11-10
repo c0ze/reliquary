@@ -93,7 +93,11 @@ def test_openai_unexpected_retrieval_error_returns_json_text(proxy, monkeypatch)
 
     monkeypatch.setattr(proxy, "handle_search_tool", fail)
     result = call(proxy, "search", {"query": "protocol"})
-    assert assert_json_error(result) == {"error": "synthetic failure"}
+    payload = assert_json_error(result)
+    # The exception text stays in the server log, not in the client result.
+    assert payload["error"] == "internal_error"
+    assert payload["error_id"]
+    assert "synthetic failure" not in result["content"][0]["text"]
 
 
 @pytest.mark.parametrize("tool", ["search", "fetch"])

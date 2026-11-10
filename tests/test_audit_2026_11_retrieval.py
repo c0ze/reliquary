@@ -122,3 +122,35 @@ def test_claude_error_results_keep_structured_content(proxy):
     result = call(proxy, "reliquary_fetch", {"id": "nope"}, endpoint="claude")
     assert result["isError"] is True
     assert result["structuredContent"]["error"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# 2. Unexpected tool exceptions must not echo raw exception text
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("endpoint,tool", [("claude", "reliquary_search"), ("openai", "search")])
+def test_tool_exception_hides_detail_and_logs_it_under_an_error_id(proxy, monkeypatch, caplog, endpoint, tool):
+    secret = "https://admin:sk-live-123@qdrant.internal:6333"
+
+    async def fail(*args, **kwargs):
+        raise ConnectionError(f"cannot reach {secret}")
+
+    monkeypatch.setattr(proxy, "handle_search_tool", fail)
+    with caplog.at_level(logging.ERROR, logger="reliquary"):
+        result = call(proxy, tool, {"query": "anything"}, endpoint=endpoint)
+    assert result["isError"] is True
+    serialized = json.dumps(result)
+    assert secret not in serialized and "sk-live" not in serialized
+    payload = result.get("structuredContent") or json.loads(result["content"][0]["text"])
+    assert payload["error"] == "internal_error"
+    error_id = payload["error_id"]
+    assert error_id in result["content"][0]["text"]
+    logged = "\n".join(record.getMessage() + (record.exc_text or "") for record in caplog.records)
+    assert error_id in logged
+    assert any(record.exc_info and secret in str(record.exc_info[1]) for record in caplog.records)
+
+
+def test_deliberate_validation_errors_keep_their_messages(proxy):
+    result = call(proxy, "reliquary_update", {"id": "x", "text": "t", "metadata": "nope"}, endpoint="claude")
+    assert result["structuredContent"] == {"error": "invalid_metadata"}
+    assert result["content"][0]["text"] == "`metadata` must be an object."

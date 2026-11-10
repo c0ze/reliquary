@@ -2048,11 +2048,14 @@ class ReliquaryChatProxy:
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_propose_update_tool(arguments, allow_user_id=True)
-        except Exception as exc:
-            LOG.exception("MCP tool failed: %s", tool_name)
+        except Exception:
+            # The exception text can carry backend hosts or credentials in URLs;
+            # log it under an id and give the client only the id.
+            error_id = secrets.token_hex(6)
+            LOG.exception("MCP tool failed [%s]: %s", error_id, tool_name)
             return self.mcp_tool_result(
-                text=f"{tool_name} failed: {exc}",
-                structured={"error": str(exc)},
+                text=f"{tool_name} failed with an internal error (error_id={error_id}); see the server log.",
+                structured={"error": "internal_error", "error_id": error_id},
                 is_error=True,
             )
 
