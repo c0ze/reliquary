@@ -2157,11 +2157,10 @@ class ReliquaryChatProxy:
             )
             # Synthesis-first: apply ALL explicit filters so every taxonomy dimension
             # (domain, hall, room, topic) enforces the same hard-restrict guarantee (Fix 1).
-            synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
-            synthesis_results = [
-                s for s in synthesis_results
-                if all((s.get("metadata") or {}).get(k) == v for k, v in explicit.items())
-            ]
+            # Filtered inside, before the limit cut, so out-of-scope pages that
+            # score higher cannot crowd the matching page out.
+            synthesis_results = await self._synthesis_first_hits(
+                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=explicit)
             routes_used = [f"explicit-filter({', '.join(f'{k}={v}' for k, v in explicit.items())})"]
         else:
             routes = self.catalog.build_routes(query) if self.catalog else [_GlobalRoute()]
@@ -2195,7 +2194,8 @@ class ReliquaryChatProxy:
                                   str(item.get("id") or "")),
             )
             # Synthesis-first (#50): a current synthesis leads; raw hits follow as evidence.
-            synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
+            synthesis_results = await self._synthesis_first_hits(
+                query, user_id=user_id, limit=result_cap, threshold=threshold)
             routes_used = [route.description for route in routes]
 
         # Use result_cap (not limit) so paginated pages past the first still see syntheses.
@@ -3711,7 +3711,10 @@ class ReliquaryChatProxy:
         matches.sort(key=lambda hit: (-self._numeric_score(hit.get("score")), str(hit.get("id") or "")))
         return matches[:limit]
 
-    async def _synthesis_first_hits(self, query: str, *, user_id: str, limit: int) -> list[dict[str, Any]]:
+    async def _synthesis_first_hits(
+        self, query: str, *, user_id: str, limit: int,
+        threshold: float | None = None, filters: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Compiled-layer pre-pass for synthesis-first retrieval (#50).
 
         Returns current (non-stale) synthesis pages matching the query, shaped like
@@ -3721,10 +3724,19 @@ class ReliquaryChatProxy:
         if self.compiled_memory is None or self.pages is None or limit <= 0:
             return []
         kwargs: dict[str, Any] = {self._search_limit_param: retrieval_candidate_limit(limit)}
+        if threshold is not None:
+            kwargs["threshold"] = threshold
+        # Taxonomy filters go into the vector search too (the compiled index
+        # carries domain/hall/room/topic), so the candidate pool is in scope;
+        # the registry check below stays authoritative.
+        search_filters: dict[str, Any] = dict(filters or {})
         if self._search_user_id_param:
             kwargs["user_id"] = user_id
+            if search_filters and self._search_supports_filters:
+                kwargs["filters"] = search_filters
         else:
-            kwargs["filters"] = {"user_id": user_id}
+            search_filters["user_id"] = user_id
+            kwargs["filters"] = search_filters
         try:
             async with self._read_lock():
                 result = await asyncio.to_thread(self.compiled_memory.search, query, **kwargs)
@@ -3746,6 +3758,11 @@ class ReliquaryChatProxy:
             if page is None or page.status != "current":
                 continue
             if self._numeric_score(hit.get("score")) < COMPILED_LEAD_MIN_SCORE:
+                continue
+            score = hit.get("score")
+            if threshold is not None and isinstance(score, (int, float)) and score < threshold:
+                continue
+            if filters and any(getattr(page, key, None) != value for key, value in filters.items()):
                 continue
             body_result = self.pages.read_body(slug)
             text = body_result[0] if body_result else str(hit.get("memory") or "")

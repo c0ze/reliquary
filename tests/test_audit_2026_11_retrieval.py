@@ -382,3 +382,49 @@ def test_pagination_pages_partition_one_ranking(make_proxy):
     # The quality key (lexical + recency bonus) orders the pages, not just the cut:
     # the fresh records that match the query lead.
     assert by_five[:4] == ["r8", "r20", "r22", "r30"]
+
+
+# ---------------------------------------------------------------------------
+# 8. threshold applies to compiled pages too
+# ---------------------------------------------------------------------------
+
+def test_threshold_excludes_low_scoring_synthesis(make_proxy):
+    compiled = ScoredMemory(lambda query, record: 0.15)
+    proxy = make_proxy(memory=ScoredMemory(lambda query, record: 0.95), compiled_memory=compiled)
+    call(proxy, "reliquary_add_memory", {"text": "raw strong match"}, endpoint="claude")
+    assert not call(proxy, "reliquary_compile_page", {"slug": "weak-page", "markdown": "barely related"},
+                    endpoint="claude")["isError"]
+
+    results = call(proxy, "reliquary_search", {"query": "x", "threshold": 0.9},
+                   endpoint="claude")["structuredContent"]["results"]
+    assert [item["route"] for item in results] == ["global"]
+    assert compiled.search_calls[-1]["threshold"] == 0.9
+
+    results = call(proxy, "reliquary_search", {"query": "x"}, endpoint="claude")["structuredContent"]["results"]
+    assert "weak-page" in [item["id"] for item in results]
+
+
+# ---------------------------------------------------------------------------
+# 9. Explicit taxonomy filters apply to syntheses before the limit cut
+# ---------------------------------------------------------------------------
+
+def _compile_ranked_pages(proxy, scores):
+    for slug, (score, domain) in scores.items():
+        result = call(proxy, "reliquary_compile_page",
+                      {"slug": slug, "markdown": f"page {slug}", "domain": domain}, endpoint="claude")
+        assert not result["isError"]
+
+
+def test_explicit_domain_keeps_matching_synthesis_behind_higher_scoring_pages(make_proxy):
+    scores = {f"other-{i}": (0.9 - i * 0.01, "life") for i in range(12)}
+    scores["dev-page"] = (0.7, "dev")
+    compiled = ScoredMemory(lambda query, record: scores[record["metadata"]["slug"]][0])
+    proxy = make_proxy(memory=ScoredMemory(), compiled_memory=compiled)
+    _compile_ranked_pages(proxy, scores)
+
+    results = call(proxy, "reliquary_search", {"query": "x", "domain": "dev", "limit": 1},
+                   endpoint="claude")["structuredContent"]["results"]
+    assert [item["id"] for item in results] == ["dev-page"]
+    # The filter runs before the cut inside the compiled pre-pass itself.
+    hits = asyncio.run(proxy._synthesis_first_hits("x", user_id="my_lord", limit=1, filters={"domain": "dev"}))
+    assert [hit["id"] for hit in hits] == ["dev-page"]
