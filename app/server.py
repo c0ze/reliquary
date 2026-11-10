@@ -3030,6 +3030,7 @@ class ReliquaryChatProxy:
                 is_error=True,
             )
 
+        self._fan_out_staleness([memory_id], metadata)
         blob_id = upload.blob_id
         mimetype = upload.mimetype
         size = upload.size
@@ -3212,6 +3213,7 @@ class ReliquaryChatProxy:
                 structured={"error": "ownership_registration_failed", "blob_id": info.id, "memory_id": memory_id},
                 is_error=True,
             )
+        self._fan_out_staleness([memory_id], metadata)
         url = self._signed_blob_url(info.id)
         return self.mcp_tool_result(
             text=f"Stored image (blob_id={info.id}, memory_id={memory_id}): {trim_text(caption, 160)}",

@@ -508,3 +508,27 @@ def test_startup_keeps_a_slot_with_an_unknown_field(make_proxy, tmp_path):
         "upl_new": {"id": "upl_new", "created_at": 1.0, "expires_at": 1e12, "added_later": True}}))
     proxy = make_proxy(state_dir=str(state))
     assert proxy.pending_uploads["upl_new"].expires_at == 1e12
+
+
+# 12 -- image writes mark dependent pages stale, like add_memory ------------
+
+def test_add_image_marks_same_topic_page_stale(proxy):
+    import base64
+
+    run(call(proxy, "reliquary_compile_page", {"slug": "topicpage", "markdown": "x", "domain": "d", "topic": "t"}))
+    run(call(proxy, "reliquary_add_image", {"caption": "new evidence", "domain": "d", "topic": "t",
+                                            "image_base64": base64.b64encode(PNG).decode()}))
+    assert proxy.pages.get("topicpage").status == "stale"
+
+
+def test_commit_image_upload_marks_same_topic_page_stale(proxy):
+    async def scenario():
+        await call(proxy, "reliquary_compile_page", {"slug": "topicpage", "markdown": "x", "domain": "d", "topic": "t"})
+        slot = (await call(proxy, "reliquary_create_image_upload", {}))["structuredContent"]["upload_id"]
+        assert (await post_bytes(proxy, slot)).status_code == 201
+        committed = await call(proxy, "reliquary_commit_image_upload",
+                               {"upload_id": slot, "caption": "new evidence", "domain": "d", "topic": "t"})
+        assert committed["isError"] is False
+
+    run(scenario())
+    assert proxy.pages.get("topicpage").status == "stale"
