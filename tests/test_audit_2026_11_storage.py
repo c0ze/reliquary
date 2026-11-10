@@ -572,3 +572,41 @@ def test_lint_reports_orphan_blobs_but_not_referenced_ones(make_proxy, tmp_path)
     without_state = lint.build_report(compiled_dir=proxy.settings.compiled_dir, blob_dir=proxy.settings.blob_dir,
                                       dataset_path=None, min_count=8)
     assert {item["id"] for item in without_state["orphan_blobs"]} == {leaked, pending}
+
+
+# 13 -- the retrieval-stats log is bounded and aggregated off the event loop --
+
+def test_retrieval_stats_log_rotates_and_aggregates_both_files(tmp_path):
+    from retrieval_stats import RetrievalStatsLog, aggregate
+
+    path = tmp_path / "stats.jsonl"
+    log = RetrievalStatsLog(str(path), clock=lambda: 1.0, max_bytes=2000)
+    for i in range(200):
+        log.record("search", [{"id": f"rec-{i}", "domain": "dev", "topic": "t"}])
+    assert path.stat().st_size <= 2000 + 200
+    assert (tmp_path / "stats.jsonl.1").stat().st_size <= 2000 + 200
+    agg = aggregate(str(path))
+    total_lines = sum(1 for _ in open(path)) + sum(1 for _ in open(f"{path}.1"))
+    assert agg["events"] == total_lines < 200
+    assert "rec-199" in agg["by_id"]
+
+
+def test_resources_read_runs_off_the_event_loop(proxy, monkeypatch):
+    offloaded = []
+    inline = asyncio.to_thread
+
+    async def recording_to_thread(func, /, *args, **kwargs):
+        offloaded.append(getattr(func, "__name__", repr(func)))
+        return await inline(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", recording_to_thread)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=proxy), base_url="http://t") as client:
+            return await client.post("/claude/mcp", headers={"authorization": "Bearer claude-secret"}, json={
+                "jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": "reliquary://needs-review"}})
+
+    response = run(scenario())
+    assert response.status_code == 200, response.text
+    assert "unindexed" in response.json()["result"]["contents"][0]["text"]
+    assert "read_resource" in offloaded

@@ -1000,7 +1000,8 @@ class ReliquaryChatProxy:
 
         if request_method == "resources/read":
             uri = str(params.get("uri") or "")
-            contents = self.read_resource(uri)
+            # needs-review folds the whole retrieval-stats log: keep it off the loop.
+            contents = await asyncio.to_thread(self.read_resource, uri)
             if contents is None:
                 await self.send_json(send, 200, self.mcp_error(request_id, -32602, f"Unknown resource: {uri}"))
                 return

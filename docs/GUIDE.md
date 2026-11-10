@@ -621,10 +621,12 @@ Key environment variables:
 **Retrieval usage stats.** When `RELIQUARY_RETRIEVAL_STATS_PATH` is set, the
 server appends an event to that JSONL log for each search hit and fetch. Nothing
 reads it live — `python app/lint.py` aggregates it offline (`--stats-path`, or the
-env var) into two additional proposal categories, alongside the existing ones:
+env var) into two additional proposal categories, alongside the existing ones.
+The log rotates at 16 MiB, keeping one previous file (`<path>.1`), so it stays
+bounded and older events age out of the counts:
 
-- **`cold_records`** — imported records that have never been retrieved since
-  stats collection began; candidates to archive. Suppressed until the log has
+- **`cold_records`** — imported records that have not been retrieved within the
+  retained log; candidates to archive. Suppressed until the log has
   at least `RELIQUARY_LINT_COLD_MIN_EVENTS` (default `200`, `--cold-min-events`)
   total events, so a freshly-enabled or sparse log doesn't flag live corpus.
 - **`hot_topics`** — domain/topic pairs with `>= --hot-topic-min` retrievals
