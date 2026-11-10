@@ -866,7 +866,10 @@ sequence: `/.well-known/*` → `/oauth/register` → `/oauth/authorize` →
   connectors out. Revoking a *refresh* token via `/oauth/revoke` drops the whole
   rotation family; revoking an access token removes just that token. The state
   files store SHA-256 hashes of the tokens, never the tokens; files written by
-  older versions are converted on first load.
+  older versions are converted on first load. The conversion is one-way: a
+  version before 0.5.2 cannot use converted files (it rejects every client's
+  token), so copy `oauth_tokens.json` and `oauth_refresh_tokens.json` aside
+  before upgrading if you might roll back, and restore them with the old image.
 - **MCP sessions are bounded per credential**: one credential holds at most 128
   of the 512 sessions, and a full table evicts the caller's own oldest
   session first. A session belongs to the credential and endpoint that

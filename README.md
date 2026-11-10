@@ -250,7 +250,10 @@ config file (see [config.example.yaml](config.example.yaml)). Highlights:
   connectors out. Revoking a *refresh* token via `/oauth/revoke` drops the whole
   rotation family; revoking an access token removes just that token. The state
   files store SHA-256 hashes of the tokens, never the tokens; files written by
-  older versions are converted on first load.
+  older versions are converted on first load. The conversion is one-way: a
+  version before 0.5.2 cannot use converted files (it rejects every client's
+  token), so copy `oauth_tokens.json` and `oauth_refresh_tokens.json` aside
+  before upgrading if you might roll back, and restore them with the old image.
 - **Mem0 telemetry is off.** Mem0 reports anonymous usage to PostHog unless
   `MEM0_TELEMETRY` is false; the image, the compose file and both CLIs default it
   to `false` (set `MEM0_TELEMETRY=true` to opt in).

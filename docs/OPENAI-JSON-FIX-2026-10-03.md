@@ -62,6 +62,15 @@ to `/home/arda/reliquary-deploy/docker-compose.override.yml`, then run
 `docker compose up -d --no-deps app` from that deployment directory. Do not
 restore older OAuth state during a code rollback.
 
+> **After 0.5.2 has started once, this rollback needs care.** 0.5.2 rewrites
+> `oauth_tokens.json` and `oauth_refresh_tokens.json` with SHA-256-keyed
+> entries. This image and the previous one read those keys as plaintext tokens,
+> so they reject every client's real token and would accept the stored hash
+> strings as bearers. Roll back only to an image that reads hashed token
+> stores, or restore the pre-upgrade copies of both files together with the
+> older image; tokens issued since the upgrade are then lost and those
+> connectors re-authorise. See the compatibility boundary in `PROJECT.md`.
+
 ## Separate client configuration finding
 
 At investigation time, `/home/arda/.codex/config.toml` configured Reliquary,
