@@ -1425,6 +1425,10 @@ class ReliquaryChatProxy:
                                         "id": {"type": "string"},
                                         "title": {"type": "string"},
                                         "url": {"type": "string"},
+                                        # Present only on proposed corrections.
+                                        "kind": {"type": "string"},
+                                        "status": {"type": "string"},
+                                        "target_id": {"type": "string"},
                                     },
                                     "required": ["id", "title", "url"],
                                 },
@@ -2232,6 +2236,13 @@ class ReliquaryChatProxy:
                     "truncated": truncated,
                     "char_count": len(full_text),
                 }
+                if metadata.get("kind") == "correction":
+                    # Without these a proposed correction reads like any
+                    # other record on the lean endpoint.
+                    structured_item["kind"] = "correction"
+                    structured_item["status"] = str(metadata.get("status") or "proposed")
+                    if metadata.get("target_id"):
+                        structured_item["target_id"] = str(metadata["target_id"])
             else:
                 # Mirror the preview cap in structuredContent so the full corpus
                 # text cannot blow out context here; full text stays behind fetch.

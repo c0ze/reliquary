@@ -211,3 +211,58 @@ def test_dedup_tokenises_turkish_letters_as_word_characters():
         {"id": "dup", "memory": "AYŞE ŞIK BİR CEKET ALDI, RENGİ KIRMIZI VE ÇOK GÜZEL!", "score": 0.78},
     ]
     assert _ids(apply_retrieval_quality("ceket", hits, limit=10, now=1_780_000_000)) == ["chic", "often"]
+
+
+# ---------------------------------------------------------------------------
+# 5. A proposed correction and its imported original must not suppress each other
+# ---------------------------------------------------------------------------
+
+NAS_BODY = ("The NAS backup job runs every night at 02:00 and copies the photo share "
+            "to the external disk in the garage, then verifies checksums and mails a report "
+            "to the admin account when any file differs from the previous snapshot.")
+
+
+def test_dedup_never_drops_a_correction_or_its_target():
+    from retrieval_quality import apply_retrieval_quality
+
+    corrected = NAS_BODY.replace("02:00", "04:00")
+    hits = [
+        {"id": "correction", "memory": corrected, "score": 0.81,
+         "metadata": {"kind": "correction", "target_id": "nas-1", "status": "proposed"}},
+        {"id": "nas-1", "memory": NAS_BODY, "score": 0.80, "metadata": {"source_group": "imported"}},
+        # An ordinary near-copy of the original is still a duplicate of it.
+        {"id": "copy", "memory": NAS_BODY + " ", "score": 0.79, "metadata": {}},
+    ]
+    assert _ids(apply_retrieval_quality("NAS backup", hits, limit=10, now=1_780_000_000)) == [
+        "correction", "nas-1",
+    ]
+    # Whichever ranks first, both survive.
+    hits[0]["score"], hits[1]["score"] = 0.70, 0.90
+    assert set(_ids(apply_retrieval_quality("NAS backup", hits, limit=10, now=1_780_000_000))) == {
+        "correction", "nas-1",
+    }
+
+
+def test_lean_search_shows_correction_beside_its_original_with_status(proxy):
+    metadata = {"title": "NAS backup", "import_record_id": "nas-1", "source_group": "imported"}
+    proxy.catalog = CorpusCatalog([CorpusRecord(
+        import_record_id="nas-1", title="NAS backup", text=NAS_BODY,
+        metadata={"title": "NAS backup"}, source_ref="",
+    )])
+    proxy.memory.add(NAS_BODY, user_id=proxy.settings.user_id, metadata=metadata)
+    filed = call(proxy, "propose_update", {
+        "target_id": "nas-1", "reason": "time is wrong",
+        "replacement_text": NAS_BODY.replace("02:00", "04:00"),
+    })
+    assert filed["isError"] is False
+    correction_id = filed["structuredContent"]["id"]
+
+    result = call(proxy, "search", {"query": "NAS backup job", "limit": 5})
+    assert result["isError"] is False
+    assert schema_errors(output_schemas(proxy)["search"], result["structuredContent"]) == []
+    items = {item["id"]: item for item in result["structuredContent"]["results"]}
+    assert {"nas-1", correction_id} <= set(items)
+    assert items[correction_id]["kind"] == "correction"
+    assert items[correction_id]["status"] == "proposed"
+    assert items[correction_id]["target_id"] == "nas-1"
+    assert "kind" not in items["nas-1"] and "status" not in items["nas-1"]

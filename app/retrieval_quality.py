@@ -82,6 +82,15 @@ def apply_retrieval_quality(
     selected_tokens: list[set[str]] = []
     selected_norms: list[str] = []
     for _, hit in ranked:
+        if _is_correction(hit):
+            # A proposed correction is by design a small edit of its target;
+            # dropping either one as a "duplicate" hides the disagreement the
+            # correction exists to surface. Keep it, and never let it shadow
+            # another record either.
+            selected.append(hit)
+            if len(selected) >= limit:
+                break
+            continue
         text = _hit_text(hit)
         normalized = _normalize_text(text)
         tokens = _dedup_tokens(text)
@@ -93,6 +102,11 @@ def apply_retrieval_quality(
         if len(selected) >= limit:
             break
     return selected
+
+
+def _is_correction(hit: dict[str, Any]) -> bool:
+    metadata = hit.get("metadata")
+    return isinstance(metadata, dict) and metadata.get("kind") == "correction"
 
 
 def _quality_score(hit: dict[str, Any], *, query_terms: set[str], now: float) -> float:
