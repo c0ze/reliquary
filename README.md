@@ -56,8 +56,8 @@ explicitly configured):
 | `RELIQUARY_METRICS_PUBLIC` | Set to `true` to expose `GET /metrics` without auth. Default `false` = requires the Claude bearer token. |
 | `RELIQUARY_RETRIEVAL_STATS_PATH` | Path for an append-only JSONL retrieval-event log (one entry per search hit / fetch). Unset = disabled. Feeds `python app/lint.py` archive/compile proposals. |
 
-`GET /metrics` emits Prometheus text format with per-tool call counters,
-rate-limit rejection counts, process uptime, and (when the vector store supports
+`GET /metrics` emits Prometheus text format with per-tool call counters (names
+that are not tools of the endpoint count as `tool="unknown"`), rate-limit rejection counts, process uptime, and (when the vector store supports
 it) an approximate memory count gauge.
 
 ## Quick start (Docker)
