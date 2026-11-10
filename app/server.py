@@ -518,6 +518,15 @@ class ReliquaryChatProxy:
                 compiled_config = copy.deepcopy(self.config)
                 compiled_config.setdefault("vector_store", {}).setdefault("config", {})
                 compiled_config["vector_store"]["config"]["collection_name"] = settings.compiled_collection
+                compiled_store = compiled_config["vector_store"]
+                raw_store = getattr(self.memory, "vector_store", None)
+                if (str(compiled_store.get("provider") or "qdrant").lower() == "qdrant"
+                        and (compiled_store["config"].get("path") or getattr(raw_store, "is_local", False))
+                        and getattr(raw_store, "client", None) is not None):
+                    # Embedded Qdrant locks its storage folder to one client; a
+                    # second QdrantClient(path=...) fails at startup. Share the raw
+                    # store's client, as mem0 does for its own entity store.
+                    compiled_store["config"]["client"] = raw_store.client
                 self.compiled_memory = Memory.from_config(compiled_config)
 
         self.metrics = Metrics()

@@ -215,3 +215,92 @@ def test_existing_page_can_be_refiled_under_its_own_slug(proxy, fake_memory):
     assert fake_memory.get("fake-1") is not None
     refiled = run(call(proxy, "reliquary_compile_page", {"slug": "fake-1", "markdown": "v2"}))
     assert refiled["isError"] is False
+
+
+# 6 -- embedded on-disk Qdrant: the compiled Memory shares the raw client ----
+
+EMBEDDER = {"provider": "openai", "config": {"model": "text-embedding-3-small"}}
+
+
+def test_compiled_memory_shares_the_embedded_qdrant_client(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from conftest import FakeMemory
+    from server import ProxySettings, ReliquaryChatProxy
+
+    built = []
+
+    class StubMemory:
+        @staticmethod
+        def from_config(config):
+            built.append(config)
+            return FakeMemory()
+
+    monkeypatch.setitem(sys.modules, "mem0", types.SimpleNamespace(Memory=StubMemory))
+    raw = FakeMemory()
+    raw.vector_store = types.SimpleNamespace(client=object(), is_local=True)
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"vector_store": {"provider": "qdrant", "config": {
+        "path": str(tmp_path / "qdrant"), "collection_name": "reliquary"}}, "embedder": EMBEDDER}))
+    ReliquaryChatProxy(ProxySettings(config_path=str(cfg), blob_dir=str(tmp_path / "blobs"),
+                                     compiled_dir=str(tmp_path / "compiled"), native_hybrid="off"),
+                       memory=raw)
+    [compiled_config] = built
+    assert compiled_config["vector_store"]["config"]["client"] is raw.vector_store.client
+    assert compiled_config["vector_store"]["config"]["collection_name"] == "reliquary_compiled"
+
+
+def test_compiled_memory_keeps_its_own_client_for_a_qdrant_server(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from conftest import FakeMemory
+    from server import ProxySettings, ReliquaryChatProxy
+
+    built = []
+    monkeypatch.setitem(sys.modules, "mem0", types.SimpleNamespace(
+        Memory=types.SimpleNamespace(from_config=lambda config: built.append(config) or FakeMemory())))
+    raw = FakeMemory()
+    raw.vector_store = types.SimpleNamespace(client=object(), is_local=False)
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"vector_store": {"provider": "qdrant", "config": {"host": "qdrant", "port": 6333}}, "embedder": EMBEDDER}))
+    ReliquaryChatProxy(ProxySettings(config_path=str(cfg), blob_dir=str(tmp_path / "blobs"),
+                                     compiled_dir=str(tmp_path / "compiled"), native_hybrid="off"),
+                       memory=raw)
+    assert "client" not in built[0]["vector_store"]["config"]
+
+
+_EMBEDDED_SCRIPT = r"""
+import json, os, sys
+d = sys.argv[1]
+sys.path.insert(0, sys.argv[2])
+from server import ProxySettings, ReliquaryChatProxy
+cfg = os.path.join(d, "config.json")
+with open(cfg, "w") as fh:
+    json.dump({
+        "vector_store": {"provider": "qdrant", "config": {"path": os.path.join(d, "qdrant"), "on_disk": True,
+                                                           "collection_name": "reliquary", "embedding_model_dims": 8}},
+        "embedder": {"provider": "openai", "config": {"model": "text-embedding-3-small", "embedding_dims": 8}},
+        "history_db_path": os.path.join(d, "history.db"),
+    }, fh)
+proxy = ReliquaryChatProxy(ProxySettings(config_path=cfg, blob_dir=os.path.join(d, "blobs"),
+                                         compiled_dir=os.path.join(d, "compiled"), native_hybrid="off"))
+assert proxy.compiled_memory.vector_store.client is proxy.memory.vector_store.client
+print("ok")
+"""
+
+
+def test_server_starts_on_embedded_qdrant_with_the_real_mem0(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    pytest.importorskip("mem0")
+    app_dir = str(Path(__file__).resolve().parents[1] / "app")
+    env = dict(os.environ, MEM0_TELEMETRY="False", MEM0_DIR=str(tmp_path / "mem0home"),
+               OPENAI_API_KEY="sk-not-used", HOME=str(tmp_path))
+    done = subprocess.run([sys.executable, "-c", _EMBEDDED_SCRIPT, str(tmp_path), app_dir],
+                          env=env, capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert done.stdout.strip().endswith("ok")
