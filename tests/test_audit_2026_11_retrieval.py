@@ -428,3 +428,26 @@ def test_explicit_domain_keeps_matching_synthesis_behind_higher_scoring_pages(ma
     # The filter runs before the cut inside the compiled pre-pass itself.
     hits = asyncio.run(proxy._synthesis_first_hits("x", user_id="my_lord", limit=1, filters={"domain": "dev"}))
     assert [hit["id"] for hit in hits] == ["dev-page"]
+
+
+# ---------------------------------------------------------------------------
+# 10. nextCursor never points past the cursor cap
+# ---------------------------------------------------------------------------
+
+def test_next_cursor_is_null_when_the_next_offset_would_be_rejected(make_proxy, monkeypatch):
+    monkeypatch.setattr(server, "SEARCH_RANKING_DEPTH", 500, raising=False)
+    memory = ScoredMemory(lambda query, record: 0.5)
+    for i in range(450):
+        memory.add(f"r{i} t{i} u{i} v{i} w{i}", user_id="my_lord",
+                   metadata={"source_group": "imported", "import_record_id": f"r{i}"})
+    proxy = make_proxy(memory=memory)
+
+    structured = call(proxy, "search", {"query": "zzz", "limit": 20, "cursor": "380"})["structuredContent"]
+    assert structured["nextCursor"] == "400"
+    follow = call(proxy, "search", {"query": "zzz", "limit": 20, "cursor": "400"})
+    assert follow["isError"] is False
+    assert len(follow["structuredContent"]["results"]) == 20
+    # 420 would be rejected as invalid_cursor, so no cursor is offered.
+    assert follow["structuredContent"]["nextCursor"] is None
+    structured = call(proxy, "search", {"query": "zzz", "limit": 20, "cursor": "395"})["structuredContent"]
+    assert structured["nextCursor"] is None

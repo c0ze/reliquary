@@ -72,6 +72,7 @@ LIVE_LEXICAL_SCAN_LIMIT = 5000
 # Search ranks one pool of up to this many hits per route, whatever the cursor,
 # and every page is a slice of that one ranking (which bounds the depth).
 SEARCH_RANKING_DEPTH = 100
+SEARCH_CURSOR_CAP = 400  # 20 pages at the max limit
 # Soft score bonus that floats project-matching memory up when caller context is
 # supplied (#42). Additive, excludes nothing; a no-op when context is absent.
 CONTEXT_MATCH_BONUS = 0.1
@@ -2099,12 +2100,11 @@ class ReliquaryChatProxy:
         except (TypeError, ValueError):
             offset = 0
         # Reject (not clamp) offsets past the cap: silently clamping would return
-        # the same page with the same nextCursor forever. 400 = 20 pages at the
-        # max limit.
-        if offset > 400:
+        # the same page with the same nextCursor forever.
+        if offset > SEARCH_CURSOR_CAP:
             return self.mcp_tool_result(
                 text="Cursor is past the pagination cap (400); restart the search or narrow it with filters.",
-                structured={"error": "invalid_cursor", "max_cursor": 400},
+                structured={"error": "invalid_cursor", "max_cursor": SEARCH_CURSOR_CAP},
                 is_error=True,
             )
         threshold = (
@@ -2216,7 +2216,12 @@ class ReliquaryChatProxy:
               + (COMPILED_RANK_BONUS if item.get("route") == "synthesis" else 0.0)),
             str(item.get("id") or ""),
         ))
-        next_cursor = str(offset + limit) if len(combined) > offset + limit else None
+        # Never hand out a cursor that the next call would reject.
+        next_cursor = (
+            str(offset + limit)
+            if len(combined) > offset + limit and offset + limit <= SEARCH_CURSOR_CAP
+            else None
+        )
         results = combined[offset:offset + limit]
         filter_header = (f" [filters: {', '.join(f'{k}={v}' for k, v in explicit.items())}]" if explicit else "")
         lines = [f"Search for {query!r} returned {len(results)} result(s).{filter_header}"]
