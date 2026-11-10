@@ -45,7 +45,10 @@ def export_vault(registry: PageRegistry, out_dir: str) -> int:
         exported.add(f"{domain_dir}/{page.slug}.md")
         body = registry.read_body(page.slug)
         if body is None:
-            continue  # keep any earlier export of a page whose body is unreadable
+            # Keep every earlier export of a page whose body is unreadable (it
+            # may be the last readable copy), wherever its domain put it.
+            exported.update(rel for rel in previous if rel.rsplit("/", 1)[-1] == f"{page.slug}.md")
+            continue
         text, _blob_id = body
         dest_dir = os.path.join(out_dir, domain_dir)
         os.makedirs(dest_dir, exist_ok=True)

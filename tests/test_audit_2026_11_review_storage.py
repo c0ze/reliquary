@@ -499,3 +499,25 @@ def test_drain_on_cancel_survives_repeated_cancellation():
         assert finished.is_set()  # the caller only finished after the work did
 
     run(scenario())
+
+
+# 12 -- export never prunes the last copy of a page whose body is unreadable -
+
+def test_export_keeps_the_old_file_of_a_moved_page_whose_body_is_lost(tmp_path):
+    import export_vault
+    from blobs import BlobStore
+    from compiled import PageRegistry
+
+    registry = PageRegistry(str(tmp_path / "compiled"), BlobStore(str(tmp_path / "blobs"), b"k"))
+    registry.put_revision("p", "the only copy", {"domain": "old"})
+    out = tmp_path / "vault"
+    assert export_vault.export_vault(registry, str(out)) == 1
+    moved = registry.put_revision("p", "moved text", {"domain": "new"})
+    Path(registry.blobs._sidecar_path(moved.current_blob)).unlink()  # current body lost
+
+    assert export_vault.export_vault(registry, str(out)) == 0
+    assert (out / "old" / "p.md").read_text().endswith("the only copy\n")
+    # The kept entry stays in the manifest, so it is pruned once the page is readable again.
+    registry.put_revision("p", "restored", {"domain": "new"})
+    assert export_vault.export_vault(registry, str(out)) == 1
+    assert not (out / "old" / "p.md").exists()
