@@ -668,8 +668,16 @@ taxonomy, and whether project context is active. Call it first.
 
 **Corrections.** Imported corpus records are read-only. To fix one without mutating
 it, `reliquary_propose_update` files a linked user record (`kind=correction`, `status=proposed`,
-`target_id`); the original stays immutable. Protected-record and scope errors return
+`target_id`); the original stays immutable. Search shows a correction beside its
+original (the duplicate filter never merges them), and lean `search` results mark it
+with `kind`, `status` and `target_id`. Protected-record and scope errors return
 a `suggested_action` telling the agent what to do next.
+
+**Backend outages.** When Qdrant or the embedder does not answer, search, fetch,
+update, delete and propose_update return an error with code `backend_unavailable`
+rather than an empty result or "not found", and `/status` and `reliquary_status`
+report `"status": "degraded"`. Unexpected tool errors return only an `error_id`;
+the details are in the server log under that id.
 
 **Provenance.** The `reliquary://sources` resource reports where memories came from,
 grouped by source and import vs. user-write, with private/public status.
@@ -684,7 +692,8 @@ docker compose ps
 docker compose logs -f app
 curl -s http://127.0.0.1:8787/healthz
 
-# Authed status (config + taxonomy)
+# Authed status (config + taxonomy); "status" is "degraded" when the memory
+# backend does not answer the count probe
 curl -s -H "Authorization: Bearer $RELIQUARY_CLAUDE_MCP_TOKEN" http://127.0.0.1:8787/status
 
 # Memory count (point count in Qdrant)

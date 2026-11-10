@@ -241,7 +241,11 @@ If records include `updated_at`, `created_at`, `timestamp`, or similar date
 metadata, search uses it as a small recency tiebreaker after vector similarity.
 The server also overfetches raw candidates and removes near-duplicate result
 texts at query time so repeated facts from multiple sources do not crowd out
-the result budget.
+the result budget. Duplicate detection works on any script (Japanese and other
+unspaced text is compared by character pairs), and a proposed correction is
+never collapsed into the record it corrects. Search pages (`cursor` /
+`nextCursor`) are slices of one ranking of up to 100 hits per route, so pages
+neither repeat nor skip records.
 
 Agent write-back is opt-in. `--writeback` stores successful chat turns in Mem0;
 add `--writeback-path /path/to/Agent.md` (or `RELIQUARY_WRITEBACK_PATH`) to also
