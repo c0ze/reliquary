@@ -3546,6 +3546,9 @@ class ReliquaryChatProxy:
             await self.send_json(send, 501, {"error": "This proxy has no base URL configured for that endpoint"})
             return
 
+        if self._unsafe_relay_path(scope["path"]):
+            await self.send_json(send, 400, {"error": "invalid_path"})
+            return
         headers = decode_headers(scope)
         body = await self.read_body(receive, self.request_body_max_bytes())
         url = self.url_for(scope, base_url)
@@ -4278,15 +4281,29 @@ class ReliquaryChatProxy:
         return f"{base_url}{path}{'?' + query if query else ''}"
 
     @staticmethod
+    def _unsafe_relay_path(path: str) -> bool:
+        """True when a /v1 path could leave the upstream's /v1 prefix: a '..'
+        segment (also percent-encoded, at any depth), '//' or a backslash."""
+        from urllib.parse import unquote
+        decoded = path
+        for _ in range(5):
+            step = unquote(decoded)
+            if step == decoded:
+                break
+            decoded = step
+        return "//" in decoded or "\\" in decoded or ".." in decoded.split("/")
+
+    # Only what an OpenAI-compatible upstream needs; never cookies, client IPs
+    # (X-Forwarded-*, CF-*) or other ingress metadata.
+    FORWARDED_UPSTREAM_HEADERS = frozenset({
+        "authorization", "api-key", "x-api-key", "content-type", "accept", "user-agent",
+        "openai-organization", "openai-project", "openai-beta", "x-request-id",
+    })
+
+    @staticmethod
     def forward_headers(headers: dict[str, str]) -> dict[str, str]:
-        excluded = {
-            "host",
-            "content-length",
-            "connection",
-            "accept-encoding",
-            "transfer-encoding",
-        }
-        return {key: value for key, value in headers.items() if key not in excluded}
+        allowed = ReliquaryChatProxy.FORWARDED_UPSTREAM_HEADERS
+        return {key: value for key, value in headers.items() if key in allowed}
 
     # /oauth/* forms and DCR metadata are tiny; they are read before any auth.
     OAUTH_BODY_MAX_BYTES = 64 * 1024

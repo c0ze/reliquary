@@ -268,3 +268,37 @@ def test_initialize_negotiates_protocol_version(proxy, requested, expected):
     assert resp["status"] == 200
     assert json.loads(resp["body"])["result"]["protocolVersion"] == expected
     assert resp["headers"]["mcp-protocol-version"] == expected
+
+
+# --- 7. /v1 passthrough stays under the upstream prefix ------------------------
+
+
+def _relay_proxy(make_proxy):
+    from unittest.mock import AsyncMock
+    import httpx
+    p = make_proxy(upstream_base_url="http://ollama:11434/v1")
+    p.client.request = AsyncMock(return_value=httpx.Response(200, json={"ok": True}))
+    return p
+
+
+@pytest.mark.parametrize("path", ["/v1/../api/delete", "/v1/%2e%2e/api/delete", "/v1/%252e%252E/api/delete",
+                                  "/v1/models/..", "/v1//api/delete", "/v1/..%2fapi", "/v1/..\\api"])
+def test_passthrough_rejects_prefix_escape(make_proxy, path):
+    p = _relay_proxy(make_proxy)
+    resp = _call(p, "DELETE", path, headers=CLAUDE)
+    assert resp["status"] == 400
+    p.client.request.assert_not_called()
+
+
+def test_passthrough_forwards_only_allowlisted_headers(make_proxy):
+    p = _relay_proxy(make_proxy)
+    resp = _call(p, "POST", "/v1/models", body=b"{}", headers={
+        "x-reliquary-token": "claude-secret", "authorization": "Bearer upstream-key",
+        "content-type": "application/json", "cookie": "session=1", "x-forwarded-for": "10.0.0.1",
+        "cf-connecting-ip": "1.2.3.4", "cf-access-jwt-assertion": "jwt", "openai-organization": "org"})
+    assert resp["status"] == 200
+    call = p.client.request.call_args
+    assert call.args[1] == "http://ollama:11434/v1/models"
+    sent = {k.lower(): v for k, v in call.kwargs["headers"].items()}
+    assert sent == {"authorization": "Bearer upstream-key", "content-type": "application/json",
+                    "openai-organization": "org"}
