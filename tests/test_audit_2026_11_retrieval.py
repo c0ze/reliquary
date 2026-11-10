@@ -451,3 +451,65 @@ def test_next_cursor_is_null_when_the_next_offset_would_be_rejected(make_proxy, 
     assert follow["structuredContent"]["nextCursor"] is None
     structured = call(proxy, "search", {"query": "zzz", "limit": 20, "cursor": "395"})["structuredContent"]
     assert structured["nextCursor"] is None
+
+
+# ---------------------------------------------------------------------------
+# 4. The exact-identifier lexical fallback must reach every user-write
+# ---------------------------------------------------------------------------
+
+TOKEN = "ARDA-RELIQUARY-IMAGE-20260605-01"
+
+
+def _store_with_imports(memory, count):
+    for i in range(count):
+        memory.add(f"imported filler record number {i}", user_id="my_lord",
+                   metadata={"source_group": "imported", "import_record_id": f"imp-{i}"})
+
+
+def test_lexical_fallback_finds_user_write_behind_5000_imports(make_proxy):
+    memory = ScoredMemory(lambda query, record: 0.9 if record["metadata"].get("source_group") == "imported" else 0.05)
+    _store_with_imports(memory, 5500)
+    proxy = make_proxy(memory=memory)
+    call(proxy, "reliquary_add_memory", {"text": f"token {TOKEN} smoke marker"}, endpoint="claude")
+
+    results = call(proxy, "reliquary_search", {"query": TOKEN, "limit": 5},
+                   endpoint="claude")["structuredContent"]["results"]
+    assert any(TOKEN in item["text"] for item in results)
+    assert memory.get_all_calls[-1]["filters"] == {"user_id": "my_lord", "source_group": "user-write"}
+
+
+class UnfilteredListMemory(ScoredMemory):
+    """A store whose listing ignores metadata filters (only the entity id)."""
+
+    def get_all(self, *, filters=None, top_k=20):
+        self.get_all_calls.append({"filters": filters, "top_k": top_k})
+        user_id = (filters or {}).get("user_id")
+        records = [dict(r) for r in self._store.values() if r["user_id"] == user_id]
+        return {"results": records[:top_k]}
+
+
+def test_lexical_fallback_grows_the_scan_when_a_page_comes_back_full(make_proxy):
+    memory = UnfilteredListMemory(lambda query, record: 0.05)
+    _store_with_imports(memory, 5500)
+    proxy = make_proxy(memory=memory)
+    call(proxy, "reliquary_add_memory", {"text": f"token {TOKEN} smoke marker"}, endpoint="claude")
+
+    hits = asyncio.run(proxy.live_lexical_matches(TOKEN, user_id="my_lord", filters=None, limit=5))
+    assert [TOKEN in hit["memory"] for hit in hits] == [True]
+    assert [c["top_k"] for c in memory.get_all_calls] == [5000, 20000]
+
+
+def test_get_all_kwargs_pass_source_group_on_mem0_1x_and_2x_signatures():
+    def get_all_1x(*, user_id=None, agent_id=None, run_id=None, filters=None, limit=100):
+        return {}
+
+    def get_all_2x(*, filters=None, top_k=20, **kwargs):
+        return {}
+
+    meta = {"source_group": "user-write"}
+    assert server.ReliquaryChatProxy._get_all_kwargs(get_all_1x, user_id="u", top_k=7, metadata_filters=meta) == {
+        "filters": {"user_id": "u", "source_group": "user-write"}, "user_id": "u", "limit": 7,
+    }
+    assert server.ReliquaryChatProxy._get_all_kwargs(get_all_2x, user_id="u", top_k=7, metadata_filters=meta) == {
+        "filters": {"user_id": "u", "source_group": "user-write"}, "top_k": 7,
+    }

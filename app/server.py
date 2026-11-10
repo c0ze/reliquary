@@ -69,6 +69,7 @@ MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
 LIVE_LEXICAL_SCAN_LIMIT = 5000
+LIVE_LEXICAL_SCAN_MAX = 80_000  # the scan grows 4x per full page up to this
 # Search ranks one pool of up to this many hits per route, whatever the cursor,
 # and every page is a slice of that one ranking (which bounds the depth).
 SEARCH_RANKING_DEPTH = 100
@@ -3687,15 +3688,27 @@ class ReliquaryChatProxy:
         get_all = getattr(self.memory, "get_all", None)
         if get_all is None:
             return []
+        # Ask the store for user-writes only (every server write stamps
+        # source_group="user-write"; imports carry "imported"), so the scan cap
+        # is not spent on the imported corpus. get_all has no offset, so a page
+        # that comes back exactly full is fetched again with a larger cap.
+        scan_limit = LIVE_LEXICAL_SCAN_LIMIT
         try:
-            kwargs = self._get_all_kwargs(get_all, user_id=user_id, top_k=LIVE_LEXICAL_SCAN_LIMIT)
-            async with self._read_lock():
-                result = await asyncio.to_thread(get_all, **kwargs)
+            while True:
+                kwargs = self._get_all_kwargs(get_all, user_id=user_id, top_k=scan_limit,
+                                              metadata_filters={"source_group": "user-write"})
+                async with self._read_lock():
+                    result = await asyncio.to_thread(get_all, **kwargs)
+                records = self._memory_results(result)
+                if len(records) != scan_limit or scan_limit >= LIVE_LEXICAL_SCAN_MAX:
+                    break
+                scan_limit = min(scan_limit * 4, LIVE_LEXICAL_SCAN_MAX)
         except Exception:
             LOG.debug("Live lexical fallback failed for user_id=%s", user_id, exc_info=True)
             return []
+        if len(records) >= LIVE_LEXICAL_SCAN_MAX:
+            LOG.warning("Live lexical fallback scanned only the first %d user-written memories", len(records))
 
-        records = self._memory_results(result)
         matches: list[dict[str, Any]] = []
         for record in records:
             if not isinstance(record, dict):
@@ -3800,8 +3813,14 @@ class ReliquaryChatProxy:
         return []
 
     @staticmethod
-    def _get_all_kwargs(get_all: Any, *, user_id: str, top_k: int) -> dict[str, Any]:
-        """Build kwargs that work across Mem0 1.x and 2.x get_all signatures."""
+    def _get_all_kwargs(
+        get_all: Any, *, user_id: str, top_k: int, metadata_filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build kwargs that work across Mem0 1.x and 2.x get_all signatures.
+
+        Both versions pass metadata keys in ``filters`` through to the vector
+        store's payload filter; where ``filters`` is not accepted they are
+        dropped and the caller must filter the records itself."""
         kwargs: dict[str, Any] = {}
         try:
             parameters = inspect.signature(get_all).parameters
@@ -3809,7 +3828,7 @@ class ReliquaryChatProxy:
             parameters = {}
         has_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
         if "filters" in parameters or has_var_kwargs:
-            kwargs["filters"] = {"user_id": user_id}
+            kwargs["filters"] = {"user_id": user_id, **(metadata_filters or {})}
         if "user_id" in parameters:
             kwargs["user_id"] = user_id
         elif not kwargs:
