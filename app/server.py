@@ -3376,6 +3376,10 @@ class ReliquaryChatProxy:
     def _enrich_hit(self, hit: dict[str, Any], *, route: str) -> dict[str, Any]:
         metadata = dict(hit.get("metadata") or {})
         import_id = metadata.get("import_record_id") if honours_import_id(metadata) else None
+        if import_id and not (self.catalog and str(import_id) in self.catalog.records_by_id):
+            # fetch resolves import ids only through the catalog; hand out the
+            # memory id instead (still read-only: update/delete refuse imports).
+            import_id = None
         record_id = str(import_id or hit.get("id") or metadata.get("source_ref") or "")
         record = self.catalog.records_by_id.get(record_id) if self.catalog else None
         title = str(metadata.get("title") or (record.title if record else "<untitled>"))

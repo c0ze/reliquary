@@ -218,3 +218,30 @@ def test_lean_commit_image_upload_strips_system_managed_metadata(proxy):
     for key in ("import_record_id", "import_content_hash"):
         assert key not in stored
     assert stored["mood"] == "ok"
+
+
+# --- 2. search ids must be fetchable -------------------------------------------
+
+def test_search_uses_memory_id_when_catalog_lacks_the_import(proxy):
+    assert proxy.catalog is None  # dataset failed to load / not configured
+    _seed(proxy, "mem-garden", "A long imported document about the garden.",
+          {"title": "Garden", "import_record_id": "garden-1", "source_group": "imported"})
+    for endpoint, search, fetch in (("openai", "search", "fetch"), ("claude", "reliquary_search", "reliquary_fetch")):
+        hit = call(proxy, endpoint, search, {"query": "garden"})["structuredContent"]["results"][0]
+        assert hit["id"] == "mem-garden"
+        fetched = call(proxy, endpoint, fetch, {"id": hit["id"]})
+        assert not fetched["isError"], fetched["structuredContent"]
+    # The fallback id must not make the imported record mutable.
+    deleted = call(proxy, "claude", "reliquary_delete", {"id": "mem-garden"})
+    assert deleted["structuredContent"]["error"] == "protected_record"
+    updated = call(proxy, "claude", "reliquary_update", {"id": "mem-garden", "text": "x"})
+    assert updated["structuredContent"]["error"] == "protected_record"
+
+
+def test_search_uses_import_id_when_catalog_has_it(proxy):
+    proxy.catalog = _catalog_with("garden-1", title="Garden", text="A long imported document about the garden.")
+    _seed(proxy, "mem-garden", "A long imported document about the garden.",
+          {"title": "Garden", "import_record_id": "garden-1", "source_group": "imported"})
+    hit = call(proxy, "openai", "search", {"query": "garden"})["structuredContent"]["results"][0]
+    assert hit["id"] == "garden-1"
+    assert not call(proxy, "openai", "fetch", {"id": "garden-1"})["isError"]
