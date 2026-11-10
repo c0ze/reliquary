@@ -16,7 +16,7 @@ from typing import Any
 os.environ.setdefault("MEM0_TELEMETRY", "false")
 
 from catalog import slugify_value  # noqa: E402
-from metadata_policy import honours_import_id  # noqa: E402
+from metadata_policy import honours_import_id, taxonomy_match_keys  # noqa: E402
 
 
 IMPORT_BOOKKEEPING_KEYS = {"import_record_id", "import_content_hash", "source_group"}
@@ -127,12 +127,22 @@ def existing_import_index(memory: Any, *, user_id: str) -> dict[str, dict[str, A
                 "text": hit.get("memory") or "",
                 "metadata": metadata,
             })
-        index[str(import_id)] = {
-            "id": str(memory_id),
-            "content_hash": str(content_hash),
-            "metadata": dict(metadata),
-        }
+        copy = {"id": str(memory_id), "content_hash": str(content_hash), "metadata": dict(metadata)}
+        entry = index.get(str(import_id))
+        if entry is None:
+            # The first copy's fields sit at the top level; "copies" holds every
+            # trusted copy, including duplicates that --no-incremental re-runs
+            # (once the default) left behind.
+            index[str(import_id)] = {**copy, "copies": [copy]}
+        else:
+            entry["copies"].append(copy)
     return index
+
+
+def _taxonomy_pairs(domain: Any, topic: Any) -> set[tuple[str, str]]:
+    """(domain, topic) match-key pairs, so a page filed under an older spelling
+    of either value ("Work Notes", "g-nl-k") meets the slugs imports store."""
+    return {(d, t) for d in taxonomy_match_keys(domain) for t in taxonomy_match_keys(topic)}
 
 
 def _fan_out_bulk(page_registry, touched_ids: set[str], touched_tax: set) -> None:
@@ -143,7 +153,7 @@ def _fan_out_bulk(page_registry, touched_ids: set[str], touched_tax: set) -> Non
             # the domain+topic fallback applies only to provenance-less pages (#69).
             if (touched_ids & set(page.derived_from or [])) or (
                 not page.derived_from
-                and page.domain and page.topic and (page.domain, page.topic) in touched_tax
+                and not touched_tax.isdisjoint(_taxonomy_pairs(page.domain, page.topic))
             ):
                 page_registry.set_status(page.slug, "stale")
     except Exception as exc:
@@ -166,7 +176,7 @@ def ingest_records(
             # never leave a half-imported corpus behind.
             raise ValueError(f"Invalid record #{position}: {problem}")
     existing = existing_import_index(memory, user_id=user_id) if incremental else {}
-    summary = {"selected": len(records), "added": 0, "updated": 0, "skipped": 0}
+    summary = {"selected": len(records), "added": 0, "updated": 0, "skipped": 0, "duplicates": 0}
     touched_ids: set[str] = set()
     touched_tax: set[tuple[str, str]] = set()
 
@@ -174,32 +184,39 @@ def ingest_records(
         metadata = import_metadata(item)
         current_hash = metadata["import_content_hash"]
         previous = existing.get(str(item["id"]))
-        if previous and previous["content_hash"] == current_hash:
-            if _derived_fields_current(previous.get("metadata") or {}, item) or not hasattr(memory, "update"):
+        copies = previous["copies"] if previous else []
+        summary["duplicates"] += max(0, len(copies) - 1)
+        if previous and not hasattr(memory, "update"):
+            if previous["content_hash"] == current_hash:
                 summary["skipped"] += 1
                 continue
-            # Same record, but imported before the importer derived slugged
-            # taxonomy and source dates: rewrite its metadata once. The content
-            # is unchanged, so compiled pages are not marked stale.
-            memory.update(previous["id"], item["text"], metadata)
+        elif copies:
+            # Every trusted copy is brought to the current text and metadata, so
+            # an old duplicate cannot outrank the current one with an obsolete
+            # snippet. Nothing is deleted, and a run that stops halfway leaves
+            # the remaining copies outdated for the next run to finish.
+            changed = [copy for copy in copies if copy["content_hash"] != current_hash]
+            # Same content, but imported before the importer derived slugged
+            # taxonomy and source dates: rewrite the metadata once, without
+            # marking compiled pages stale.
+            migrated = [copy for copy in copies if copy["content_hash"] == current_hash
+                        and not _derived_fields_current(copy["metadata"], item)]
+            if not changed and not migrated:
+                summary["skipped"] += 1
+                continue
+            for copy in changed + migrated:
+                memory.update(copy["id"], item["text"], metadata)
             summary["updated"] += 1
-            continue
-        if previous and hasattr(memory, "update"):
-            memory.update(previous["id"], item["text"], metadata)
-            summary["updated"] += 1
-            touched_ids.add(str(item["id"]))
-            d = str(metadata.get("domain") or "")
-            t = str(metadata.get("topic") or "")
-            if d and t:
-                touched_tax.add((d, t))
+            if changed:
+                touched_ids.add(str(item["id"]))
+                touched_tax |= _taxonomy_pairs(metadata.get("domain"), metadata.get("topic"))
+                for copy in changed:  # pages filed under the taxonomy the record had
+                    touched_tax |= _taxonomy_pairs(copy["metadata"].get("domain"), copy["metadata"].get("topic"))
             continue
         memory.add(item["text"], user_id=user_id, metadata=metadata, infer=infer)
         summary["added"] += 1
         touched_ids.add(str(item["id"]))
-        d = str(metadata.get("domain") or "")
-        t = str(metadata.get("topic") or "")
-        if d and t:
-            touched_tax.add((d, t))
+        touched_tax |= _taxonomy_pairs(metadata.get("domain"), metadata.get("topic"))
 
     if page_registry is not None and (touched_ids or touched_tax):
         _fan_out_bulk(page_registry, touched_ids, touched_tax)
@@ -465,6 +482,8 @@ def main() -> None:
         "Ingest complete: "
         f"{summary['added']} added, {summary['updated']} updated, "
         f"{summary['skipped']} skipped, {summary['selected']} selected."
+        + (f" Kept {summary['duplicates']} duplicate cop{'y' if summary['duplicates'] == 1 else 'ies'}"
+           " of earlier imports in step with their record." if summary["duplicates"] else "")
     )
 
 

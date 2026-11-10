@@ -108,7 +108,7 @@ def test_rerunning_ingest_with_default_options_does_not_duplicate():
     ingest_records(memory, CORPUS, user_id="default")
     summary = ingest_records(memory, CORPUS, user_id="default")
     assert len(memory.rows) == 3
-    assert summary == {"selected": 3, "added": 0, "updated": 0, "skipped": 3}
+    assert summary == {"selected": 3, "added": 0, "updated": 0, "skipped": 3, "duplicates": 0}
 
 
 def test_ingest_user_id_defaults_from_environment(monkeypatch):
@@ -198,14 +198,14 @@ def test_existing_imports_get_derived_fields_once_without_marking_pages_stale(tm
                                                "derived_from": ["dated"]})
 
     first = ingest_records(memory, [plain, dated, raw_tax], user_id="default", page_registry=registry)
-    assert first == {"selected": 3, "added": 0, "updated": 2, "skipped": 1}
+    assert first == {"selected": 3, "added": 0, "updated": 2, "skipped": 1, "duplicates": 0}
     assert registry.get("nas").status == "current"
     by_id = {row["metadata"]["import_record_id"]: row for row in memory.rows.values()}
     assert by_id["dated"]["metadata"]["source_updated_at"] == "2019-01-01"
     assert by_id["raw"]["metadata"]["domain"] == "work-notes"
 
     second = ingest_records(memory, [plain, dated, raw_tax], user_id="default")
-    assert second == {"selected": 3, "added": 0, "updated": 0, "skipped": 3}
+    assert second == {"selected": 3, "added": 0, "updated": 0, "skipped": 3, "duplicates": 0}
     assert len(memory.rows) == 3
 
 

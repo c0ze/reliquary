@@ -24,7 +24,9 @@ import health
 from ingest import load_config
 from oauth import OAuthProvider, RegistrationDisabledError, scope_is_write
 from catalog import CorpusCatalog
-from metadata_policy import caller_kind, clean_caller_metadata, honours_import_id, normalize_taxonomy
+from metadata_policy import (
+    caller_kind, clean_caller_metadata, honours_import_id, normalize_taxonomy, normalize_taxonomy_value,
+)
 from persistence import JsonFileStore
 from runtime import AsyncRWLock, MCPSessionStore, native_hybrid_active, reads_can_be_concurrent
 from blobs import BlobStore, BlobTooLarge
@@ -906,7 +908,9 @@ class ReliquaryChatProxy:
         if method == "DELETE":
             session_id = headers.get("mcp-session-id")
             if session_id:
-                self.mcp_sessions.remove(session_id)
+                # Another credential's (or endpoint's) session is left alone and
+                # answered like an unknown one.
+                self.mcp_sessions.remove_owned(session_id, profile.name, self._credential_key(headers))
             await self.send_empty(send, 204)
             return
 
@@ -991,7 +995,7 @@ class ReliquaryChatProxy:
             return
 
         session_id = headers.get("mcp-session-id")
-        if session_id and session_id not in self.mcp_sessions:
+        if session_id and not self.mcp_sessions.claim(session_id, profile.name, self._credential_key(headers)):
             await self.send_json(send, 404, self.mcp_error(request_id, -32001, "Unknown MCP session"))
             return
 
@@ -1270,7 +1274,9 @@ class ReliquaryChatProxy:
         domain_prefix = "reliquary://domain/"
         if uri.startswith(domain_prefix) and uri.endswith("/index") and self.pages is not None:
             domain = uri[len(domain_prefix):-len("/index")]
-            payload = {"domain": domain, "pages": [self._page_summary(p) for p in self.pages.list(domain=domain)]}
+            spellings = {domain, normalize_taxonomy_value(domain)}  # pages filed before normalisation
+            payload = {"domain": domain, "pages": [self._page_summary(p) for p in self.pages.list()
+                                                   if p.domain in spellings]}
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
         if uri == "reliquary://taxonomy":
             payload = {
@@ -2201,18 +2207,28 @@ class ReliquaryChatProxy:
                                     if (v := arguments.get(k)) is not None and str(v).strip()}
 
         if explicit:
-            # Hard-filter path: one search with the explicit filters; no catalog routing.
-            hits = await self.search_memories(
-                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=explicit,
-                lexical_min_hits=limit,
-            )
-            raw_routes, failed_routes = 1, int(isinstance(hits, _BackendFailure))
+            # Hard-filter path: no catalog routing. Writes store the slug form
+            # ("Work Notes" -> "work-notes"); records and pages stored by older
+            # versions keep the raw spelling, so a filter whose two spellings
+            # differ searches both and merges by id. Each search is hard-filtered.
+            filter_sets = [{k: normalize_taxonomy_value(v) for k, v in explicit.items()}]
+            if filter_sets[0] != explicit:
+                filter_sets.append(explicit)
+            raw_routes, failed_routes = len(filter_sets), 0
             by_key: dict[str, dict[str, Any]] = {}
-            for hit in hits:
-                enriched = self._enrich_hit(hit, route="explicit-filter")
-                key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
-                by_key[key] = enriched
-                rank_scores[key] = quality_score(query, hit, now=rank_now)
+            for filter_set in filter_sets:
+                hits = await self.search_memories(
+                    query, user_id=user_id, limit=result_cap, threshold=threshold, filters=filter_set,
+                    lexical_min_hits=limit,
+                )
+                failed_routes += isinstance(hits, _BackendFailure)
+                for hit in hits:
+                    enriched = self._enrich_hit(hit, route="explicit-filter")
+                    key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
+                    existing = by_key.get(key)
+                    if existing is None or self._numeric_score(enriched.get("score")) > self._numeric_score(existing.get("score")):
+                        by_key[key] = enriched
+                        rank_scores[key] = quality_score(query, hit, now=rank_now)
             raw_results = sorted(
                 by_key.values(),
                 key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)
@@ -2223,8 +2239,12 @@ class ReliquaryChatProxy:
             # (domain, hall, room, topic) enforces the same hard-restrict guarantee (Fix 1).
             # Filtered inside, before the limit cut, so out-of-scope pages that
             # score higher cannot crowd the matching page out.
-            synthesis_results = await self._synthesis_first_hits(
-                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=explicit)
+            synthesis_results = []
+            for filter_set in filter_sets:
+                for page_hit in await self._synthesis_first_hits(
+                        query, user_id=user_id, limit=result_cap, threshold=threshold, filters=filter_set):
+                    if all(page_hit.get("id") != seen.get("id") for seen in synthesis_results):
+                        synthesis_results.append(page_hit)
             routes_used = [f"explicit-filter({', '.join(f'{k}={v}' for k, v in explicit.items())})"]
         else:
             routes = self.catalog.build_routes(query) if self.catalog else [_GlobalRoute()]
@@ -2621,7 +2641,11 @@ class ReliquaryChatProxy:
                                         structured={"error": "compiled_disabled"}, is_error=True)
         domain = str(arguments.get("domain") or "").strip() or None
         status = str(arguments.get("status") or "").strip() or None
-        pages = self.pages.list(domain=domain, status=status)
+        pages = self.pages.list(status=status)
+        if domain is not None:
+            # The slug form new pages store, or the raw spelling of older pages.
+            spellings = {domain, normalize_taxonomy_value(domain)}
+            pages = [p for p in pages if p.domain in spellings]
         summaries = [{"slug": p.slug, "title": p.title, "domain": p.domain, "status": p.status,
                       "updated_at": p.updated_at, "revision": p.current_blob} for p in pages]
         return self.mcp_tool_result(text=f"{len(summaries)} page(s).", structured={"pages": summaries})
@@ -4903,7 +4927,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=os.getenv("RELIQUARY_OAUTH_VERBATIM_TOKEN", "false").lower() in {"1", "true", "yes"},
         help="Return the master bearer itself as the OAuth access_token (old behavior) instead of a "
-        "derived, revocable token. Default false.",
+        "derived, revocable token. Read-only grants still get a derived read token. Default false.",
     )
     parser.add_argument("--oauth-access-token-ttl", type=int, default=_env_int("RELIQUARY_OAUTH_ACCESS_TOKEN_TTL", 432000),
                         help="Access-token lifetime in seconds (default 5 days). Refresh rotation renews it.")

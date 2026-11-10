@@ -143,7 +143,10 @@ page with `reliquary_compile_page` (Reliquary never generates prose); it is stor
 revision in the blob store, indexed into a **separate Qdrant collection**, and
 cited back to its source memories via `derived_from`. Search then leads with a
 relevant *current* synthesis and surfaces raw memories as its evidence. New raw
-writes flag dependent pages `stale` (a queued suggestion, never an auto-rewrite).
+writes flag dependent pages `stale` (a queued suggestion, never an auto-rewrite);
+a page without `derived_from` depends on writes with its domain and topic, in
+any spelling an older version stored (`Work Notes` = `work-notes`, `g-nl-k` =
+`günlük`).
 Inspect pages with `reliquary_list_pages` / `reliquary_page_history` (the latter
 reports per-revision timestamp + status), archive a page by re-filing it with
 `status=archived`, or permanently remove one with `reliquary_delete_page`. A re-file
@@ -247,7 +250,10 @@ config file (see [config.example.yaml](config.example.yaml)). Highlights:
   connectors out. Revoking a *refresh* token via `/oauth/revoke` drops the whole
   rotation family; revoking an access token removes just that token. The state
   files store SHA-256 hashes of the tokens, never the tokens; files written by
-  older versions are converted on first load.
+  older versions are converted on first load. The conversion is one-way: a
+  version before 0.5.2 cannot use converted files (it rejects every client's
+  token), so copy `oauth_tokens.json` and `oauth_refresh_tokens.json` aside
+  before upgrading if you might roll back, and restore them with the old image.
 - **Mem0 telemetry is off.** Mem0 reports anonymous usage to PostHog unless
   `MEM0_TELEMETRY` is false; the image, the compose file and both CLIs default it
   to `false` (set `MEM0_TELEMETRY=true` to opt in).

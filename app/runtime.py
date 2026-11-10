@@ -177,9 +177,33 @@ class MCPSessionStore:
         self._sessions[session_id] = entry
         return entry[0]
 
+    def claim(self, session_id: str, profile_name: str, owner: str | None) -> bool:
+        """Whether ``owner`` may use the live session ``session_id`` on
+        ``profile_name`` (refreshing its recency if so). A session persisted
+        before owners were recorded adopts the first credential that presents
+        it on its own profile, so an upgrade does not end every session."""
+        entry = self._sessions.get(session_id)
+        if entry is None or entry[0] != profile_name:
+            return False
+        if entry[2] is not None and entry[2] != owner:
+            return False
+        if self.touch(session_id) is None:
+            return False
+        if entry[2] is None and owner is not None:
+            entry[2] = owner
+            self._persist()
+        return True
+
     def remove(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
         self._persist()
+
+    def remove_owned(self, session_id: str, profile_name: str, owner: str | None) -> bool:
+        """Remove the session only for a caller that :meth:`claim` admits."""
+        if not self.claim(session_id, profile_name, owner):
+            return False
+        self.remove(session_id)
+        return True
 
     def __len__(self) -> int:
         self._evict_expired()

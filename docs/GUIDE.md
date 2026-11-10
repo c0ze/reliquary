@@ -91,7 +91,10 @@ server — MCP + OAuth + the Mem0 client). No chat LLM is involved in retrieval.
 **Explicit filters:** pass `domain`/`hall`/`room`/`topic` to `reliquary_search` to
 *hard-restrict* results to that taxonomy slice — this overrides the query-text
 routing in step 2, giving predictable retrieval when you know where to look. The
-response echoes the applied `filters`.
+response echoes the applied `filters`. A filter value matches the slug form that
+writes and imports store (`domain="Work Notes"` finds `work-notes`) and also its
+spelling as given, so records and pages stored by older versions under
+`Work Notes` are still found; `reliquary_list_pages` filters `domain` the same way.
 
 ### Endpoints
 
@@ -228,7 +231,7 @@ file** (`config.yaml`). Run `python app/server.py --help` for every flag.
 | `RELIQUARY_OPENAI_MCP_TOKEN` | — | Bearer for `/openai/mcp` (OAuth also works; required for any access, write-capable by scope) |
 | `RELIQUARY_OAUTH_CLIENT_ID` | — | Pin the OAuth client id; only this id is accepted |
 | `RELIQUARY_OAUTH_ALLOW_REGISTRATION` | `true` | Allow `POST /oauth/register` (DCR). Disable after the connector registers once |
-| `RELIQUARY_OAUTH_VERBATIM_TOKEN` | `false` | Return the master bearer verbatim instead of a derived, revocable token |
+| `RELIQUARY_OAUTH_VERBATIM_TOKEN` | `false` | Return the master bearer verbatim instead of a derived, revocable token. A read-only grant (`scope=read`) still gets a derived read token, since the master bearer always grants write |
 | `RELIQUARY_DATASET_PATH` | — | Curated JSONL (or dir) enabling taxonomy routing + `fetch` bootstrap docs |
 | `RELIQUARY_EMBEDDER_PROVIDER` / `_MODEL` / `_BASE_URL` / `_API_KEY` / `_DIMS` | — | Synthesize an embedder block without editing `config.yaml` |
 | `RELIQUARY_NATIVE_HYBRID` | `auto` | `auto`/`on`/`off` — detect/assume/disable mem0's server-side BM25 hybrid; see [Native hybrid search](#native-hybrid-search) |
@@ -359,6 +362,13 @@ taxonomy value that was not already a slug, are rewritten (and re-embedded)
 once; the rest are skipped. Their content hash is unchanged, so compiled pages
 are not marked stale by it.
 
+Earlier versions added every record on every run unless `--incremental` was
+given, so a collection can hold several copies of one record. An incremental
+run brings every copy to the record's current text and metadata (it deletes
+none) and treats a record as unchanged only when all its copies are, so an old
+copy cannot surface an outdated snippet; the summary line counts the duplicate
+copies it found. To get rid of them, re-import into an empty collection.
+
 > ⚠️ **The embedder defines the vector space.** If you change the embedding model
 > (or its dimensions), existing vectors become incomparable — **re-ingest** the
 > whole corpus afterwards.
@@ -449,7 +459,10 @@ Claude.ai Custom Connectors speak OAuth. Reliquary ships a small OAuth 2.1 shim:
    Claude registers itself via DCR.
 2. Claude opens a browser authorize page (`/oauth/authorize`). **Paste your
    `RELIQUARY_CLAUDE_MCP_TOKEN`** there and authorize. The connector receives a
-   **derived, revocable** token (not the master). The page shows the redirect
+   **derived, revocable** token (not the master; with
+   `RELIQUARY_OAUTH_VERBATIM_TOKEN=true` a write grant receives the master
+   bearer itself, but a read-only grant still gets a derived read token).
+   The page shows the redirect
    host, the client_id, the raw scope and the access it will get (read-only or
    read and write); redirect URIs with userinfo (`user@host`), backslashes or
    control characters are refused.
@@ -853,10 +866,17 @@ sequence: `/.well-known/*` → `/oauth/register` → `/oauth/authorize` →
   connectors out. Revoking a *refresh* token via `/oauth/revoke` drops the whole
   rotation family; revoking an access token removes just that token. The state
   files store SHA-256 hashes of the tokens, never the tokens; files written by
-  older versions are converted on first load.
+  older versions are converted on first load. The conversion is one-way: a
+  version before 0.5.2 cannot use converted files (it rejects every client's
+  token), so copy `oauth_tokens.json` and `oauth_refresh_tokens.json` aside
+  before upgrading if you might roll back, and restore them with the old image.
 - **MCP sessions are bounded per credential**: one credential holds at most 128
   of the 512 sessions, and a full table evicts the caller's own oldest
-  session first.
+  session first. A session belongs to the credential and endpoint that
+  initialised it: any other credential, or the other endpoint, gets `404`
+  (unknown session) when it uses the id, and its `DELETE` leaves the session
+  alone. Sessions saved by versions that did not record an owner are adopted
+  by the first credential that uses them on their own endpoint.
 - **Publish only behind TLS**, and prefer narrowing your proxy to the
   `/claude/*`, `/openai/*`, `/uploads/*`, `/oauth/*`, `/.well-known/*`, `/healthz`
   paths. (`/uploads/*` requires the same write bearer as the MCP endpoint that

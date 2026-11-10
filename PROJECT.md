@@ -84,3 +84,15 @@ No registry release is implied by a local deployment. See
 [the audit record](docs/AUDIT-2026-09-06.md) and
 [the JSON fix verification](docs/OPENAI-JSON-FIX-2026-10-03.md) for evidence
 and rollback.
+
+Token-store compatibility boundary: 0.5.2 rewrites `oauth_tokens.json` and
+`oauth_refresh_tokens.json` in the state directory once, keying them by
+`sha256:<hex>` of each token instead of the token. Older images (0.5.1,
+`reliquary:local-audit-20260906`, `reliquary:openai-json-fix-20261003`) read
+those keys as plaintext tokens: they reject every client's real token and would
+accept the stored hash strings as bearers. Before the first 0.5.2 start, copy
+both files aside. After it has started once, roll back only to an image that
+reads hashed token stores, or put the pre-upgrade copies of both files back
+together with the older image; tokens issued since the upgrade are then lost
+and those connectors re-authorise. Never run an older image on the migrated
+files.
