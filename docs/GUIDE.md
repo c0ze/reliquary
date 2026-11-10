@@ -91,7 +91,10 @@ server — MCP + OAuth + the Mem0 client). No chat LLM is involved in retrieval.
 **Explicit filters:** pass `domain`/`hall`/`room`/`topic` to `reliquary_search` to
 *hard-restrict* results to that taxonomy slice — this overrides the query-text
 routing in step 2, giving predictable retrieval when you know where to look. The
-response echoes the applied `filters`.
+response echoes the applied `filters`. A filter value matches the slug form that
+writes and imports store (`domain="Work Notes"` finds `work-notes`) and also its
+spelling as given, so records and pages stored by older versions under
+`Work Notes` are still found; `reliquary_list_pages` filters `domain` the same way.
 
 ### Endpoints
 

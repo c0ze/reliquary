@@ -146,3 +146,68 @@ def test_ownerless_persisted_session_adopts_its_first_credential(make_proxy, tmp
     restarted = make_proxy(state_dir=str(state), static_tokens=tokens)
     assert _ping(restarted, READER, "legacy") == 404
     assert _ping(restarted, CLAUDE, "legacy") == 200
+
+
+# --- 5. explicit search filters accept the spelling writes accept --------------
+
+
+def _tool(p, name, arguments, endpoint="claude"):
+    profile = p.endpoint_profiles[getattr(p.settings, f"{endpoint}_mcp_path")]
+    return asyncio.run(p.call_mcp_tool(profile, name, arguments, can_write=True))
+
+
+def _search_ids(p, **arguments):
+    result = _tool(p, "reliquary_search", {"query": "notes", "limit": 20, **arguments})
+    assert not result.get("isError"), result
+    return {item["id"] for item in result["structuredContent"]["results"]}
+
+
+def test_explicit_filter_round_trips_a_normalised_write(proxy):
+    added = _tool(proxy, "reliquary_add_memory", {"text": "Rack wiring plan", "domain": "Work Notes"})
+    new_id = added["structuredContent"]["ids"][0]
+    assert proxy.memory.get(new_id)["metadata"]["domain"] == "work-notes"
+    assert new_id in _search_ids(proxy, domain="Work Notes")
+    assert new_id in _search_ids(proxy, domain="work-notes")
+
+
+def test_explicit_filter_still_finds_records_stored_under_the_raw_spelling(proxy):
+    new_id = _tool(proxy, "reliquary_add_memory", {"text": "New note", "domain": "Work Notes"})[
+        "structuredContent"]["ids"][0]
+    legacy_id = proxy.memory.add("Legacy note", user_id="my_lord",
+                                 metadata={"domain": "Work Notes", "source_group": "user-write"})["results"][0]["id"]
+    other_id = proxy.memory.add("Elsewhere", user_id="my_lord",
+                                metadata={"domain": "Home", "source_group": "user-write"})["results"][0]["id"]
+    found = _search_ids(proxy, domain="Work Notes")
+    assert {new_id, legacy_id} <= found
+    assert other_id not in found  # still a hard restriction
+    # The pool is the same on every page: paging through finds each record once.
+    first = _tool(proxy, "reliquary_search", {"query": "notes", "limit": 1, "domain": "Work Notes"})
+    second = _tool(proxy, "reliquary_search", {"query": "notes", "limit": 1, "domain": "Work Notes",
+                                               "cursor": first["structuredContent"]["nextCursor"]})
+    paged = [first["structuredContent"]["results"][0]["id"], second["structuredContent"]["results"][0]["id"]]
+    assert sorted(paged) == sorted([new_id, legacy_id])
+    assert second["structuredContent"]["nextCursor"] is None
+
+
+def test_explicit_filter_reaches_new_and_legacy_compiled_pages(proxy):
+    _tool(proxy, "reliquary_compile_page", {"slug": "new-page", "title": "New page", "markdown": "notes body",
+                                            "domain": "Work Notes"})
+    assert proxy.pages.get("new-page").domain == "work-notes"
+    # A page filed by an older version keeps the raw spelling in the registry and index.
+    info = proxy.pages.put_revision("old-page", "notes body", {"title": "Old page", "domain": "Work Notes"})
+    proxy.compiled_memory.add("notes body", user_id="my_lord", metadata={
+        "kind": "synthesis", "source_group": "compiled", "slug": "old-page", "domain": "Work Notes",
+        "blob_ref": info.current_blob})
+    found = _search_ids(proxy, domain="Work Notes")
+    assert {"new-page", "old-page"} <= found
+
+
+def test_list_pages_domain_filter_accepts_either_spelling(proxy):
+    _tool(proxy, "reliquary_compile_page", {"slug": "new-page", "title": "New", "markdown": "b", "domain": "Work Notes"})
+    proxy.pages.put_revision("old-page", "b", {"title": "Old", "domain": "Work Notes"})
+    proxy.pages.put_revision("elsewhere", "b", {"title": "Else", "domain": "home"})
+    for domain in ("Work Notes", " Work Notes "):
+        pages = _tool(proxy, "reliquary_list_pages", {"domain": domain})["structuredContent"]["pages"]
+        assert {page["slug"] for page in pages} == {"new-page", "old-page"}
+    pages = _tool(proxy, "reliquary_list_pages", {"domain": "work-notes"})["structuredContent"]["pages"]
+    assert {page["slug"] for page in pages} == {"new-page"}
