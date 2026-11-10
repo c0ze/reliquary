@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,9 +36,24 @@ EXTRA_ALIASES: dict[str, set[str]] = {
 }
 
 
+def _slug_char(char: str) -> bool:
+    # Letters, marks and digits of any script. For ASCII this is exactly
+    # [a-zA-Z0-9], so ASCII input slugs exactly as it always has.
+    return unicodedata.category(char)[0] in {"L", "M", "N"}
+
+
 def slugify_value(value: str) -> str:
-    value = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
-    return value
+    """Case-folded, NFKC-normalised slug: runs of anything that is not a letter,
+    mark or digit (of any script) become one '-'. 'Work Notes' -> 'work-notes',
+    'Günlük' -> 'günlük', '日記' -> '日記'."""
+    value = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", value).casefold())
+    out: list[str] = []
+    for char in value:
+        if _slug_char(char):
+            out.append(char)
+        elif out and out[-1] != "-":
+            out.append("-")
+    return "".join(out).strip("-")
 
 
 def query_text(value: str) -> str:
@@ -69,6 +84,7 @@ class QueryRoute:
 
 class CorpusCatalog:
     def __init__(self, records: list[CorpusRecord]):
+        records = self._unique_records(records)
         self.records_by_id = {record.import_record_id: record for record in records}
         self.alias_maps: dict[str, defaultdict[str, set[str]]] = {
             "domain": defaultdict(set),
@@ -98,7 +114,9 @@ class CorpusCatalog:
 
         records: list[CorpusRecord] = []
         for current_path in paths:
-            with current_path.open("r", encoding="utf-8") as handle:
+            # utf-8-sig drops a byte-order mark; errors="replace" confines an
+            # invalid byte to its own record instead of failing the whole file.
+            with current_path.open("r", encoding="utf-8-sig", errors="replace") as handle:
                 for lineno, line in enumerate(handle, start=1):
                     line = line.strip()
                     if not line:
@@ -108,9 +126,15 @@ class CorpusCatalog:
                     # catalog=None and every imported-record fetch would 404).
                     try:
                         payload = json.loads(line)
+                        record_id = payload["id"]
+                        if isinstance(record_id, bool) or not isinstance(record_id, (str, int)) \
+                                or not str(record_id).strip():
+                            raise ValueError(f"id must be a non-empty string, got {record_id!r}")
                         metadata = payload.get("metadata") or {}
+                        if not isinstance(metadata, dict):
+                            raise ValueError("metadata must be an object")
                         record = CorpusRecord(
-                            import_record_id=str(payload["id"]),
+                            import_record_id=str(record_id),
                             title=str(metadata.get("title") or "<untitled>"),
                             text=str(payload.get("text") or ""),
                             metadata=metadata,
@@ -122,6 +146,22 @@ class CorpusCatalog:
                         continue
                     records.append(record)
         return cls(records)
+
+    @staticmethod
+    def _unique_records(records: list[CorpusRecord]) -> list[CorpusRecord]:
+        # The same id twice is one record (the last one wins, as in ingest);
+        # counting both would inflate value counts and keep stale taxonomy.
+        unique: dict[str, CorpusRecord] = {}
+        duplicates = 0
+        for record in records:
+            if record.import_record_id in unique:
+                duplicates += 1
+                del unique[record.import_record_id]
+            unique[record.import_record_id] = record
+        if duplicates:
+            print(f"[catalog] {duplicates} duplicate record id(s); the last occurrence of each wins",
+                  file=sys.stderr)
+        return list(unique.values())
 
     def _build_indexes(self, records: list[CorpusRecord]) -> None:
         domains: set[str] = set()

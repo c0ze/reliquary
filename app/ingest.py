@@ -10,10 +10,26 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from metadata_policy import honours_import_id
+# Mem0 reports anonymous usage to PostHog unless MEM0_TELEMETRY is false, and
+# reads the variable once, when mem0 is first imported. Default it off before
+# anything imports mem0; an explicit MEM0_TELEMETRY=true still opts in.
+os.environ.setdefault("MEM0_TELEMETRY", "false")
+
+from catalog import slugify_value  # noqa: E402
+from metadata_policy import honours_import_id  # noqa: E402
 
 
 IMPORT_BOOKKEEPING_KEYS = {"import_record_id", "import_content_hash", "source_group"}
+# Taxonomy fields are stored as the same slugs the catalog advertises and routes
+# on, so a route filter such as {"domain": "work-notes"} matches the payload.
+TAXONOMY_FIELDS = ("domain", "hall", "room", "topic")
+# Mem0 owns the top-level created_at/updated_at of every memory: add() sets
+# updated_at = created_at and update() sets updated_at = now. The corpus's own
+# dates are kept under these namespaced keys so the recency tiebreaker uses them.
+SOURCE_DATE_KEYS = {
+    "source_updated_at": ("updated_at", "updatedAt"),
+    "source_created_at": ("created_at", "createdAt", "timestamp", "date"),
+}
 
 
 def _clean_import_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -29,12 +45,48 @@ def record_content_hash(item: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _source_date(metadata: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip()):
+            return value
+    return None
+
+
+def derived_import_fields(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Fields the importer derives from a record's own metadata.
+
+    They are not part of `import_content_hash` (which hashes the record as
+    written in the JSONL), so adding a derived field never changes the hash.
+    """
+    derived: dict[str, Any] = {}
+    for field in TAXONOMY_FIELDS:
+        value = metadata.get(field)
+        if isinstance(value, str) and value:
+            derived[field] = slugify_value(value)
+    for target, keys in SOURCE_DATE_KEYS.items():
+        if target in metadata:
+            continue  # an explicit value in the corpus wins
+        value = _source_date(metadata, keys)
+        if value is not None:
+            derived[target] = value
+    return derived
+
+
 def import_metadata(item: dict[str, Any]) -> dict[str, Any]:
     metadata = dict(item.get("metadata") or {})
+    metadata.update(derived_import_fields(metadata))
     metadata["import_record_id"] = item["id"]
     metadata["import_content_hash"] = record_content_hash(item)
     metadata["source_group"] = "imported"
     return metadata
+
+
+def _derived_fields_current(stored: dict[str, Any], item: dict[str, Any]) -> bool:
+    derived = derived_import_fields(dict(item.get("metadata") or {}))
+    return all(stored.get(key) == value for key, value in derived.items())
 
 
 def _memory_results(result: Any) -> list[dict[str, Any]]:
@@ -75,7 +127,11 @@ def existing_import_index(memory: Any, *, user_id: str) -> dict[str, dict[str, A
                 "text": hit.get("memory") or "",
                 "metadata": metadata,
             })
-        index[str(import_id)] = {"id": str(memory_id), "content_hash": str(content_hash)}
+        index[str(import_id)] = {
+            "id": str(memory_id),
+            "content_hash": str(content_hash),
+            "metadata": dict(metadata),
+        }
     return index
 
 
@@ -100,9 +156,15 @@ def ingest_records(
     *,
     user_id: str,
     infer: bool = False,
-    incremental: bool = False,
+    incremental: bool = True,
     page_registry=None,
 ) -> dict[str, int]:
+    for position, item in enumerate(records, start=1):
+        problem = record_problem(item)
+        if problem:
+            # Validate everything before the first write, so a bad record can
+            # never leave a half-imported corpus behind.
+            raise ValueError(f"Invalid record #{position}: {problem}")
     existing = existing_import_index(memory, user_id=user_id) if incremental else {}
     summary = {"selected": len(records), "added": 0, "updated": 0, "skipped": 0}
     touched_ids: set[str] = set()
@@ -113,7 +175,14 @@ def ingest_records(
         current_hash = metadata["import_content_hash"]
         previous = existing.get(str(item["id"]))
         if previous and previous["content_hash"] == current_hash:
-            summary["skipped"] += 1
+            if _derived_fields_current(previous.get("metadata") or {}, item) or not hasattr(memory, "update"):
+                summary["skipped"] += 1
+                continue
+            # Same record, but imported before the importer derived slugged
+            # taxonomy and source dates: rewrite its metadata once. The content
+            # is unchanged, so compiled pages are not marked stale.
+            memory.update(previous["id"], item["text"], metadata)
+            summary["updated"] += 1
             continue
         if previous and hasattr(memory, "update"):
             memory.update(previous["id"], item["text"], metadata)
@@ -138,9 +207,25 @@ def ingest_records(
     return summary
 
 
+def record_problem(item: Any) -> str | None:
+    """Why a corpus record cannot be imported, or None when it is valid."""
+    if not isinstance(item, dict):
+        return "expected a JSON object"
+    if "id" not in item or "text" not in item or "metadata" not in item:
+        return "required keys are id, text, metadata"
+    if not isinstance(item["id"], str) or not item["id"].strip():
+        return "id must be a non-empty string"
+    if not isinstance(item["text"], str) or not item["text"].strip():
+        return "text must be a non-empty string"
+    if item["metadata"] is not None and not isinstance(item["metadata"], dict):
+        return "metadata must be an object"
+    return None
+
+
 def read_jsonl(path: Path) -> list[dict]:
     records = []
-    with path.open("r", encoding="utf-8") as handle:
+    # utf-8-sig: a byte-order mark (Windows editors add one) must not break line 1.
+    with path.open("r", encoding="utf-8-sig") as handle:
         for lineno, line in enumerate(handle, start=1):
             line = line.strip()
             if not line:
@@ -149,14 +234,11 @@ def read_jsonl(path: Path) -> list[dict]:
                 item = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise SystemExit(f"Invalid JSON in {path} at line {lineno}: {exc}") from exc
-            if not isinstance(item, dict):
-                raise SystemExit(f"Invalid record in {path} at line {lineno}: expected a JSON object")
-            if "id" not in item or "text" not in item or "metadata" not in item:
-                raise SystemExit(
-                    f"Invalid record in {path} at line {lineno}: required keys are id, text, metadata"
-                )
-            if not isinstance(item["metadata"], dict):
-                raise SystemExit(f"Invalid record in {path} at line {lineno}: metadata must be an object")
+            problem = record_problem(item)
+            if problem is None and not isinstance(item["metadata"], dict):
+                problem = "metadata must be an object"
+            if problem:
+                raise SystemExit(f"Invalid record in {path} at line {lineno}: {problem}")
             records.append(item)
     return records
 
@@ -273,12 +355,13 @@ def load_config(config_arg: str) -> dict:
     return synthesize_embedder_config(config)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Ingest a JSONL corpus into Mem0. Each line is a record: "
             '{"id": "...", "text": "...", "metadata": {...}}. Records are '
-            "de-duplicated by `id`."
+            "de-duplicated by `id`: re-running updates changed records and skips "
+            "unchanged ones."
         )
     )
     parser.add_argument(
@@ -287,13 +370,23 @@ def main() -> None:
         help="One or more JSONL files (or directories of *.jsonl) to ingest.",
     )
     parser.add_argument("--config", default="~/.mem0/config.yaml", help="Path to your Mem0 config file.")
-    parser.add_argument("--user-id", default="default", help="Mem0 user_id to attach to every imported record.")
+    parser.add_argument(
+        "--user-id",
+        default=os.getenv("RELIQUARY_USER_ID") or "default",
+        help="Mem0 user_id to attach to every imported record (env RELIQUARY_USER_ID; default 'default', "
+        "which is also the server's default). It must match the server's --user-id or the records are invisible.",
+    )
     parser.add_argument("--limit", type=non_negative_int, default=None, help="Only ingest the first N unique records.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be imported without calling Mem0.")
     parser.add_argument(
         "--incremental",
-        action="store_true",
-        help="Skip unchanged records and update changed records by stable JSONL id.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Skip unchanged records and update changed records by stable JSONL id (default). "
+            "--no-incremental adds every record without looking for earlier imports, so "
+            "re-running it on an existing collection duplicates the corpus."
+        ),
     )
     parser.add_argument(
         "--infer",
@@ -304,7 +397,11 @@ def main() -> None:
             "Disabled by default so raw records are stored reliably."
         ),
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     paths: list[Path] = []
     for entry in args.dataset:
