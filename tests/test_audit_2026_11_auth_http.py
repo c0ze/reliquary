@@ -232,3 +232,22 @@ def test_non_ascii_bearer_on_authorize_form_is_401(proxy):
             "code_challenge": challenge, "code_challenge_method": "S256", "bearer_token": "café"}
     resp = _call(proxy, "POST", "/oauth/authorize", body=urlencode(form).encode())
     assert resp["status"] == 401
+
+
+# --- 5. malformed MCP bodies --------------------------------------------------
+
+
+@pytest.mark.parametrize("body", [b"\xff\xfe{not utf-8", b'{"jsonrpc": "2.0", "id": 1, "method": "\xc3"}',
+                                  b"[" * 100000 + b"]" * 100000])
+def test_malformed_mcp_body_is_parse_error(proxy, body):
+    resp = _call(proxy, "POST", "/claude/mcp", body=body, headers=CLAUDE)
+    assert resp["status"] == 400
+    assert json.loads(resp["body"])["error"]["code"] == -32700
+
+
+@pytest.mark.parametrize("path,headers", [("/oauth/register", {}), ("/v1/chat/completions", CLAUDE),
+                                          ("/reliquary/search", CLAUDE)])
+def test_malformed_json_bodies_elsewhere_are_400(proxy, path, headers):
+    for body in (b'{"a": "\xc3"}', b"[" * 20000 + b"]" * 20000):
+        resp = _call(proxy, "POST", path, body=body, headers=headers)
+        assert resp["status"] == 400, (path, body[:10])

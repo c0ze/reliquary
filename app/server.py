@@ -808,7 +808,7 @@ class ReliquaryChatProxy:
             if body:
                 try:
                     payload = json.loads(body)
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):  # bad JSON, bad UTF-8, too deep
                     await self.send_json(send, 400, {"error": "Body must be valid JSON"})
                     return
 
@@ -904,7 +904,7 @@ class ReliquaryChatProxy:
             )
         try:
             message = json.loads(body or b"{}")
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # bad JSON, bad UTF-8, too deep
             await self.send_json(send, 400, self.mcp_error(None, -32700, "Invalid JSON"))
             return
 
@@ -3433,7 +3433,7 @@ class ReliquaryChatProxy:
         body = await self.read_body(receive, self.request_body_max_bytes())
         try:
             payload = json.loads(body or b"{}")
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # bad JSON, bad UTF-8, too deep
             await self.send_json(send, 400, {"error": "Request body must be valid JSON"})
             return
 
@@ -4158,7 +4158,7 @@ class ReliquaryChatProxy:
         body = await self.read_body(receive)
         try:
             payload = json.loads(body or b"{}")
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # bad JSON, bad UTF-8, too deep
             await self.send_json(send, 400, {"error": "invalid_client_metadata", "error_description": "Invalid JSON"})
             return
         if not isinstance(payload, dict):
