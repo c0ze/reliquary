@@ -292,3 +292,34 @@ def test_failed_replacement_add_for_an_existing_page_is_cleaned_up(proxy, monkey
     tracked = proxy.pages.get("pg").memory_id
     assert [mid for mid, rec in proxy.compiled_memory._store.items() if rec["metadata"]["slug"] == "pg"] in ([], [tracked])
     assert result["structuredContent"]["index_confirmed"] is False  # the restored revision is not indexed
+
+
+# f -- an interrupted import still invalidates what it already touched -------
+
+def test_interrupted_ingest_marks_pages_of_already_updated_records_stale(tmp_path):
+    from blobs import BlobStore
+    from compiled import PageRegistry
+    from ingest import ingest_records
+    from test_audit_2026_11_ingest import Mem0LikeMemory
+
+    registry = PageRegistry(str(tmp_path / "compiled"), BlobStore(str(tmp_path / "blobs"), b"k"))
+    registry.put_revision("by-id", "s", {"derived_from": ["r1"], "status": "current"})
+    registry.put_revision("by-tax", "s", {"domain": "old-domain", "topic": "old-topic", "status": "current"})
+    memory = Mem0LikeMemory()
+    original = [{"id": "r1", "text": "Tokyo", "metadata": {"domain": "old-domain", "topic": "old-topic"}},
+                {"id": "r2", "text": "two", "metadata": {}}]
+    ingest_records(memory, original, user_id="u")
+    changed = [{"id": "r1", "text": "Osaka", "metadata": {"domain": "new-domain", "topic": "new-topic"}},
+               {"id": "r2", "text": "two, changed", "metadata": {}}]
+    real_update = memory.update
+
+    def update(memory_id, data, metadata=None):
+        if data == "two, changed":
+            raise ConnectionError("qdrant down")  # the run stops after r1 landed
+        return real_update(memory_id, data, metadata)
+
+    memory.update = update
+    with pytest.raises(ConnectionError):
+        ingest_records(memory, changed, user_id="u", page_registry=registry)
+    assert registry.get("by-id").status == "stale"
+    assert registry.get("by-tax").status == "stale"  # filed under r1's taxonomy before the update
