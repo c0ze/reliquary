@@ -60,8 +60,12 @@ The app publishes only `127.0.0.1:8787`, behind the Cloudflare tunnel for
 `https://reliquary.arda.tr`. Rebuild and recreate only the app; preserve the
 Qdrant, Ollama, corpus, blob, compiled and OAuth state mounts.
 
-The September 2026 audit uses a local image selected by
-`/home/arda/reliquary-deploy/docker-compose.override.yml`. A plain
+The local image selected by
+`/home/arda/reliquary-deploy/docker-compose.override.yml` is
+`reliquary:openai-json-fix-20261003`. It includes the September audit fixes and
+the OpenAI search/fetch JSON response correction. A plain
 `docker compose up -d --no-deps app` from that directory includes the override.
 No registry release is implied by a local deployment. See
-[the audit record](docs/AUDIT-2026-09-06.md) for fixes, evidence and rollback.
+[the audit record](docs/AUDIT-2026-09-06.md) and
+[the JSON fix verification](docs/OPENAI-JSON-FIX-2026-10-03.md) for evidence
+and rollback.

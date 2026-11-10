@@ -1050,6 +1050,7 @@ class ReliquaryChatProxy:
                     structured={"error": "rate_limited", "category": category},
                     is_error=True,
                 )
+                result = self._format_retrieval_result(profile, tool_name, result)
             else:
                 from context import resolve_context
                 ctx = resolve_context(tool_arguments, headers)
@@ -1412,6 +1413,26 @@ class ReliquaryChatProxy:
                         "required": ["query"],
                         "additionalProperties": False,
                     },
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "results": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "title": {"type": "string"},
+                                        "url": {"type": "string"},
+                                    },
+                                    "required": ["id", "title", "url"],
+                                },
+                            },
+                            "nextCursor": {"type": ["string", "null"]},
+                        },
+                        "required": ["results"],
+                    },
                 },
                 {
                     "name": "list_domains",
@@ -1430,6 +1451,17 @@ class ReliquaryChatProxy:
                         "properties": {"id": {"type": "string", "description": "Document id returned by search."}},
                         "required": ["id"],
                         "additionalProperties": False,
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "title": {"type": "string"},
+                            "text": {"type": "string"},
+                            "url": {"type": "string"},
+                            "metadata": {"type": "object"},
+                        },
+                        "required": ["id", "title", "text", "url"],
                     },
                 },
                 {
@@ -1850,7 +1882,23 @@ class ReliquaryChatProxy:
             ])
         return claude_tools
 
+    @staticmethod
+    def _format_retrieval_result(profile: EndpointProfile, tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
+        # OpenAI's search/fetch contract mirrors structuredContent as JSON text
+        # for clients that parse content instead. Keep Claude's readable text
+        # and every other tool's existing presentation unchanged.
+        if profile.name != "openai" or tool_name not in {"search", "fetch"}:
+            return result
+        return {
+            **result,
+            "content": [{"type": "text", "text": json.dumps(result["structuredContent"], ensure_ascii=False)}],
+        }
+
     async def call_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any], *, can_write: bool = False, context=None) -> dict[str, Any]:
+        result = await self._dispatch_mcp_tool(profile, tool_name, arguments, can_write=can_write, context=context)
+        return self._format_retrieval_result(profile, tool_name, result)
+
+    async def _dispatch_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any], *, can_write: bool = False, context=None) -> dict[str, Any]:
         try:
             if profile.name == "openai":
                 if tool_name == "capabilities":
