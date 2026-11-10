@@ -154,3 +154,60 @@ def test_deliberate_validation_errors_keep_their_messages(proxy):
     result = call(proxy, "reliquary_update", {"id": "x", "text": "t", "metadata": "nope"}, endpoint="claude")
     assert result["structuredContent"] == {"error": "invalid_metadata"}
     assert result["content"][0]["text"] == "`metadata` must be an object."
+
+
+# ---------------------------------------------------------------------------
+# 3. Near-duplicate filter must not collapse distinct non-Latin memories
+# ---------------------------------------------------------------------------
+
+def _ids(hits):
+    return [hit["id"] for hit in hits]
+
+
+def test_dedup_keeps_distinct_japanese_notes_sharing_one_latin_word():
+    from retrieval_quality import apply_retrieval_quality
+
+    hits = [
+        {"id": "a", "memory": "東京で iPhone を買った。色は黒。", "score": 0.80},
+        {"id": "b", "memory": "iPhone の画面が割れたので修理に出した。", "score": 0.79},
+    ]
+    assert _ids(apply_retrieval_quality("iPhone", hits, limit=10, now=1_780_000_000)) == ["a", "b"]
+
+
+def test_dedup_keeps_distinct_notes_whose_only_ascii_token_is_a_year():
+    from retrieval_quality import apply_retrieval_quality
+
+    hits = [
+        {"id": "c", "memory": "母の誕生日は 2025 年の春に祝った。", "score": 0.70},
+        {"id": "d", "memory": "2025 年の確定申告は三月に提出済み。", "score": 0.69},
+    ]
+    assert _ids(apply_retrieval_quality("2025", hits, limit=10, now=1_780_000_000)) == ["c", "d"]
+
+
+def test_dedup_still_collapses_japanese_near_duplicates():
+    from retrieval_quality import apply_retrieval_quality
+
+    hits = [
+        {"id": "first", "memory": "東京駅の近くの喫茶店で毎週土曜日に友達と会って話をする。", "score": 0.80},
+        {"id": "again", "memory": "東京駅の近くの喫茶店で毎週土曜日に友達と会って話をする！", "score": 0.79},
+        {"id": "exact", "memory": "東京駅の近くの喫茶店で  毎週土曜日に友達と会って話をする。", "score": 0.78},
+    ]
+    assert _ids(apply_retrieval_quality("喫茶店", hits, limit=10, now=1_780_000_000)) == ["first"]
+
+
+def test_dedup_tokenises_turkish_letters_as_word_characters():
+    from retrieval_quality import _dedup_tokens, apply_retrieval_quality
+
+    # Letters stay whole words (the old [a-z0-9]+ split "şık" into "k");
+    # dotted and dotless i fold together because Turkish casing is ambiguous.
+    assert _dedup_tokens("İstanbul'da şık bir ılık gün; DAĞ yolu") == {
+        "istanbul", "da", "şik", "bir", "ilik", "gün", "dağ", "yolu",
+    }
+    assert _dedup_tokens("ŞIK ılık") == _dedup_tokens("şık ILIK")
+    # "şık" (chic) and "sık" (frequent) stay different words.
+    hits = [
+        {"id": "chic", "memory": "Ayşe şık bir ceket aldı, rengi kırmızı ve çok güzel.", "score": 0.80},
+        {"id": "often", "memory": "Ayşe sık sık ceket alır, rengi önemli değil ama güzel.", "score": 0.79},
+        {"id": "dup", "memory": "AYŞE ŞIK BİR CEKET ALDI, RENGİ KIRMIZI VE ÇOK GÜZEL!", "score": 0.78},
+    ]
+    assert _ids(apply_retrieval_quality("ceket", hits, limit=10, now=1_780_000_000)) == ["chic", "often"]
