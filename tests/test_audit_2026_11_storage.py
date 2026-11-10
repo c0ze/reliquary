@@ -142,3 +142,45 @@ def test_refile_with_explicit_empty_lists_clears_provenance(proxy):
     page = proxy.pages.get("syn")
     assert page.derived_from == [] and page.supersedes == []
     assert page.title == "syn"  # a new page with no title still defaults to its slug
+
+
+# 4 -- over-long slugs: no leaked blob, no raw OSError ----------------------
+
+def test_long_title_is_rejected_before_any_blob_is_written(proxy):
+    result = run(call(proxy, "reliquary_compile_page", {"title": "word " * 60, "markdown": "x"}))
+    assert result["structuredContent"]["error"] == "slug_too_long"
+    assert sidecars(proxy) == []
+
+
+def test_fetch_of_an_over_long_id_is_not_found(proxy):
+    run(call(proxy, "reliquary_compile_page", {"slug": "aa-page", "markdown": "x"}))  # shard dir "aa" exists
+    result = run(call(proxy, "reliquary_fetch", {"id": "a" * 300}))
+    assert result["structuredContent"]["error"] == "not_found"
+
+
+def test_registry_releases_the_blob_when_the_page_cannot_be_saved(tmp_path, monkeypatch):
+    from blobs import BlobStore
+    from compiled import MAX_SLUG_LENGTH, PageRegistry
+
+    registry = PageRegistry(str(tmp_path / "compiled"), BlobStore(str(tmp_path / "blobs"), b"k"))
+    with pytest.raises(ValueError):
+        registry.put_revision("w" * (MAX_SLUG_LENGTH + 1), "body", {})
+
+    def disk_full(info):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(registry, "_save", disk_full)
+    with pytest.raises(OSError):
+        registry.put_revision("ok", "body", {})
+    assert list((tmp_path / "blobs").rglob("*.json")) == []
+
+
+def test_existing_page_over_the_slug_cap_can_still_be_refiled(proxy, monkeypatch):
+    import compiled
+
+    run(call(proxy, "reliquary_compile_page", {"slug": "legacy-long-slug", "markdown": "v1"}))
+    monkeypatch.setattr(compiled, "MAX_SLUG_LENGTH", 8)
+    refiled = run(call(proxy, "reliquary_compile_page", {"slug": "legacy-long-slug", "markdown": "v2"}))
+    assert refiled["isError"] is False
+    fresh = run(call(proxy, "reliquary_compile_page", {"slug": "another-long-one", "markdown": "v1"}))
+    assert fresh["structuredContent"]["error"] == "slug_too_long"

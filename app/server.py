@@ -2407,7 +2407,7 @@ class ReliquaryChatProxy:
         if self.pages is None or self.compiled_memory is None:
             return self.mcp_tool_result(text="The compiled layer is not configured.",
                                         structured={"error": "compiled_disabled"}, is_error=True)
-        from compiled import slugify, VALID_STATUSES
+        from compiled import slugify, MAX_SLUG_LENGTH, VALID_STATUSES
         markdown = str(arguments.get("markdown") or "").strip()
         if not markdown:
             return self.mcp_tool_result(text="A non-empty `markdown` is required.",
@@ -2438,6 +2438,10 @@ class ReliquaryChatProxy:
                     structured={"error": "invalid_argument", "key": key}, is_error=True)
             id_lists[key] = [str(x).strip() for x in value if str(x).strip()]
         previous = self.pages.get(slug)
+        if previous is None and len(slug) > MAX_SLUG_LENGTH:
+            return self.mcp_tool_result(
+                text=f"The page slug is {len(slug)} characters; pass a `slug` of at most {MAX_SLUG_LENGTH}.",
+                structured={"error": "slug_too_long", "max_length": MAX_SLUG_LENGTH}, is_error=True)
         frontmatter: dict[str, Any] = {"status": status, **id_lists}
         if title or previous is None:
             frontmatter["title"] = title or slug

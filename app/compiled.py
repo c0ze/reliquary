@@ -31,6 +31,9 @@ _REGISTRY_LOCK = threading.Lock()
 
 VALID_STATUSES = ("current", "stale", "draft", "archived")
 
+# Slugs become file names (<slug>.json); keep them well under NAME_MAX (255).
+MAX_SLUG_LENGTH = 120
+
 
 def slugify(value: str) -> str:
     """Lowercase, collapse runs of non-alphanumerics to single hyphens, trim."""
@@ -108,7 +111,9 @@ class PageRegistry:
                 data = json.load(fh)
             fields = {k: v for k, v in data.items() if k in PageInfo.__dataclass_fields__}
             return PageInfo(**fields)
-        except (FileNotFoundError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError):
+            # OSError covers missing files and names the filesystem rejects
+            # (ENAMETOOLONG for an over-long id passed in by fetch).
             return None
 
     def read_body(self, slug: str) -> "tuple[str, str] | None":
@@ -137,6 +142,8 @@ class PageRegistry:
         now = time.time()
         with _REGISTRY_LOCK:
             existing = self.get(slug)
+            if existing is None and len(slug) > MAX_SLUG_LENGTH:
+                raise ValueError(f"slug longer than {MAX_SLUG_LENGTH} characters")
             # Keep the superseded revision intact while constructing its successor.
             info = PageInfo(**asdict(existing)) if existing else PageInfo(slug=slug, current_blob="", created_at=now)
             for key in ("title", "domain", "hall", "room", "topic", "status", "kind"):
@@ -173,7 +180,14 @@ class PageRegistry:
                     "status": existing.status,
                 })
             info.current_blob = blob_info.id
-            self._save(info)
+            try:
+                self._save(info)
+            except BaseException:
+                # Don't leak the reference put() took for a revision that was
+                # never recorded (an identical re-file already released it).
+                if not (existing and existing.current_blob == blob_info.id):
+                    self.blobs.delete(blob_info.id)
+                raise
             return info
 
     def rollback_revision(self, slug: str, previous: "PageInfo | None", new_blob: str) -> None:
