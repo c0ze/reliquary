@@ -501,6 +501,7 @@ def test_startup_releases_the_blob_of_an_unusable_slot(make_proxy, tmp_path):
     (state / "pending_uploads.json").write_text(json.dumps({
         "upl_bad": {"id": "upl_bad", "created_at": 1.0, "expires_at": None, "blob_id": blob.id}}))
     proxy = make_proxy(state_dir=str(state))
+    run(proxy._reap_expired_uploads())  # settled by the first pass after start
     assert proxy.blobs.info(blob.id) is None
 
 

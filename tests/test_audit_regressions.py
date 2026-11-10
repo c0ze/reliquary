@@ -128,6 +128,7 @@ def test_expired_post_reclaims_previously_uploaded_bytes(proxy):
             blob_id = result.json()["blob_id"]
             proxy.pending_uploads[slot["upload_id"]].expires_at = 1
             assert (await client.post(slot["upload_url"], content=PNG, headers=headers)).status_code == 410
+        await proxy._reap_expired_uploads()  # the POST schedules the settling pass
         assert proxy.blobs.info(blob_id) is None
     asyncio.run(scenario())
 
