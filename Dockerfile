@@ -1,9 +1,11 @@
 # Reliquary MCP memory server.
 FROM python:3.12-slim
 
-# Avoid .pyc + buffered stdout in containers.
+# Avoid .pyc + buffered stdout in containers. Mem0 sends usage telemetry to
+# PostHog unless MEM0_TELEMETRY is false; set MEM0_TELEMETRY=true to opt in.
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    MEM0_TELEMETRY=false
 
 WORKDIR /srv
 
@@ -19,10 +21,15 @@ COPY app/ ./app/
 # Run as a non-root user (least privilege). Give it a real, writable HOME —
 # mem0 writes ~/.mem0 (telemetry / user id) at startup, which fails for a
 # system user whose home defaults to /nonexistent.
-RUN addgroup --system appuser \
-    && adduser --system --ingroup appuser --home /home/appuser appuser \
-    && mkdir -p /home/appuser \
-    && chown -R appuser:appuser /srv /home/appuser
+#
+# The ids are fixed at uid 100 / gid 101 (what earlier images were allocated):
+# bind-mounted data directories must be owned by 100:101 on the host, e.g.
+#   mkdir -p data/blobs data/compiled data/state && sudo chown -R 100:101 data
+# The /data directories are created here too, so named volumes start writable.
+RUN addgroup --system --gid 101 appuser \
+    && adduser --system --uid 100 --ingroup appuser --home /home/appuser appuser \
+    && mkdir -p /home/appuser /data/blobs /data/compiled /data/state \
+    && chown -R appuser:appuser /srv /home/appuser /data
 ENV HOME=/home/appuser
 USER appuser
 

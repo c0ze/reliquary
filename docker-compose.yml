@@ -2,6 +2,8 @@
 #
 #   cp .env.example .env            # set your bearer tokens
 #   cp config.example.yaml config.yaml
+#   mkdir -p data/blobs data/compiled data/state corpus
+#   sudo chown -R 100:101 data      # the app runs as uid 100, gid 101
 #   docker compose up -d            # qdrant + embedder (+ model pull) + app
 #
 # Three services: a Qdrant vector store, an embedding model (Ollama serving
@@ -15,6 +17,12 @@ services:
     volumes:
       - qdrant_storage:/qdrant/storage
     # Not published — only the app talks to it over the compose network.
+    # The image has bash but no curl/wget, so probe /readyz over /dev/tcp.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /readyz HTTP/1.0\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   # Embedding model. Ollama exposes an OpenAI-compatible /v1/embeddings endpoint
   # on port 11434; mem0's "openai" embedder provider points at it (see
@@ -31,7 +39,9 @@ services:
       timeout: 5s
       retries: 12
 
-  # One-shot: pull the embedding model into the shared volume, then exit.
+  # One-shot: pull the embedding model into the shared volume, then exit. It
+  # skips the pull when the model is already there, so the app can be recreated
+  # without network access.
   embedder-pull:
     image: ollama/ollama:0.30.0
     depends_on:
@@ -39,7 +49,7 @@ services:
         condition: service_healthy
     environment:
       OLLAMA_HOST: "embedder:11434"
-    entrypoint: ["ollama", "pull", "nomic-embed-text"]
+    entrypoint: ["/bin/sh", "-c", "ollama show nomic-embed-text >/dev/null 2>&1 || ollama pull nomic-embed-text"]
     restart: "no"
 
   app:
@@ -56,13 +66,26 @@ services:
     # Default RELIQUARY_STATE_DIR to the mounted state volume even if .env ships
     # it blank, so OAuth tokens + MCP sessions persist across restarts instead of
     # signing connectors out. An explicit value in .env still wins.
+    # Mem0 usage telemetry (PostHog) stays off unless .env sets it to true.
     environment:
       RELIQUARY_STATE_DIR: ${RELIQUARY_STATE_DIR:-/data/state}
+      MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
+    # Bind mounts must be owned by uid 100 / gid 101 (the image's appuser), or
+    # startup fails its write probe: Docker creates a missing host directory
+    # root-owned. The corpus is mounted read-only at /corpus for ingest and
+    # RELIQUARY_DATASET_PATH (e.g. /corpus/corpus.jsonl).
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ${BLOB_HOST_DIR:-./data/blobs}:/data/blobs
       - ${COMPILED_HOST_DIR:-./data/compiled}:/data/compiled
       - ${STATE_HOST_DIR:-./data/state}:/data/state
+      - ${CORPUS_HOST_DIR:-./corpus}:/corpus:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; r = u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8787/healthz', timeout=4); raise SystemExit(r.status != 200)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
     # Publish to loopback only; put Cloudflare Tunnel / Caddy / Traefik in front
     # for public TLS. Remove the 127.0.0.1 prefix at your own risk.
     ports:
