@@ -22,5 +22,7 @@ class AuditLog:
         with self._lock:
             directory = os.path.dirname(self.path) or "."
             os.makedirs(directory, exist_ok=True)
-            with open(self.path, "a", encoding="utf-8") as fh:
+            # Created owner-only: the log names memory ids and user ids.
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
                 fh.write(line)

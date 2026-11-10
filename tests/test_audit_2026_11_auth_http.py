@@ -436,3 +436,22 @@ def test_rate_limit_keys_static_tokens_by_label(make_proxy):
 
 def test_rate_limits_default_off(proxy):
     assert proxy.write_limiter.limit == 0 and proxy.search_limiter.limit == 0
+
+
+# --- 11. audit log permissions ----------------------------------------------
+
+
+def test_audit_log_is_created_owner_only(tmp_path):
+    import os
+    import stat
+    from audit import AuditLog
+    path = tmp_path / "logs" / "audit.jsonl"
+    old = os.umask(0o022)
+    try:
+        log = AuditLog(str(path))
+        log.record(action="add", ids={"id": "1"})
+        log.record(action="delete", ids={"id": "1"})
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert [json.loads(line)["action"] for line in path.read_text().splitlines()] == ["add", "delete"]
