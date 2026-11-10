@@ -472,3 +472,39 @@ def test_failed_retry_after_a_crash_keeps_the_committed_bytes(make_proxy, tmp_pa
     monkeypatch.setattr(memory, "add", down)
     run(call(restarted, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "retry"}))
     assert restarted.blobs.get(committed["blob_id"]) is not None
+
+
+# 11 -- a type-invalid pending_uploads.json neither crashes nor leaks --------
+
+def test_startup_skips_type_invalid_upload_slots(make_proxy, tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "pending_uploads.json").write_text(json.dumps({
+        "upl_null": {"id": "upl_null", "created_at": 1.0, "expires_at": None},
+        "upl_str": {"id": "upl_str", "created_at": "yesterday", "expires_at": 1e12},
+        "upl_path": {"id": "upl_path", "created_at": 1.0, "expires_at": 1e12, "blob_id": "../../etc/passwd"},
+    }))
+    proxy = make_proxy(state_dir=str(state))
+    assert proxy.pending_uploads == {}
+    assert json.loads((state / "pending_uploads.json").read_text()) == {}
+
+
+def test_startup_releases_the_blob_of_an_unusable_slot(make_proxy, tmp_path):
+    from blobs import BlobStore
+
+    state = tmp_path / "state"
+    state.mkdir()
+    blob = BlobStore(str(tmp_path / "blobs"), b"test-signing-key").put(PNG)  # the slot's reference
+    (state / "pending_uploads.json").write_text(json.dumps({
+        "upl_bad": {"id": "upl_bad", "created_at": 1.0, "expires_at": None, "blob_id": blob.id}}))
+    proxy = make_proxy(state_dir=str(state))
+    assert proxy.blobs.info(blob.id) is None
+
+
+def test_startup_keeps_a_slot_with_an_unknown_field(make_proxy, tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "pending_uploads.json").write_text(json.dumps({
+        "upl_new": {"id": "upl_new", "created_at": 1.0, "expires_at": 1e12, "added_later": True}}))
+    proxy = make_proxy(state_dir=str(state))
+    assert proxy.pending_uploads["upl_new"].expires_at == 1e12

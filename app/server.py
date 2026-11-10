@@ -2627,15 +2627,47 @@ class ReliquaryChatProxy:
         if not self.pending_upload_store:
             return
         restored: dict[str, PendingUpload] = {}
+        dropped = False
         for upload_id, rec in self.pending_upload_store.load().items():
-            if not isinstance(rec, dict):
+            upload = self._pending_upload_from_record(upload_id, rec)
+            if upload is not None:
+                restored[upload_id] = upload
                 continue
-            try:
-                restored[upload_id] = PendingUpload(**rec)
-            except TypeError:
-                continue
+            dropped = True
+            # A malformed slot can still name the blob it holds a reference on;
+            # release it with the cleanup guard instead of leaking it.
+            blob_id = rec.get("blob_id") if isinstance(rec, dict) else None
+            if isinstance(blob_id, str) and re.fullmatch(r"[0-9a-f]{64}", blob_id):
+                info = self.blobs.info(blob_id)
+                if info is not None and info.ref_count > len(info.owners):
+                    self.blobs.delete(blob_id)
         self.pending_uploads = restored
+        if dropped:
+            self._save_pending_uploads()
         self._cleanup_expired_uploads()
+
+    @staticmethod
+    def _pending_upload_from_record(upload_id: str, rec: Any) -> PendingUpload | None:
+        """Type-check one persisted slot; None when it is unusable. Unknown keys
+        are ignored so a slot written by a newer version still loads."""
+        if not isinstance(rec, dict) or rec.get("id") != upload_id:
+            return None
+        fields: dict[str, Any] = {}
+        for name, kinds in (("id", str), ("created_at", (int, float)), ("expires_at", (int, float)),
+                            ("expected_mimetype", str), ("expected_size", int), ("filename", str),
+                            ("blob_id", str), ("mimetype", str), ("size", int), ("profile", str)):
+            value = rec.get(name)
+            if value is None:
+                if name in ("id", "created_at", "expires_at"):
+                    return None
+                continue
+            if isinstance(value, bool) or not isinstance(value, kinds):
+                return None
+            fields[name] = value
+        blob_id = fields.get("blob_id")
+        if blob_id is not None and not re.fullmatch(r"[0-9a-f]{64}", blob_id):
+            return None
+        return PendingUpload(**fields)
 
     def _save_pending_uploads(self) -> None:
         if not self.pending_upload_store:
