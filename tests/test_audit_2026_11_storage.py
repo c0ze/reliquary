@@ -184,3 +184,34 @@ def test_existing_page_over_the_slug_cap_can_still_be_refiled(proxy, monkeypatch
     assert refiled["isError"] is False
     fresh = run(call(proxy, "reliquary_compile_page", {"slug": "another-long-one", "markdown": "v1"}))
     assert fresh["structuredContent"]["error"] == "slug_too_long"
+
+
+# 3 -- a new page slug must not shadow an existing record id ----------------
+
+def test_new_page_cannot_shadow_a_catalog_record(proxy):
+    from catalog import CorpusCatalog, CorpusRecord
+
+    proxy.catalog = CorpusCatalog([CorpusRecord(import_record_id="nas-backup-plan", title="NAS backup plan",
+                                                text="the imported record", metadata={"domain": "infra"},
+                                                source_ref="")])
+    result = run(call(proxy, "reliquary_compile_page", {"title": "NAS backup plan", "markdown": "synthesis"}))
+    assert proxy.pages.get("nas-backup-plan") is None
+    assert result["structuredContent"]["error"] == "slug_conflict"
+    fetched = run(call(proxy, "reliquary_fetch", {"id": "nas-backup-plan"}))
+    assert fetched["structuredContent"]["text"] == "the imported record"
+
+
+def test_new_page_cannot_shadow_a_live_memory(proxy):
+    added = run(call(proxy, "reliquary_add_memory", {"text": "live note"}))
+    memory_id = added["structuredContent"]["ids"][0]
+    result = run(call(proxy, "reliquary_compile_page", {"slug": memory_id, "markdown": "synthesis"}))
+    assert proxy.pages.get(memory_id) is None
+    assert result["structuredContent"]["error"] == "slug_conflict"
+
+
+def test_existing_page_can_be_refiled_under_its_own_slug(proxy, fake_memory):
+    run(call(proxy, "reliquary_compile_page", {"slug": "fake-1", "markdown": "v1"}))
+    run(call(proxy, "reliquary_add_memory", {"text": "now a live memory has the same id"}))
+    assert fake_memory.get("fake-1") is not None
+    refiled = run(call(proxy, "reliquary_compile_page", {"slug": "fake-1", "markdown": "v2"}))
+    assert refiled["isError"] is False

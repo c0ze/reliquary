@@ -2442,6 +2442,20 @@ class ReliquaryChatProxy:
             return self.mcp_tool_result(
                 text=f"The page slug is {len(slug)} characters; pass a `slug` of at most {MAX_SLUG_LENGTH}.",
                 structured={"error": "slug_too_long", "max_length": MAX_SLUG_LENGTH}, is_error=True)
+        if previous is None:
+            # fetch resolves pages before catalog records and live memories, so a
+            # new slug must not take over an existing record id.
+            shadowed = bool(self.catalog and slug in self.catalog.records_by_id)
+            if not shadowed:
+                try:
+                    async with self._read_lock():
+                        shadowed = await asyncio.to_thread(self.memory.get, slug) is not None
+                except Exception:
+                    LOG.debug("Slug collision probe failed for %s", slug, exc_info=True)
+            if shadowed:
+                return self.mcp_tool_result(
+                    text=f"The slug {slug!r} is already a record id; pass a different `slug`.",
+                    structured={"error": "slug_conflict", "slug": slug}, is_error=True)
         frontmatter: dict[str, Any] = {"status": status, **id_lists}
         if title or previous is None:
             frontmatter["title"] = title or slug
