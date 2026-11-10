@@ -2519,7 +2519,14 @@ class ReliquaryChatProxy:
                 # Same lock every other compiled-store op takes: embedded local
                 # Qdrant is not safe under concurrent read/write.
                 async with self.memory_lock.write():
-                    await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
+                    try:
+                        await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
+                    except Exception:
+                        # mem0 raises for an id it does not hold. A vector that is
+                        # already gone (collection rebuilt/restored, or a crash after
+                        # an earlier vector delete) must not wedge the page forever.
+                        if await asyncio.to_thread(self.compiled_memory.get, info.memory_id) is not None:
+                            raise
                 deleted_memory = info.memory_id
             except Exception as exc:
                 LOG.warning("delete_page: aborting; could not delete indexed memory %s for %s: %s",
