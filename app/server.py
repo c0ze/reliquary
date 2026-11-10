@@ -1056,7 +1056,7 @@ class ReliquaryChatProxy:
                 from context import resolve_context
                 ctx = resolve_context(tool_arguments, headers)
                 result = await self.call_mcp_tool(profile, tool_name, tool_arguments, can_write=can_write, context=ctx)
-                self.metrics.record_tool(tool_name, ok=not result.get("isError"))
+                self.metrics.record_tool(self._metric_tool_name(profile, tool_name), ok=not result.get("isError"))
                 if category == "write" and not result.get("isError"):
                     structured = result.get("structuredContent") or {}
                     try:
@@ -1093,6 +1093,12 @@ class ReliquaryChatProxy:
         "reliquary_add_memory", "reliquary_delete", "reliquary_update", "reliquary_add_image",
         "reliquary_delete_image", "reliquary_commit_image_upload", "reliquary_propose_update",
     })
+
+    def _metric_tool_name(self, profile: EndpointProfile, tool_name: str) -> str:
+        """Metric label for a call: names that are not tools of this endpoint
+        collapse to "unknown", so callers cannot mint unbounded series."""
+        known = {tool["name"] for tool in self.mcp_tools_for(profile, can_write=True)}
+        return tool_name if tool_name in known else "unknown"
 
     def _audit_user_id(self, tool_name: str, arguments: dict[str, Any], structured: dict[str, Any]) -> str:
         """The user a successful write really ran as, for the audit log."""

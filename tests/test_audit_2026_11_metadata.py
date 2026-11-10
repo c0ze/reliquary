@@ -281,3 +281,24 @@ def test_audit_records_effective_user_and_page_slug(make_proxy, tmp_path):
     assert [e["user_id"] for e in entries] == ["my_lord", "my_lord", "my_lord", "alice"]
     assert entries[1]["ids"].get("slug") == "pg"
     assert entries[2]["ids"].get("slug") == "pg"
+
+
+# --- 4. metrics labels -------------------------------------------------------
+
+def test_metrics_escape_label_values():
+    metrics = Metrics()
+    metrics.record_tool('x"} 1\nforged_metric{a="b', ok=True)
+    rendered = metrics.render()
+    assert "\nforged_metric" not in rendered
+    assert r'tool="x\"} 1\nforged_metric{a=\"b"' in rendered
+
+
+def test_metrics_record_unknown_tool_names_as_unknown(proxy):
+    s = proxy.settings
+    for index in range(5):
+        _rpc(proxy, s.claude_mcp_path, "claude-secret", f"no_such_tool_{index}", {})
+    _rpc(proxy, s.claude_mcp_path, "claude-secret", 'evil"\nforged 1', {})
+    _rpc(proxy, s.openai_mcp_path, "openai-secret", "reliquary_search", {"query": "x"})  # not an openai tool
+    _rpc(proxy, s.claude_mcp_path, "claude-secret", "reliquary_search", {"query": "x"})
+    tools = {tool for tool, _status in proxy.metrics._tool_calls}
+    assert tools == {"unknown", "reliquary_search"}
