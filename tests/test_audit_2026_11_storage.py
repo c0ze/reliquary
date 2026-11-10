@@ -304,3 +304,102 @@ def test_server_starts_on_embedded_qdrant_with_the_real_mem0(tmp_path):
                           env=env, capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stderr[-2000:]
     assert done.stdout.strip().endswith("ok")
+
+
+# 7 -- every atomic replace is fsynced, then its directory -------------------
+
+def _record_durability(monkeypatch):
+    import os
+    import stat
+
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        kind = "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        events.append((kind, None))
+        return real_fsync(fd)
+
+    def replace(src, dst):
+        events.append(("replace", str(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    return events
+
+
+def _assert_durable(events, *suffixes):
+    replaces = [i for i, (kind, _dst) in enumerate(events) if kind == "replace"]
+    assert replaces, events
+    for i in replaces:
+        assert events[i - 1][0] == "file", events  # data fsynced before the rename
+    assert events[-1][0] == "dir", events          # the rename itself made durable
+    written = [dst for kind, dst in events if kind == "replace"]
+    for suffix in suffixes:
+        assert any(dst.endswith(suffix) for dst in written), (suffix, written)
+
+
+def test_blob_put_fsyncs_bytes_and_sidecar(tmp_path, monkeypatch):
+    from blobs import BlobStore
+
+    store = BlobStore(str(tmp_path / "blobs"), b"k")
+    events = _record_durability(monkeypatch)
+    store.put(PNG)
+    _assert_durable(events, ".png", ".json")
+
+
+def test_page_registry_save_is_fsynced(tmp_path, monkeypatch):
+    from blobs import BlobStore
+    from compiled import PageRegistry
+
+    registry = PageRegistry(str(tmp_path / "compiled"), BlobStore(str(tmp_path / "blobs"), b"k"))
+    events = _record_durability(monkeypatch)
+    registry.put_revision("page", "body", {})
+    _assert_durable(events, "page.json")
+
+
+def test_json_file_store_save_is_fsynced(tmp_path, monkeypatch):
+    from persistence import JsonFileStore
+
+    events = _record_durability(monkeypatch)
+    JsonFileStore(str(tmp_path / "state" / "oauth_tokens.json")).save({"a": 1})
+    _assert_durable(events, "oauth_tokens.json")
+
+
+# 15 -- registry writes from two processes cannot collide --------------------
+
+def test_registry_writes_use_unique_temp_names(tmp_path, monkeypatch):
+    import os
+
+    from blobs import BlobStore
+    from compiled import PageRegistry
+
+    registry = PageRegistry(str(tmp_path / "compiled"), BlobStore(str(tmp_path / "blobs"), b"k"))
+    registry.put_revision("page", "body", {})
+    sources = []
+    real_replace = os.replace
+    monkeypatch.setattr(os, "replace", lambda src, dst: (sources.append(str(src)), real_replace(src, dst))[1])
+    registry.set_status("page", "stale")
+    registry.set_status("page", "current")
+    assert len(sources) == len(set(sources)) == 2
+
+
+def test_registry_mutations_hold_a_cross_process_lock(tmp_path):
+    import os
+
+    fcntl = pytest.importorskip("fcntl")
+    from blobs import BlobStore
+    from compiled import PageRegistry
+
+    registry = PageRegistry(str(tmp_path / "compiled"), BlobStore(str(tmp_path / "blobs"), b"k"))
+    registry.put_revision("page", "body", {})
+    other = os.open(str(tmp_path / "compiled" / ".lock"), os.O_RDWR)
+    try:
+        with registry._locked():
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released afterwards
+    finally:
+        os.close(other)
+    assert [p.slug for p in registry.list()] == ["page"]

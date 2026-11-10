@@ -22,7 +22,15 @@ import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
+
+from persistence import atomic_write
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
 
 if TYPE_CHECKING:
     from blobs import BlobStore
@@ -129,18 +137,30 @@ class PageRegistry:
     # --- write ---
     def _save(self, info: "PageInfo") -> None:
         os.makedirs(self._shard_dir(info.slug), exist_ok=True)
-        path = self._path(info.slug)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(asdict(info), fh)
-        os.replace(tmp, path)
+        atomic_write(self._path(info.slug), json.dumps(asdict(info)).encode("utf-8"))
+
+    @contextmanager
+    def _locked(self):
+        """Serialize registry read-modify-write cycles across threads and, via
+        an advisory lock file, across processes (the ingest CLI marks pages
+        stale while the server may be filing them)."""
+        with _REGISTRY_LOCK:
+            if fcntl is None:
+                yield
+                return
+            fd = os.open(os.path.join(self.registry_dir, ".lock"), os.O_RDWR | os.O_CREAT, 0o666)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                os.close(fd)
 
     def put_revision(self, slug: str, body: str, frontmatter: dict) -> "PageInfo":
         slug = slugify(slug)
         if not slug:
             raise ValueError("empty slug")
         now = time.time()
-        with _REGISTRY_LOCK:
+        with self._locked():
             existing = self.get(slug)
             if existing is None and len(slug) > MAX_SLUG_LENGTH:
                 raise ValueError(f"slug longer than {MAX_SLUG_LENGTH} characters")
@@ -194,7 +214,7 @@ class PageRegistry:
         """Undo a put_revision whose index write failed: restore the previous
         registry entry (or remove a page that did not exist before) and release
         the reference put_revision took on ``new_blob``."""
-        with _REGISTRY_LOCK:
+        with self._locked():
             if previous is None:
                 try:
                     os.remove(self._path(slug))
@@ -254,7 +274,7 @@ class PageRegistry:
         """Hard-delete a page: unlink its current + historical revision blobs
         (ref-counted) and remove the registry entry. Returns the deleted PageInfo
         (so the caller can clean up the indexed memory) or None if absent."""
-        with _REGISTRY_LOCK:
+        with self._locked():
             info = self.get(slug)
             if info is None:
                 return None
@@ -271,7 +291,7 @@ class PageRegistry:
             return info
 
     def set_status(self, slug: str, status: str) -> "PageInfo | None":
-        with _REGISTRY_LOCK:
+        with self._locked():
             if status not in VALID_STATUSES:
                 raise ValueError(f"invalid status: {status!r}")
             info = self.get(slug)
@@ -283,7 +303,7 @@ class PageRegistry:
             return info
 
     def set_memory_id(self, slug: str, memory_id: str) -> None:
-        with _REGISTRY_LOCK:
+        with self._locked():
             info = self.get(slug)
             if info is None:
                 return
