@@ -155,3 +155,38 @@ def test_consent_page_never_shows_userinfo(proxy):
         {"redirect_uri": "https://claude.ai@evil.example/cb"}, error="bad")
     assert '<span class="host">claude.ai' not in page
     assert '<span class="host">evil.example</span>' in page
+
+
+# --- 3. scope parsing fails closed --------------------------------------------
+
+
+@pytest.mark.parametrize("scope", ["read offline_access", "openid read", "READ  search", "openid", "claudeai",
+                                   "ro", "read-only", "reader"])
+def test_scope_without_write_is_read(scope):
+    from oauth import scope_is_write
+    assert scope_is_write(scope) is False
+
+
+@pytest.mark.parametrize("scope", ["write", "read write", "openid write offline_access", "mcp", "", None,
+                                   "  ", "mcp offline_access"])
+def test_write_and_legacy_scopes_grant_write(scope):
+    from oauth import scope_is_write
+    assert scope_is_write(scope) is True
+
+
+def test_oauth_token_with_multiword_read_scope_is_read(proxy):
+    access, _ = proxy.oauth.issue_token_pair(client_id="c", scope="read offline_access")
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    assert proxy.resolve_scope(profile, {"authorization": f"Bearer {access}"}) == "read"
+
+
+def test_static_token_unknown_scope_is_read_and_warns(caplog):
+    import logging
+    from server import parse_static_tokens
+    with caplog.at_level(logging.WARNING):
+        parsed = parse_static_tokens("a:ro:t1;b:read-only:t2;c:reader:t3;d:write:t4;e:mcp:t5;f:read:t6")
+    assert dict((label, scope) for label, scope, _ in parsed) == {
+        "a": "read", "b": "read", "c": "read", "d": "write", "e": "write", "f": "read"}
+    warned = " ".join(r.getMessage() for r in caplog.records)
+    assert "a" in warned and "ro" in warned
+    assert "t1" not in warned  # never log the token itself

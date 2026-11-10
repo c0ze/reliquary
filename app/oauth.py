@@ -20,11 +20,22 @@ REFRESH_TOKEN_TTL = 0  # 0 = non-expiring
 REFRESH_REUSE_GRACE = 24 * 3600
 
 READ_SCOPES = {"read", "readonly", "read_only", "search"}
+WRITE_SCOPES = {"write"}
+LEGACY_WRITE_SCOPE = "mcp"  # what exchange_code stores when no scope was requested
+KNOWN_SCOPES = READ_SCOPES | WRITE_SCOPES | {LEGACY_WRITE_SCOPE}
 
 
 def scope_is_write(scope: str | None) -> bool:
-    """Everything except an explicit read scope grants write (legacy 'mcp' = write)."""
-    return str(scope or "").strip().lower() not in READ_SCOPES
+    """True only for a space-separated scope set that asks for write.
+
+    'write' anywhere grants write. The legacy forms existing deployments rely
+    on also grant write: no scope at all, and 'mcp' (the default stored when a
+    client requested none) unless an explicit read word sits next to it.
+    Anything else ('read offline_access', 'openid', unknown words) is read."""
+    words = set(str(scope or "").lower().split())
+    if not words or words & WRITE_SCOPES:
+        return True
+    return LEGACY_WRITE_SCOPE in words and not (words & READ_SCOPES)
 
 
 @dataclass
