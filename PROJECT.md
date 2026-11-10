@@ -43,14 +43,27 @@ remote upload and blob links. Never commit secrets or corpus data.
 git diff --check
 uv lock --check
 uvx pip-audit -r requirements.lock --no-deps --disable-pip
+f=$(mktemp) && uv export --frozen --no-hashes --no-emit-project -o "$f" && uvx pip-audit -r "$f" --no-deps --disable-pip
 docker build -t reliquary:local .
 ```
 
+CI (`.github/workflows/tests.yml`) runs the same list against
+`requirements.lock`; `docker-publish.yml` publishes only after it passes.
+
 Tests use dependency-light in-memory fakes, including Mem0 1.x and 2.x API
-contracts. Integration checks must also exercise the built image with the
-installed Mem0, Qdrant and embedder. Keep direct pins in `pyproject.toml` and
-`requirements.txt` aligned; Docker installs `requirements.lock`, while uv uses
-`uv.lock`.
+contracts; `tests/test_audit_2026_11_packaging.py` binds every adapter call to
+the installed `mem0.Memory` signatures. Integration checks must also exercise
+the built image with the installed Mem0, Qdrant and embedder. Keep direct pins
+in `pyproject.toml` and `requirements.txt` aligned; Docker installs
+`requirements.lock`, while uv uses `uv.lock`. Regenerate `requirements.lock`
+with the command in `requirements.txt`: it passes
+`--python-platform x86_64-unknown-linux-gnu`, without which a run on an arm64
+Mac drops greenlet. Python 3.12 is the supported and tested version.
+
+Imports are incremental by default (matched by JSONL `id`). The importer stores
+taxonomy as catalog slugs and keeps corpus dates as `source_updated_at` /
+`source_created_at`, which the recency tiebreaker prefers over Mem0's own
+timestamps; these derived fields are not part of `import_content_hash`.
 
 ## Deployment on Arda's machine
 
@@ -58,7 +71,9 @@ The checkout is `/home/arda/projects/utils/agents/reliquary`. The running stack
 is configured separately in `/home/arda/reliquary-deploy/docker-compose.yml`.
 The app publishes only `127.0.0.1:8787`, behind the Cloudflare tunnel for
 `https://reliquary.arda.tr`. Rebuild and recreate only the app; preserve the
-Qdrant, Ollama, corpus, blob, compiled and OAuth state mounts.
+Qdrant, Ollama, corpus, blob, compiled and OAuth state mounts. The image's
+`appuser` is uid 100 / gid 101 (pinned in the Dockerfile); the data mounts are
+owned by 100:101.
 
 The local image selected by
 `/home/arda/reliquary-deploy/docker-compose.override.yml` is

@@ -64,16 +64,26 @@ server {
     listen 443 ssl;
     server_name reliquary.example.com;
 
+    # nginx refuses bodies over 1 MB by default. Raw uploads go up to
+    # RELIQUARY_BLOB_MAX_BYTES (30 MB by default), and an image sent inline to
+    # add_image travels base64-encoded inside JSON (about 4/3 larger), so allow
+    # 41 MB. Raise both together if you raise the blob cap.
+    client_max_body_size 41m;
+
+    # Every proxied location passes the public Host and scheme: the server
+    # builds its OAuth discovery URLs from them, and without X-Forwarded-Proto
+    # it advertises http:// endpoints for an HTTPS site.
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
     # Allowed public paths
     location ~ ^/(claude|openai|uploads|oauth)/ {
         proxy_pass http://127.0.0.1:8787;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 
     location ~ ^/\.well-known/ {
         proxy_pass http://127.0.0.1:8787;
-        proxy_set_header Host $host;
     }
 
     location = /healthz {
@@ -94,6 +104,9 @@ server {
     }
 }
 ```
+
+`proxy_set_header` directives are inherited only by locations that set none of
+their own; if you add one inside a location, repeat all three there.
 
 ## Hardening checklist
 
