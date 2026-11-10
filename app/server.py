@@ -1126,14 +1126,10 @@ class ReliquaryChatProxy:
             return "read"
         return "other"
 
-    @staticmethod
-    def _rate_key(headers: dict[str, str]) -> str:
-        auth = headers.get("authorization", "").strip()
-        scheme, _, token = auth.partition(" ")
-        token = token.strip()
-        if scheme.lower() == "bearer" and token:
-            return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
-        return "anon"
+    def _rate_key(self, headers: dict[str, str]) -> str:
+        # Per credential, not per token string: a refreshed OAuth access token
+        # stays in its grant's bucket, static tokens share their label's.
+        return self._credential_key(headers)
 
     def _routing_hint(self) -> str:
         if not self.catalog or not self.catalog.routeable_domains:

@@ -400,3 +400,39 @@ def test_session_store_loads_old_format_and_round_trips_owner(tmp_path):
     assert reloaded.touch("old-sess") == "claude"
     assert reloaded.touch("new-sess") == "openai"
     assert json.loads(path.read_text())["old-sess"] == "claude"  # owner-less entries keep the old shape
+
+
+# --- 10. rate limit follows the credential, not the token string -------------
+
+
+def _search(p, token):
+    body = _rpc("tools/call", {"name": "reliquary_search", "arguments": {"query": "x"}})
+    resp = _call(p, "POST", "/claude/mcp", body=body, headers={"authorization": f"Bearer {token}"})
+    return json.loads(resp["body"])["result"]
+
+
+def test_rate_limit_survives_token_refresh(make_proxy):
+    p = make_proxy(rate_limit_searches=2)
+    access, refresh = p.oauth.issue_token_pair(client_id="c", scope="read")
+    assert not _search(p, access).get("isError")
+    assert not _search(p, access).get("isError")
+    assert _search(p, access)["structuredContent"]["error"] == "rate_limited"
+    resp, err = p.oauth.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    assert err is None
+    # A refreshed token is the same grant: still limited.
+    assert _search(p, resp["access_token"])["structuredContent"]["error"] == "rate_limited"
+    # A different grant has its own budget.
+    other, _ = p.oauth.issue_token_pair(client_id="c", scope="read")
+    assert not _search(p, other).get("isError")
+
+
+def test_rate_limit_keys_static_tokens_by_label(make_proxy):
+    p = make_proxy(static_tokens=(("ci", "read", "tok-a"),))
+    headers = {"authorization": "Bearer tok-a"}
+    assert p._rate_key(headers) == "static:ci"
+    assert p._rate_key({"authorization": "Bearer claude-secret"}) == "master:claude"
+    assert p._rate_key({}) == "anon"
+
+
+def test_rate_limits_default_off(proxy):
+    assert proxy.write_limiter.limit == 0 and proxy.search_limiter.limit == 0
