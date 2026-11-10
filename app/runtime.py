@@ -47,6 +47,35 @@ def native_hybrid_active(mode: str | None, *, has_bm25_slot: bool, bm25_usable: 
     return bool(has_bm25_slot and bm25_usable)  # auto
 
 
+async def drain_on_cancel(awaitable):
+    """Await ``awaitable`` to completion even when the caller is cancelled.
+
+    Cancelling an awaited ``asyncio.to_thread`` call does not stop its worker
+    thread, so a lock held around that call would be released while the thread
+    still mutates storage. This runs the work as a shielded task and, if the
+    caller is cancelled, keeps waiting for the task before re-raising the
+    CancelledError, so the caller's locks are released only once the work is
+    done.
+    """
+    task = asyncio.ensure_future(awaitable)
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if task.done():
+                raise  # the work itself was cancelled
+            cancelled = cancelled or exc
+            continue
+        except BaseException:
+            if cancelled is not None:
+                raise cancelled
+            raise
+        if cancelled is not None:
+            raise cancelled
+        return result
+
+
 class AsyncRWLock:
     """A writer-preferring readers-writer lock for asyncio.
 

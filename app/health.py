@@ -38,12 +38,18 @@ def stale_pages(pages: Iterable[Any]) -> list[dict[str, Any]]:
 
 
 def unindexed_pages(pages: Iterable[Any]) -> list[dict[str, Any]]:
-    """Current pages with no vector-index record: invisible to search."""
-    return [
-        {"kind": "unindexed_page", "slug": p.slug,
-         "reason": "current page has no index record (not searchable); re-file it with compile_page"}
-        for p in pages if getattr(p, "status", None) == "current" and not getattr(p, "memory_id", None)
-    ]
+    """Current pages with no vector-index record (invisible to search), and pages
+    whose index entry a failed compile could not confirm matches them."""
+    out: list[dict[str, Any]] = []
+    for p in pages:
+        if getattr(p, "index_unconfirmed", False):
+            out.append({"kind": "unindexed_page", "slug": p.slug,
+                        "reason": "index entry may not match the page after a failed compile; "
+                                  "re-file it with compile_page"})
+        elif getattr(p, "status", None) == "current" and not getattr(p, "memory_id", None):
+            out.append({"kind": "unindexed_page", "slug": p.slug,
+                        "reason": "current page has no index record (not searchable); re-file it with compile_page"})
+    return out
 
 
 def coverage_gaps(pages: Iterable[Any], raw_counts: dict[str, int], *, min_count: int) -> list[dict[str, Any]]:
@@ -129,10 +135,13 @@ def hot_topics_without_synthesis(pages: Iterable[Any], stats_by_topic: dict[str,
 def orphan_blobs(blob_infos: Iterable[Any], *, page_refs: set[str], pending_refs: set[str],
                  limit: int = 50) -> list[dict[str, Any]]:
     """Blobs nothing references: no owning memory, no page revision, no pending
-    upload slot. Leaked references (an abandoned upload, a crash mid-write)."""
+    upload slot. Leaked references (an abandoned upload, a crash mid-write).
+    An "upload:<id>" owner marks a slot's reference; it keeps the blob alive only
+    while that slot is pending (``pending_refs``)."""
     out: list[dict[str, Any]] = []
     for info in blob_infos:
-        if info.owners or info.id in page_refs or info.id in pending_refs:
+        memory_owners = [o for o in info.owners if not str(o).startswith("upload:")]
+        if memory_owners or info.id in page_refs or info.id in pending_refs:
             continue
         out.append({"kind": "orphan_blob", "id": info.id, "size": info.size, "ref_count": info.ref_count,
                     "reason": "blob has no owning memory, page revision or pending upload; candidate to remove"})

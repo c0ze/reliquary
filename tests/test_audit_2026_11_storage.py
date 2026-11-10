@@ -12,6 +12,9 @@ import pytest
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"storage-audit"
 
+# Captured at import, before the fixtures replace it with an inline stand-in.
+REAL_TO_THREAD = asyncio.to_thread
+
 
 def run(coro):
     return asyncio.run(coro)
@@ -592,24 +595,52 @@ def test_retrieval_stats_log_rotates_and_aggregates_both_files(tmp_path):
 
 
 def test_resources_read_runs_off_the_event_loop(proxy, monkeypatch):
-    offloaded = []
-    inline = asyncio.to_thread
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
 
-    async def recording_to_thread(func, /, *args, **kwargs):
-        offloaded.append(getattr(func, "__name__", repr(func)))
-        return await inline(func, *args, **kwargs)
+    # The fixture runs to_thread inline; put real worker threads back, on an
+    # executor this test owns and shuts down itself.
+    monkeypatch.setattr(asyncio, "to_thread", REAL_TO_THREAD)
+    executor = ThreadPoolExecutor(max_workers=2)
+    threads = []
+    real_read = proxy.read_resource
 
-    monkeypatch.setattr(asyncio, "to_thread", recording_to_thread)
+    def slow_read(uri):
+        threads.append(threading.get_ident())
+        time.sleep(0.3)  # e.g. folding a large retrieval-stats log
+        return real_read(uri)
+
+    monkeypatch.setattr(proxy, "read_resource", slow_read)
 
     async def scenario():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=proxy), base_url="http://t") as client:
-            return await client.post("/claude/mcp", headers={"authorization": "Bearer claude-secret"}, json={
-                "jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": "reliquary://needs-review"}})
+        asyncio.get_running_loop().set_default_executor(executor)
+        ticks = 0
+        done = False
 
-    response = run(scenario())
+        async def ticker():
+            nonlocal ticks
+            while not done:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(ticker())
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=proxy), base_url="http://t") as client:
+                response = await client.post("/claude/mcp", headers={"authorization": "Bearer claude-secret"}, json={
+                    "jsonrpc": "2.0", "id": 1, "method": "resources/read",
+                    "params": {"uri": "reliquary://needs-review"}})
+        finally:
+            done = True
+            await task
+            executor.shutdown(wait=True, cancel_futures=True)
+        return response, ticks, threading.get_ident()
+
+    response, ticks, loop_thread = asyncio.run(scenario())
     assert response.status_code == 200, response.text
     assert "unindexed" in response.json()["result"]["contents"][0]["text"]
-    assert "read_resource" in offloaded
+    assert threads and threads[0] != loop_thread
+    assert ticks >= 10  # about 30 while the read held its worker thread
 
 
 # 14 -- cancelling a waiting writer wakes the readers it was blocking --------

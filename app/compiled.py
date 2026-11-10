@@ -70,6 +70,9 @@ class PageInfo:
     # Older registries predate this field, so it can be shorter than `history`.
     revisions_meta: list[dict] = field(default_factory=list)
     memory_id: str | None = None
+    # Set when a failed compile could not confirm that the index entry matches
+    # the restored revision; cleared by the next successful index write.
+    index_unconfirmed: bool = False
 
 
 def _emit_frontmatter(info: "PageInfo") -> str:
@@ -92,6 +95,15 @@ def _emit_frontmatter(info: "PageInfo") -> str:
 
 def assemble_markdown(info: "PageInfo", body: str) -> str:
     return f"{_emit_frontmatter(info)}\n\n{body.strip()}\n"
+
+
+def markdown_body(text: str) -> str:
+    """The body assemble_markdown() wrapped: ``text`` without its frontmatter."""
+    if text.startswith("---\n"):
+        parts = text[4:].split("\n---\n", 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+    return text.strip()
 
 
 class PageRegistry:
@@ -214,21 +226,33 @@ class PageRegistry:
                 raise
             return info
 
-    def rollback_revision(self, slug: str, previous: "PageInfo | None", new_blob: str) -> None:
-        """Undo a put_revision whose index write failed: restore the previous
-        registry entry (or remove a page that did not exist before) and release
-        the reference put_revision took on ``new_blob``."""
+    def rollback_revision(self, slug: str, previous: "PageInfo | None", written: "PageInfo") -> bool:
+        """Undo the put_revision that returned ``written`` after its index write
+        failed: restore the previous registry entry (or remove a page that did
+        not exist before) and release the reference put_revision took on the new
+        revision's blob. Does nothing, and returns False, if the page no longer
+        carries that revision (another writer replaced or removed it)."""
         with self._locked():
+            current = self.get(slug)
+            if current is None or current.current_blob != written.current_blob:
+                return False
             if previous is None:
                 try:
                     os.remove(self._path(slug))
                 except FileNotFoundError:
                     pass
             else:
-                self._save(previous)
+                restored = PageInfo(**asdict(previous))
+                # A source changed while the index write was in flight: keep the
+                # stale mark instead of resurrecting the snapshot's "current".
+                if current.status == "stale" != written.status and restored.status == "current":
+                    restored.status = "stale"
+                self._save(restored)
             # An identical re-file already balanced its own reference.
+            new_blob = written.current_blob
             if new_blob and (previous is None or previous.current_blob != new_blob):
                 self.blobs.delete(new_blob)
+            return True
 
     def _iter_pages(self):
         for shard in os.listdir(self.registry_dir):
@@ -312,6 +336,15 @@ class PageRegistry:
             if info is None:
                 return
             info.memory_id = memory_id
+            info.index_unconfirmed = False
+            self._save(info)
+
+    def set_index_unconfirmed(self, slug: str) -> None:
+        with self._locked():
+            info = self.get(slug)
+            if info is None:
+                return
+            info.index_unconfirmed = True
             self._save(info)
 
     def pages_deriving_from(self, *, ids=(), domain: str | None = None,

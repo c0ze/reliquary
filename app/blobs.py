@@ -35,6 +35,11 @@ def _validate_blob_id(blob_id: str) -> None:
 
 _STORE_LOCK = threading.Lock()
 
+# An owner entry "upload:<upload_id>" marks the reference a pending upload slot
+# holds, so the slot can later consume exactly its own reference (and hand it
+# to its caption memory on commit). Old readers see just another owner string.
+UPLOAD_OWNER_PREFIX = "upload:"
+
 
 class BlobTooLarge(Exception):
     """Raised by ``BlobStore.put`` when data exceeds the configured cap."""
@@ -120,7 +125,9 @@ class BlobStore:
         atomic_write(self._sidecar_path(info.id), json.dumps(asdict(info)).encode("utf-8"))
 
     # --- store / fetch -------------------------------------------------------
-    def put(self, data: bytes, *, mimetype: str | None = None) -> BlobInfo:
+    def put(self, data: bytes, *, mimetype: str | None = None, owner: str | None = None) -> BlobInfo:
+        """Store ``data`` (or add a reference to identical bytes). ``owner``, if
+        given, is recorded in the same sidecar write as the new reference."""
         if self.max_bytes and len(data) > self.max_bytes:
             raise BlobTooLarge(len(data), self.max_bytes)
 
@@ -130,6 +137,8 @@ class BlobStore:
             existing = self.info(blob_id)
             if existing is not None:
                 existing.ref_count += 1
+                if owner is not None and owner not in existing.owners:
+                    existing.owners.append(owner)
                 blob_path = self._blob_path(blob_id, existing.ext)
                 if not os.path.exists(blob_path):
                     # Self-heal a stale sidecar (bytes lost to a crash window or
@@ -159,6 +168,7 @@ class BlobStore:
                 ext=ext,
                 ref_count=1,
                 created=time.time(),
+                owners=[owner] if owner is not None else [],
             )
             self._write_sidecar(info)
             return info
@@ -204,6 +214,22 @@ class BlobStore:
             if memory_id not in info.owners:
                 info.owners.append(memory_id)
                 self._write_sidecar(info)
+
+    def transfer_owner(self, blob_id: str, old: str, new: str) -> bool:
+        """Hand the reference ``old`` holds to ``new`` in one sidecar write
+        (ref_count unchanged). False, and nothing changed, if ``old`` holds none."""
+        _validate_blob_id(blob_id)
+        with _STORE_LOCK:
+            info = self.info(blob_id)
+            if info is None or old not in info.owners:
+                return False
+            info.owners.remove(old)
+            if new in info.owners:
+                info.ref_count -= 1  # ``new`` already holds a reference of its own
+            else:
+                info.owners.append(new)
+            self._write_sidecar(info)
+            return True
 
     def is_owner(self, blob_id: str, memory_id: str) -> bool:
         """Return ``True`` iff ``memory_id`` is a registered owner of ``blob_id``."""
