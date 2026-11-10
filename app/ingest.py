@@ -146,16 +146,13 @@ def _taxonomy_pairs(domain: Any, topic: Any) -> set[tuple[str, str]]:
 
 
 def _fan_out_bulk(page_registry, touched_ids: set[str], touched_tax: set) -> None:
-    """One-pass staleness fan-out after a bulk import (avoids O(records*pages))."""
+    """One-pass staleness fan-out after a bulk import (avoids O(records*pages)).
+    A page that declares derived_from is judged on its sources alone; the
+    domain+topic fallback applies only to provenance-less pages (#69). Matching
+    and marking happen under one registry lock, so a page the server re-files
+    meanwhile is judged on its new provenance."""
     try:
-        for page in page_registry.list(status="current"):
-            # A page that declares derived_from is judged on its sources alone;
-            # the domain+topic fallback applies only to provenance-less pages (#69).
-            if (touched_ids & set(page.derived_from or [])) or (
-                not page.derived_from
-                and not touched_tax.isdisjoint(_taxonomy_pairs(page.domain, page.topic))
-            ):
-                page_registry.set_status(page.slug, "stale")
+        page_registry.mark_stale_deriving_from(ids=touched_ids, pairs=touched_tax)
     except Exception as exc:
         print(f"[ingest] staleness fan-out skipped: {exc}", file=sys.stderr)
 
