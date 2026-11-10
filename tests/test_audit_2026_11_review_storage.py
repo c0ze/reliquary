@@ -204,3 +204,34 @@ def test_lint_counts_a_slot_marker_only_while_its_slot_is_pending(tmp_path):
     report = lint.build_report(compiled_dir=str(tmp_path / "compiled"), blob_dir=str(tmp_path / "blobs"),
                                dataset_path=None, min_count=8, state_dir=str(state))
     assert report["orphan_blobs"] == []
+
+
+# 4 -- a compile rollback keeps a stale mark recorded after its snapshot -----
+
+def test_compile_rollback_keeps_a_concurrent_stale_mark(proxy, monkeypatch):
+    run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "v1"}))
+
+    def update_fails_after_a_source_change(*args, **kwargs):
+        proxy.pages.set_status("pg", "stale")  # e.g. ingest or a live write meanwhile
+        raise RuntimeError("embedder unavailable")
+
+    monkeypatch.setattr(proxy.compiled_memory, "update", update_fails_after_a_source_change)
+    monkeypatch.setattr(proxy.compiled_memory, "add", update_fails_after_a_source_change)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "v2"}))
+    assert result["isError"] is True
+    page = proxy.pages.get("pg")
+    assert page.status == "stale"
+    assert "v1" in proxy.pages.read_body("pg")[0]
+
+
+def test_rollback_leaves_a_page_another_writer_replaced(tmp_path):
+    from blobs import BlobStore
+    from compiled import PageRegistry
+
+    registry = PageRegistry(str(tmp_path / "compiled"), BlobStore(str(tmp_path / "blobs"), b"k"))
+    previous = registry.put_revision("pg", "v1", {})
+    ours = registry.put_revision("pg", "v2", {})
+    theirs = registry.put_revision("pg", "v3", {})  # another process re-filed meanwhile
+    assert registry.rollback_revision("pg", previous, ours) is False
+    assert registry.get("pg").current_blob == theirs.current_blob
+    assert registry.blobs.info(ours.current_blob).ref_count == 1  # held by history, not released

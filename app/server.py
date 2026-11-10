@@ -2604,7 +2604,7 @@ class ReliquaryChatProxy:
             # The registry commits before the index write; without this, a
             # failure left a current revision that search never sees (or, for
             # an existing page, registry text that diverges from the index).
-            await asyncio.to_thread(self.pages.rollback_revision, slug, previous, info.current_blob)
+            await asyncio.to_thread(self.pages.rollback_revision, slug, previous, info)
             return self.mcp_tool_result(
                 text=f"Could not index page slug={slug}; nothing was changed. Retry later.",
                 structured={"error": "index_failed", "slug": slug}, is_error=True)
