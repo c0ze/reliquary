@@ -403,3 +403,26 @@ def test_registry_mutations_hold_a_cross_process_lock(tmp_path):
     finally:
         os.close(other)
     assert [p.slug for p in registry.list()] == ["page"]
+
+
+# 8 -- an identical re-file heals a lost sidecar instead of unlinking bytes --
+
+def test_identical_refile_restores_a_page_whose_sidecar_was_lost(proxy):
+    args = {"slug": "heal", "title": "Heal", "markdown": "body"}
+    filed = run(call(proxy, "reliquary_compile_page", dict(args)))
+    blob = filed["structuredContent"]["revision"]
+    Path(proxy.blobs._sidecar_path(blob)).write_text("")  # zero-length after a power loss
+    assert run(call(proxy, "reliquary_fetch", {"id": "heal"}))["structuredContent"]["error"] == "blob_missing"
+
+    refiled = run(call(proxy, "reliquary_compile_page", dict(args)))
+    assert refiled["isError"] is False
+    fetched = run(call(proxy, "reliquary_fetch", {"id": "heal"}))
+    assert "error" not in fetched["structuredContent"]
+    assert proxy.blobs.info(blob).ref_count == 1
+
+
+def test_identical_refile_still_releases_its_extra_reference(proxy):
+    args = {"slug": "same", "markdown": "body"}
+    blob = run(call(proxy, "reliquary_compile_page", dict(args)))["structuredContent"]["revision"]
+    run(call(proxy, "reliquary_compile_page", dict(args)))
+    assert proxy.blobs.info(blob).ref_count == 1

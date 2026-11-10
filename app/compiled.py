@@ -185,10 +185,13 @@ class PageRegistry:
                 info.created_at = now
             blob_info = self.blobs.put(assemble_markdown(info, body).encode("utf-8"),
                                        mimetype="text/markdown")
-            if existing and existing.current_blob == blob_info.id:
+            if existing and existing.current_blob == blob_info.id and blob_info.ref_count > 1:
                 # Identical re-file: put() bumped the ref for a blob this page
                 # already counts once; release the extra ref so delete() stays
-                # balanced and the blob can actually be reclaimed later.
+                # balanced and the blob can actually be reclaimed later. At
+                # ref_count 1, put() recreated a blob whose sidecar was lost:
+                # that single ref is this page's, and releasing it would unlink
+                # the bytes the re-file just restored.
                 self.blobs.delete(blob_info.id)
             if existing and existing.current_blob and existing.current_blob != blob_info.id:
                 info.history.append(existing.current_blob)
