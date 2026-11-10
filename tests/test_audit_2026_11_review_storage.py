@@ -320,3 +320,84 @@ def test_update_that_landed_before_mem0_failed_counts_as_indexed(proxy, monkeypa
     # The vector matches the new revision: the history-row failure is not a page failure.
     assert result["isError"] is False, result
     assert "new text" in proxy.pages.read_body("pg")[0]
+
+
+# 9 -- registry mutations never wait for the cross-process lock on the loop --
+
+async def _ticks_while(awaitable, interval=0.01):
+    """Run ``awaitable`` and count how often the event loop got to run a
+    ticker meanwhile."""
+    ticks = 0
+    done = False
+
+    async def ticker():
+        nonlocal ticks
+        while not done:
+            ticks += 1
+            await asyncio.sleep(interval)
+
+    task = asyncio.create_task(ticker())
+    try:
+        result = await awaitable
+    finally:
+        done = True
+        await task
+    return result, ticks
+
+
+def _hold_registry_lock(proxy, seconds):
+    import fcntl
+    import os
+
+    fd = os.open(os.path.join(proxy.pages.registry_dir, ".lock"), os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # another process (ingest) holds the registry
+
+    def release():
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    timer = threading.Timer(seconds, release)
+    timer.start()
+    return timer
+
+
+def test_staleness_fan_out_does_not_block_the_event_loop(proxy, monkeypatch):
+    pytest.importorskip("fcntl")
+    run(call(proxy, "reliquary_compile_page", {"slug": "topicpage", "markdown": "x", "domain": "d", "topic": "t"}))
+
+    async def scenario():
+        timer = _hold_registry_lock(proxy, 0.4)
+        try:
+            return await _ticks_while(call(proxy, "reliquary_add_memory",
+                                           {"text": "new evidence", "domain": "d", "topic": "t"}))
+        finally:
+            timer.join()
+
+    result, ticks = run_threaded(monkeypatch, scenario)
+    assert result["isError"] is False
+    assert ticks >= 10  # about 40 if the loop kept running while the lock was held
+    assert proxy.pages.get("topicpage").status == "stale"
+
+
+def test_recording_the_memory_id_does_not_block_the_event_loop(proxy, monkeypatch):
+    pytest.importorskip("fcntl")
+    real_add = proxy.compiled_memory.add
+    timers = []
+
+    def add_then_ingest_takes_the_lock(*args, **kwargs):
+        timers.append(_hold_registry_lock(proxy, 0.4))
+        return real_add(*args, **kwargs)
+
+    monkeypatch.setattr(proxy.compiled_memory, "add", add_then_ingest_takes_the_lock)
+
+    async def scenario():
+        try:
+            return await _ticks_while(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "x"}))
+        finally:
+            for timer in timers:
+                timer.join()
+
+    result, ticks = run_threaded(monkeypatch, scenario)
+    assert result["isError"] is False
+    assert ticks >= 10
+    assert proxy.pages.get("pg").memory_id == result["structuredContent"]["memory_id"]

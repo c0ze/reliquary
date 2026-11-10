@@ -2440,20 +2440,22 @@ class ReliquaryChatProxy:
             is_error=True,
         )
 
-    def _fan_out_staleness(self, source_ids: list[str], metadata: dict[str, Any]) -> None:
+    async def _fan_out_staleness(self, source_ids: list[str], metadata: dict[str, Any]) -> None:
         """Flag current synthesis pages deriving from a changed raw memory
         (pages with no declared provenance fall back to a domain+topic match).
         Flips the status flag only — never rewrites page content or mints a
         revision; the page surfaces in needs-review for a human-driven recompile.
-        Wrapped so it can never break the write."""
+        Wrapped so it can never break the write. Registry work runs in worker
+        threads: set_status waits for a cross-process file lock (ingest)."""
         if self.pages is None:
             return
         try:
             domain = (metadata or {}).get("domain")
             topic = (metadata or {}).get("topic")
-            for page in self.pages.pages_deriving_from(ids=source_ids, domain=domain, topic=topic):
+            for page in await asyncio.to_thread(self.pages.pages_deriving_from,
+                                                ids=source_ids, domain=domain, topic=topic):
                 if page.status == "current":
-                    self.pages.set_status(page.slug, "stale")
+                    await asyncio.to_thread(self.pages.set_status, page.slug, "stale")
         except Exception:
             LOG.exception("Staleness fan-out failed (non-fatal)")
 
@@ -2486,7 +2488,7 @@ class ReliquaryChatProxy:
 
         result = await self.add_memory(text, user_id=user_id, metadata=metadata, infer=infer)
         new_ids = added_memory_ids(result)
-        self._fan_out_staleness(new_ids, metadata)
+        await self._fan_out_staleness(new_ids, metadata)
         if len(new_ids) == 1:
             id_note = f" (id={new_ids[0]})"
         elif new_ids:
@@ -2623,7 +2625,7 @@ class ReliquaryChatProxy:
             return self.mcp_tool_result(
                 text=text, structured={"error": "index_failed", "slug": slug, "index_confirmed": confirmed},
                 is_error=True)
-        self.pages.set_memory_id(slug, memory_id)
+        await asyncio.to_thread(self.pages.set_memory_id, slug, memory_id)
         url = self._signed_blob_url(info.current_blob)
         return self.mcp_tool_result(
             text=f"Filed synthesis page slug={slug} (revision {info.current_blob[:12]}, status={status}).",
@@ -3223,7 +3225,7 @@ class ReliquaryChatProxy:
                 is_error=True,
             )
 
-        self._fan_out_staleness([memory_id], metadata)
+        await self._fan_out_staleness([memory_id], metadata)
         blob_id = upload.blob_id
         mimetype = upload.mimetype
         size = upload.size
@@ -3407,7 +3409,7 @@ class ReliquaryChatProxy:
                 structured={"error": "ownership_registration_failed", "blob_id": info.id, "memory_id": memory_id},
                 is_error=True,
             )
-        self._fan_out_staleness([memory_id], metadata)
+        await self._fan_out_staleness([memory_id], metadata)
         url = self._signed_blob_url(info.id)
         return self.mcp_tool_result(
             text=f"Stored image (blob_id={info.id}, memory_id={memory_id}): {trim_text(caption, 160)}",
@@ -3500,7 +3502,7 @@ class ReliquaryChatProxy:
                 is_error=True,
             )
         await self.delete_memory(memory_id)
-        self._fan_out_staleness([memory_id], metadata)
+        await self._fan_out_staleness([memory_id], metadata)
         unlinked = self.blobs.delete(str(blob_ref), owner=memory_id)
         return self.mcp_tool_result(
             text=f"Deleted image memory_id={memory_id} (blob_id={blob_ref}, blob_unlinked={bool(unlinked)}).",
@@ -3577,7 +3579,7 @@ class ReliquaryChatProxy:
                     is_error=True,
                 )
         await self.delete_memory(record_id)
-        self._fan_out_staleness([record_id], existing_meta)
+        await self._fan_out_staleness([record_id], existing_meta)
         return self.mcp_tool_result(
             text=f"Deleted memory {existing.get('title', record_id)} (id={record_id}).",
             structured={"deleted": True, "id": record_id, "title": existing.get("title")},
@@ -3649,9 +3651,9 @@ class ReliquaryChatProxy:
             metadata.pop(key, None)  # never valid on a user-write (pre-fix forgeries)
         metadata["source_group"] = "user-write"
         await self.update_memory(record_id, new_text, metadata=metadata)
-        self._fan_out_staleness([record_id], existing_metadata)
+        await self._fan_out_staleness([record_id], existing_metadata)
         if metadata != existing_metadata:
-            self._fan_out_staleness([record_id], metadata)
+            await self._fan_out_staleness([record_id], metadata)
         return self.mcp_tool_result(
             text=f"Updated memory id={record_id}: {trim_text(new_text, 160)}",
             structured={"updated": True, "id": record_id, "metadata": metadata},
