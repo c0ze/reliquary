@@ -119,6 +119,12 @@ def _recency_bonus(hit: dict[str, Any], *, now: float) -> float:
 
 def _hit_timestamp(hit: dict[str, Any]) -> float | None:
     metadata = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
+    # Imported records keep their corpus dates here; Mem0 rewrites the
+    # top-level created_at/updated_at to import time (see app/ingest.py).
+    for key in ("source_updated_at", "source_created_at"):
+        parsed = _parse_timestamp(metadata.get(key))
+        if parsed is not None:
+            return parsed
     for source in (hit, metadata):
         for key in _DATE_KEYS:
             parsed = _parse_timestamp(source.get(key))
