@@ -2913,6 +2913,18 @@ class ReliquaryChatProxy:
                 structured={"error": "upload_not_ready", "upload_id": upload_id},
                 is_error=True,
             )
+        blob_info = self.blobs.info(upload.blob_id)
+        if blob_info is None or blob_info.ref_count <= len(blob_info.owners):
+            # Same guard as _cleanup_expired_uploads: no unaccounted reference
+            # means this slot outlived a successful commit (crash before the slot
+            # was dropped). Committing again would double-own the blob, and a
+            # failed retry's rollback would unlink the committed memory's bytes.
+            self._drop_upload(upload_id)
+            return self.mcp_tool_result(
+                text=f"Upload slot {upload_id} was already committed.",
+                structured={"error": "already_committed", "upload_id": upload_id, "blob_id": upload.blob_id},
+                is_error=True,
+            )
 
         user_id = (
             str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id

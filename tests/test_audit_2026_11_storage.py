@@ -426,3 +426,49 @@ def test_identical_refile_still_releases_its_extra_reference(proxy):
     blob = run(call(proxy, "reliquary_compile_page", dict(args)))["structuredContent"]["revision"]
     run(call(proxy, "reliquary_compile_page", dict(args)))
     assert proxy.blobs.info(blob).ref_count == 1
+
+
+# 9 -- an upload slot that outlived its commit cannot be committed again -----
+
+def _commit_then_crash_before_slot_drop(make_proxy, state, memory):
+    first = make_proxy(memory=memory, state_dir=state)
+
+    async def scenario():
+        slot = (await call(first, "reliquary_create_image_upload", {}))["structuredContent"]["upload_id"]
+        assert (await post_bytes(first, slot)).status_code == 201
+        first._drop_upload = lambda upload_id: None  # crash before the drop is persisted
+        committed = await call(first, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "cat"})
+        return slot, committed["structuredContent"]
+
+    return run(scenario())
+
+
+def test_retried_commit_after_a_crash_does_not_double_own_the_blob(make_proxy, tmp_path):
+    from conftest import FakeMemory
+
+    memory = FakeMemory()
+    state = str(tmp_path / "state")
+    slot, committed = _commit_then_crash_before_slot_drop(make_proxy, state, memory)
+    restarted = make_proxy(memory=memory, state_dir=state)
+    retry = run(call(restarted, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "cat (retry)"}))
+    info = restarted.blobs.info(committed["blob_id"])
+    assert info.owners == [committed["memory_id"]] and info.ref_count == 1
+    assert retry["structuredContent"]["error"] == "already_committed"
+    assert slot not in restarted.pending_uploads
+    assert len(memory._store) == 1
+
+
+def test_failed_retry_after_a_crash_keeps_the_committed_bytes(make_proxy, tmp_path, monkeypatch):
+    from conftest import FakeMemory
+
+    memory = FakeMemory()
+    state = str(tmp_path / "state")
+    slot, committed = _commit_then_crash_before_slot_drop(make_proxy, state, memory)
+    restarted = make_proxy(memory=memory, state_dir=state)
+
+    def down(*args, **kwargs):
+        raise ConnectionError("qdrant down")
+
+    monkeypatch.setattr(memory, "add", down)
+    run(call(restarted, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "retry"}))
+    assert restarted.blobs.get(committed["blob_id"]) is not None
