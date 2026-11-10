@@ -3451,6 +3451,11 @@ class ReliquaryChatProxy:
 
         original_messages = [message for message in messages if isinstance(message, dict)]
         user_id = payload.pop("reliquary_user_id", None) or request_headers.get("x-reliquary-user-id") or self.settings.user_id
+        if isinstance(user_id, int) and not isinstance(user_id, bool):
+            user_id = str(user_id)
+        if not isinstance(user_id, str):
+            await self.send_json(send, 400, {"error": "`reliquary_user_id` must be a string"})
+            return
         reliquary_limit = self._coerce_int(
             payload.pop("reliquary_limit", self.settings.memory_limit),
             default=self.settings.memory_limit,
@@ -3459,6 +3464,9 @@ class ReliquaryChatProxy:
         )
         reliquary_threshold = coerce_threshold(payload.pop("reliquary_threshold", self.settings.memory_threshold))
         reliquary_query = payload.pop("reliquary_query", None) or latest_user_text(original_messages)
+        if not isinstance(reliquary_query, str):
+            await self.send_json(send, 400, {"error": "`reliquary_query` must be a string"})
+            return
         reliquary_disabled = bool(payload.pop("reliquary_disable", False))
         stream = bool(payload.get("stream"))
 
@@ -3479,12 +3487,13 @@ class ReliquaryChatProxy:
 
         upstream_url = self.url_for(scope, self.settings.upstream_base_url)
         forward_headers = self.forward_headers(request_headers)
+        from helpers import header_safe  # user text: percent-encode so latin-1 headers can't fail
         extra_headers = {
             "x-reliquary-hit-count": str(len(memory_hits)),
-            "x-reliquary-user-id": user_id,
+            "x-reliquary-user-id": header_safe(user_id),
         }
         if reliquary_query:
-            extra_headers["x-reliquary-query"] = trim_text(reliquary_query, 140)
+            extra_headers["x-reliquary-query"] = header_safe(trim_text(reliquary_query, 140))
 
         if stream:
             assistant_text = await self.stream_upstream_request(

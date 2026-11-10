@@ -302,3 +302,42 @@ def test_passthrough_forwards_only_allowlisted_headers(make_proxy):
     sent = {k.lower(): v for k, v in call.kwargs["headers"].items()}
     assert sent == {"authorization": "Bearer upstream-key", "content-type": "application/json",
                     "openai-organization": "org"}
+
+
+# --- 8. chat proxy headers with non-Latin-1 text -----------------------------
+
+
+def _chat(p, payload):
+    return _call(p, "POST", "/v1/chat/completions", body=json.dumps(payload).encode(),
+                 headers={**CLAUDE, "content-type": "application/json"})
+
+
+@pytest.mark.parametrize("text", ["merhaba şişe", "こんにちは", "100% done\r\nx-evil: 1"])
+def test_chat_proxy_non_latin1_query_is_header_safe(make_proxy, text):
+    from urllib.parse import unquote
+    p = _relay_proxy(make_proxy)
+    resp = _chat(p, {"model": "m", "messages": [{"role": "user", "content": text}]})
+    assert resp["status"] == 200
+    header = resp["headers"]["x-reliquary-query"]
+    assert header.isascii() and "\r" not in header and "\n" not in header
+    assert unquote(header) == " ".join(text.split())  # trim_text collapses whitespace
+
+
+def test_chat_proxy_keeps_plain_ascii_query_header(make_proxy):
+    p = _relay_proxy(make_proxy)
+    resp = _chat(p, {"model": "m", "messages": [{"role": "user", "content": "blue notebook"}]})
+    assert resp["headers"]["x-reliquary-query"] == "blue notebook"
+
+
+def test_chat_proxy_user_id_is_validated(make_proxy):
+    p = _relay_proxy(make_proxy)
+    msgs = [{"role": "user", "content": "hi"}]
+    resp = _chat(p, {"model": "m", "messages": msgs, "reliquary_user_id": 42})
+    assert resp["status"] == 200 and resp["headers"]["x-reliquary-user-id"] == "42"
+    resp = _chat(p, {"model": "m", "messages": msgs, "reliquary_user_id": "kullanıcı"})
+    assert resp["status"] == 200 and resp["headers"]["x-reliquary-user-id"] == "kullan%C4%B1c%C4%B1"
+    p.client.request.reset_mock()
+    for bad in ({"a": 1}, ["x"], True, 1.5):
+        resp = _chat(p, {"model": "m", "messages": msgs, "reliquary_user_id": bad})
+        assert resp["status"] == 400, bad
+    p.client.request.assert_not_called()
