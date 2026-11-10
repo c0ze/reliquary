@@ -64,6 +64,9 @@ from retrieval_quality import apply_retrieval_quality, retrieval_candidate_limit
 
 LOG = logging.getLogger("reliquary")
 MCP_PROTOCOL_VERSION = "2025-06-18"
+# Versions an initialize request may negotiate (same JSON-over-POST surface;
+# older clients ignore the newer result fields). Unknown -> MCP_PROTOCOL_VERSION.
+SUPPORTED_MCP_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 MCP_SERVER_NAME = "reliquary"
 MCP_SERVER_VERSION = "0.5.1"
 MCP_MAX_SESSIONS = 512
@@ -571,6 +574,11 @@ class ReliquaryChatProxy:
             method = scope["method"].upper()
             path = scope["path"]
 
+            body_cap = self._body_cap_for_path(path)
+            declared = decode_headers(scope).get("content-length", "").strip()
+            if body_cap and declared.isdigit() and int(declared) > body_cap:
+                raise RequestBodyTooLarge(body_cap)  # refuse before reading a byte
+
             if method == "OPTIONS":
                 await self.send_empty(send, 204)
                 return
@@ -726,6 +734,8 @@ class ReliquaryChatProxy:
                 return
 
             await self.send_json(send, 404, {"error": f"Unknown path: {path}"})
+        except RequestBodyTooLarge as exc:
+            await self.send_json(send, 413, {"error": "request_too_large", "max_bytes": exc.max_bytes})
         except Exception:
             # Only HTTP scopes can receive an http.response.* reply. For lifespan or
             # any other scope, sending one would emit invalid ASGI messages and mask
@@ -798,11 +808,11 @@ class ReliquaryChatProxy:
         payload: dict[str, Any] = {}
 
         if scope["method"].upper() == "POST":
-            body = await self.read_body(receive)
+            body = await self.read_body(receive, self.request_body_max_bytes())
             if body:
                 try:
                     payload = json.loads(body)
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):  # bad JSON, bad UTF-8, too deep
                     await self.send_json(send, 400, {"error": "Body must be valid JSON"})
                     return
 
@@ -886,7 +896,7 @@ class ReliquaryChatProxy:
             await self.send_empty(send, 405, extra_headers={"allow": "POST, DELETE"})
             return
 
-        body = await self.read_body(receive)
+        body = await self.read_body(receive, self.request_body_max_bytes())
         if profile.name == "openai":
             # Request bodies + identifiers are sensitive; only at debug level.
             LOG.debug(
@@ -898,7 +908,7 @@ class ReliquaryChatProxy:
             )
         try:
             message = json.loads(body or b"{}")
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # bad JSON, bad UTF-8, too deep
             await self.send_json(send, 400, self.mcp_error(None, -32700, "Invalid JSON"))
             return
 
@@ -923,15 +933,19 @@ class ReliquaryChatProxy:
             return
 
         if request_method == "initialize":
+            requested_version = params.get("protocolVersion")
+            negotiated_version = (
+                requested_version if requested_version in SUPPORTED_MCP_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
+            )
             session_id = secrets.token_urlsafe(24)
-            self.mcp_sessions.add(session_id, profile.name)
+            self.mcp_sessions.add(session_id, profile.name, owner=self._credential_key(headers))
             await self.send_json(
                 send,
                 200,
                 self.mcp_success(
                     request_id,
                     {
-                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "protocolVersion": negotiated_version,
                         "capabilities": {
                             "tools": {"listChanged": False},
                             "resources": {"listChanged": False},
@@ -946,7 +960,7 @@ class ReliquaryChatProxy:
                         },
                     },
                 ),
-                extra_headers={"Mcp-Session-Id": session_id, "MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
+                extra_headers={"Mcp-Session-Id": session_id, "MCP-Protocol-Version": negotiated_version},
             )
             return
 
@@ -1135,14 +1149,10 @@ class ReliquaryChatProxy:
             return "read"
         return "other"
 
-    @staticmethod
-    def _rate_key(headers: dict[str, str]) -> str:
-        auth = headers.get("authorization", "").strip()
-        scheme, _, token = auth.partition(" ")
-        token = token.strip()
-        if scheme.lower() == "bearer" and token:
-            return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
-        return "anon"
+    def _rate_key(self, headers: dict[str, str]) -> str:
+        # Per credential, not per token string: a refreshed OAuth access token
+        # stays in its grant's bucket, static tokens share their label's.
+        return self._credential_key(headers)
 
     def _routing_hint(self) -> str:
         if not self.catalog or not self.catalog.routeable_domains:
@@ -3463,10 +3473,10 @@ class ReliquaryChatProxy:
 
     async def handle_chat_completions(self, scope: dict[str, Any], receive, send) -> None:
         request_headers = decode_headers(scope)
-        body = await self.read_body(receive)
+        body = await self.read_body(receive, self.request_body_max_bytes())
         try:
             payload = json.loads(body or b"{}")
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # bad JSON, bad UTF-8, too deep
             await self.send_json(send, 400, {"error": "Request body must be valid JSON"})
             return
 
@@ -3477,6 +3487,11 @@ class ReliquaryChatProxy:
 
         original_messages = [message for message in messages if isinstance(message, dict)]
         user_id = payload.pop("reliquary_user_id", None) or request_headers.get("x-reliquary-user-id") or self.settings.user_id
+        if isinstance(user_id, int) and not isinstance(user_id, bool):
+            user_id = str(user_id)
+        if not isinstance(user_id, str):
+            await self.send_json(send, 400, {"error": "`reliquary_user_id` must be a string"})
+            return
         reliquary_limit = self._coerce_int(
             payload.pop("reliquary_limit", self.settings.memory_limit),
             default=self.settings.memory_limit,
@@ -3485,6 +3500,9 @@ class ReliquaryChatProxy:
         )
         reliquary_threshold = coerce_threshold(payload.pop("reliquary_threshold", self.settings.memory_threshold))
         reliquary_query = payload.pop("reliquary_query", None) or latest_user_text(original_messages)
+        if not isinstance(reliquary_query, str):
+            await self.send_json(send, 400, {"error": "`reliquary_query` must be a string"})
+            return
         reliquary_disabled = bool(payload.pop("reliquary_disable", False))
         stream = bool(payload.get("stream"))
 
@@ -3505,12 +3523,13 @@ class ReliquaryChatProxy:
 
         upstream_url = self.url_for(scope, self.settings.upstream_base_url)
         forward_headers = self.forward_headers(request_headers)
+        from helpers import header_safe  # user text: percent-encode so latin-1 headers can't fail
         extra_headers = {
             "x-reliquary-hit-count": str(len(memory_hits)),
-            "x-reliquary-user-id": user_id,
+            "x-reliquary-user-id": header_safe(user_id),
         }
         if reliquary_query:
-            extra_headers["x-reliquary-query"] = trim_text(reliquary_query, 140)
+            extra_headers["x-reliquary-query"] = header_safe(trim_text(reliquary_query, 140))
 
         if stream:
             assistant_text = await self.stream_upstream_request(
@@ -3572,8 +3591,11 @@ class ReliquaryChatProxy:
             await self.send_json(send, 501, {"error": "This proxy has no base URL configured for that endpoint"})
             return
 
+        if self._unsafe_relay_path(scope["path"]):
+            await self.send_json(send, 400, {"error": "invalid_path"})
+            return
         headers = decode_headers(scope)
-        body = await self.read_body(receive)
+        body = await self.read_body(receive, self.request_body_max_bytes())
         url = self.url_for(scope, base_url)
         response = await self.client.request(scope["method"], url, headers=self.forward_headers(headers), content=body)
         await send(
@@ -3960,16 +3982,37 @@ class ReliquaryChatProxy:
         token = token.strip()
         if scheme.lower() != "bearer" or not token:
             return None
-        if profile.token and secrets.compare_digest(token, profile.token):
+        if profile.token and secrets.compare_digest(token.encode("utf-8"), profile.token.encode("utf-8")):
             return "write"
         for static_token, scope in self._static_tokens.items():
-            if secrets.compare_digest(token, static_token):
+            if secrets.compare_digest(token.encode("utf-8"), static_token.encode("utf-8")):
                 return scope
         resource = f"{self.oauth.base_url(headers)}{profile.path}"
         oauth_scope = self.oauth.access_token_scope(token, resource=resource)
         if oauth_scope is not None:
             return "write" if scope_is_write(oauth_scope) else "read"
         return None
+
+    def _credential_key(self, headers: dict[str, str]) -> str:
+        """Stable identity of the credential behind a request, for per-credential
+        bounds (MCP sessions, rate limits): an endpoint's master token, a static
+        token's label, or an OAuth grant's rotation family. Never the raw token,
+        which changes on every refresh, and never a secret."""
+        scheme, _, token = headers.get("authorization", "").strip().partition(" ")
+        token = token.strip()
+        if scheme.lower() != "bearer" or not token:
+            return "anon"
+        candidate = token.encode("utf-8")
+        for endpoint in self.endpoint_profiles.values():
+            if endpoint.token and secrets.compare_digest(candidate, endpoint.token.encode("utf-8")):
+                return f"master:{endpoint.name}"
+        for label, _scope, static_token in self.settings.static_tokens:
+            if secrets.compare_digest(candidate, static_token.encode("utf-8")):
+                return f"static:{label}"
+        identity = self.oauth.access_token_identity(token)
+        if identity:
+            return f"oauth:{identity}"
+        return "token:" + hashlib.sha256(candidate).hexdigest()[:16]
 
     def is_allowed_token(self, profile: EndpointProfile, headers: dict[str, str]) -> bool:
         return self.resolve_scope(profile, headers) is not None
@@ -4191,7 +4234,7 @@ class ReliquaryChatProxy:
         body = await self.read_body(receive)
         try:
             payload = json.loads(body or b"{}")
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # bad JSON, bad UTF-8, too deep
             await self.send_json(send, 400, {"error": "invalid_client_metadata", "error_description": "Invalid JSON"})
             return
         if not isinstance(payload, dict):
@@ -4304,31 +4347,55 @@ class ReliquaryChatProxy:
         return f"{base_url}{path}{'?' + query if query else ''}"
 
     @staticmethod
-    def forward_headers(headers: dict[str, str]) -> dict[str, str]:
-        excluded = {
-            "host",
-            "content-length",
-            "connection",
-            "accept-encoding",
-            "transfer-encoding",
-        }
-        return {key: value for key, value in headers.items() if key not in excluded}
+    def _unsafe_relay_path(path: str) -> bool:
+        """True when a /v1 path could leave the upstream's /v1 prefix: a '..'
+        segment (also percent-encoded, at any depth), '//' or a backslash."""
+        from urllib.parse import unquote
+        decoded = path
+        for _ in range(5):
+            step = unquote(decoded)
+            if step == decoded:
+                break
+            decoded = step
+        return "//" in decoded or "\\" in decoded or ".." in decoded.split("/")
+
+    # Only what an OpenAI-compatible upstream needs; never cookies, client IPs
+    # (X-Forwarded-*, CF-*) or other ingress metadata.
+    FORWARDED_UPSTREAM_HEADERS = frozenset({
+        "authorization", "api-key", "x-api-key", "content-type", "accept", "user-agent",
+        "openai-organization", "openai-project", "openai-beta", "x-request-id",
+    })
 
     @staticmethod
-    async def read_body(receive) -> bytes:
-        chunks: list[bytes] = []
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                break  # client went away; stop instead of waiting forever
-            if message["type"] != "http.request":
-                continue
-            chunk = message.get("body", b"")
-            if chunk:
-                chunks.append(chunk)
-            if not message.get("more_body", False):
-                break
-        return b"".join(chunks)
+    def forward_headers(headers: dict[str, str]) -> dict[str, str]:
+        allowed = ReliquaryChatProxy.FORWARDED_UPSTREAM_HEADERS
+        return {key: value for key, value in headers.items() if key in allowed}
+
+    # /oauth/* forms and DCR metadata are tiny; they are read before any auth.
+    OAUTH_BODY_MAX_BYTES = 64 * 1024
+
+    def request_body_max_bytes(self) -> int:
+        """Cap for the authenticated JSON routes (MCP, /v1, debug search): an
+        inline base64 image at the blob limit plus 1 MiB for the JSON envelope.
+        0 (unlimited) only when the operator disabled the blob limit too."""
+        blob_max = self.settings.blob_max_bytes
+        if not blob_max:
+            return 0
+        return 4 * -(-blob_max // 3) + 1024 * 1024
+
+    def _body_cap_for_path(self, path: str) -> int:
+        if path.startswith("/oauth/"):
+            return self.OAUTH_BODY_MAX_BYTES
+        if UPLOAD_PATH_RE.fullmatch(path):
+            return 0  # the raw upload route enforces blob_max_bytes itself
+        return self.request_body_max_bytes()
+
+    @staticmethod
+    async def read_body(receive, max_bytes: int = OAUTH_BODY_MAX_BYTES) -> bytes:
+        data = await ReliquaryChatProxy._read_body_limited(receive, max_bytes)
+        if data is None:
+            raise RequestBodyTooLarge(max_bytes)
+        return data
 
     @staticmethod
     async def send_empty(send, status: int, extra_headers: dict[str, str] | None = None) -> None:
@@ -4425,6 +4492,14 @@ class ReliquaryChatProxy:
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
+class RequestBodyTooLarge(Exception):
+    """Raised by read_body once a request body passes its cap; answered with 413."""
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(f"request body exceeds {max_bytes} bytes")
+        self.max_bytes = max_bytes
+
+
 @dataclass
 class _GlobalRoute:
     filters: dict[str, Any] | None = None
@@ -4434,9 +4509,11 @@ class _GlobalRoute:
 def parse_static_tokens(raw: str | None) -> tuple[tuple[str, str, str], ...]:
     """Parse 'label:scope:token;...' into a tuple of (label, scope, token) triples.
 
-    Scope is normalised: anything that isn't an explicit read scope becomes 'write'
-    so the legacy 'mcp' value and unknown strings all grant write (backward-compat).
+    Scope is normalised fail-closed with static_token_scope_is_write: 'write'
+    (and the legacy 'mcp' or an empty scope) grants write; read words and
+    unrecognised words grant read, with a warning for the unrecognised ones.
     """
+    from oauth import KNOWN_SCOPES, static_token_scope_is_write
     entries: list[tuple[str, str, str]] = []
     for chunk in (raw or "").split(";"):
         chunk = chunk.strip()
@@ -4447,7 +4524,10 @@ def parse_static_tokens(raw: str | None) -> tuple[tuple[str, str, str], ...]:
             LOG.warning("Ignoring malformed RELIQUARY_STATIC_TOKENS entry (need label:scope:token).")
             continue
         label, scope, token = (p.strip() for p in parts)
-        scope = "write" if scope_is_write(scope) else "read"
+        unknown = set(scope.lower().split()) - KNOWN_SCOPES
+        raw_scope, scope = scope, ("write" if static_token_scope_is_write(scope) else "read")
+        if unknown:
+            LOG.warning("Static token %r has unrecognised scope %r; granting %s.", label, raw_scope, scope)
         if not label or not token:
             LOG.warning("Ignoring static token entry with empty label/token.")
             continue

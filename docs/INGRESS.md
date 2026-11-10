@@ -113,8 +113,8 @@ See the main README for full documentation. Summary:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `RELIQUARY_AUDIT_LOG` | unset | Path for the append-only JSONL write-audit log. Disabled when unset. |
-| `RELIQUARY_RATE_LIMIT_WRITES` | `0` | Max write tool calls per token per minute. `0` = unlimited. |
-| `RELIQUARY_RATE_LIMIT_SEARCHES` | `0` | Max search/fetch calls per token per minute. `0` = unlimited. |
+| `RELIQUARY_AUDIT_LOG` | unset | Path for the append-only JSONL write-audit log (created `0600`). Disabled when unset. |
+| `RELIQUARY_RATE_LIMIT_WRITES` | `0` | Max write tool calls per credential (OAuth grant, static token label, master token) per minute. `0` = unlimited. |
+| `RELIQUARY_RATE_LIMIT_SEARCHES` | `0` | Max search/fetch calls per credential per minute. `0` = unlimited. |
 | `RELIQUARY_METRICS_PUBLIC` | `false` | Expose `/metrics` without auth. Default: requires Claude bearer. |
 | `RELIQUARY_RETRIEVAL_STATS_PATH` | unset | Path for the append-only JSONL retrieval-event log. Disabled when unset; feeds `lint.py` archive/compile proposals. |

@@ -50,9 +50,9 @@ explicitly configured):
 
 | Environment variable | Purpose |
 |---|---|
-| `RELIQUARY_AUDIT_LOG` | Append-only JSONL log of every successful write (add/update/delete). Path to file; unset = disabled. |
-| `RELIQUARY_RATE_LIMIT_WRITES` | Max write tool calls per token per minute (`0` = unlimited). |
-| `RELIQUARY_RATE_LIMIT_SEARCHES` | Max search/fetch calls per token per minute (`0` = unlimited). |
+| `RELIQUARY_AUDIT_LOG` | Append-only JSONL log of every successful write (add/update/delete). Path to file (created `0600`); unset = disabled. |
+| `RELIQUARY_RATE_LIMIT_WRITES` | Max write tool calls per credential per minute (`0` = unlimited). A credential is an OAuth grant (refreshed tokens share its budget), a static token's label, or an endpoint's master token. |
+| `RELIQUARY_RATE_LIMIT_SEARCHES` | Max search/fetch calls per credential per minute (`0` = unlimited). |
 | `RELIQUARY_METRICS_PUBLIC` | Set to `true` to expose `GET /metrics` without auth. Default `false` = requires the Claude bearer token. |
 | `RELIQUARY_RETRIEVAL_STATS_PATH` | Path for an append-only JSONL retrieval-event log (one entry per search hit / fetch). Unset = disabled. Feeds `python app/lint.py` archive/compile proposals. |
 
@@ -208,14 +208,28 @@ Run `python app/server.py --help` for the full flag list.
 
 - **Default-closed.** Every endpoint requires a valid token; there is no
   anonymous access. Write vs read is decided by the token's scope, identically
-  for the Claude and OpenAI endpoints.
+  for the Claude and OpenAI endpoints. A scope is a space-separated word set.
+  An OAuth grant is read-only when its scope contains a read word (`read`,
+  `readonly`, `read_only`, `search`) and no `write`, so `read offline_access`
+  is read-only; anything else (`write`, no scope, `mcp`, or only unrecognised
+  words such as `openid`) keeps write, and the authorize page shows which one
+  the client gets. Static tokens are stricter: only `write` (or the legacy
+  `mcp` or an empty scope) grants write; an unrecognised scope such as `ro`,
+  `rw` or `reader` is read-only and logged as a warning.
+- **Request size limits.** `/oauth/*` bodies are capped at 64 KiB; MCP, `/v1/*`
+  and `/reliquary/search` bodies at the base64 size of `RELIQUARY_BLOB_MAX_BYTES`
+  plus 1 MiB (about 41 MiB by default, enough for an inline image at the blob
+  limit). Larger bodies, or a larger `Content-Length`, get `413`. `/uploads/*`
+  keeps its own `RELIQUARY_BLOB_MAX_BYTES` limit.
 - **OAuth tokens are derived & revocable.** The connector gets a short-lived,
   resource-scoped access token (default 5 days) plus a **rotating refresh token**
   (non-expiring by default, with reuse detection) so it renews silently. The Docker
   Compose stack persists tokens across restarts by default (see `STATE_HOST_DIR`);
   outside Docker, set `RELIQUARY_STATE_DIR` yourself — without it, a restart signs
   connectors out. Revoking a *refresh* token via `/oauth/revoke` drops the whole
-  rotation family; revoking an access token removes just that token.
+  rotation family; revoking an access token removes just that token. The state
+  files store SHA-256 hashes of the tokens, never the tokens; files written by
+  older versions are converted on first load.
 - **Embedded vs server Qdrant.** Reads run concurrently only against a Qdrant
   *server*; an embedded on-disk store is auto-detected and serialized (it is not
   read-thread-safe).

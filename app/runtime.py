@@ -107,31 +107,52 @@ class MCPSessionStore:
     refreshes its recency, so only genuinely idle sessions are dropped once the
     table is full.
 
+    Sessions may carry an ``owner`` (the credential that created them). One
+    owner holds at most ``max_per_owner`` sessions, and when the table is full
+    a new session evicts the owner's own least-recently-used session before
+    anyone else's, so one token cannot push every other client out.
+
     Single-event-loop access only; no internal locking needed.
     """
 
-    def __init__(self, *, max_size: int, ttl: float, clock=time.monotonic, session_store=None) -> None:
+    def __init__(self, *, max_size: int, ttl: float, clock=time.monotonic, session_store=None,
+                 max_per_owner: int | None = None) -> None:
         if max_size < 1:
             raise ValueError("max_size must be >= 1")
         self.max_size = max_size
+        self.max_per_owner = max(1, max_per_owner if max_per_owner is not None else max_size // 4)
         self.ttl = ttl
         self._clock = clock
-        # session_id -> [profile_name, last_seen]; insertion/access order == LRU order
+        # session_id -> [profile_name, last_seen, owner]; insertion/access order == LRU order
         self._sessions: "dict[str, list]" = {}
         self._session_store = session_store
         if self._session_store is not None:
-            for sid, profile_name in self._session_store.load().items():
-                if isinstance(sid, str) and isinstance(profile_name, str):
-                    self._sessions[sid] = [profile_name, self._clock()]
+            for sid, value in self._session_store.load().items():
+                # Old files store "profile"; owned sessions store ["profile", "owner"].
+                if isinstance(value, list) and len(value) == 2:
+                    profile_name, owner = value
+                else:
+                    profile_name, owner = value, None
+                if isinstance(sid, str) and isinstance(profile_name, str) and (owner is None or isinstance(owner, str)):
+                    self._sessions[sid] = [profile_name, self._clock(), owner]
 
-    def add(self, session_id: str, profile_name: str) -> None:
+    def add(self, session_id: str, profile_name: str, owner: str | None = None) -> None:
         self._evict_expired()
         self._sessions.pop(session_id, None)
-        self._sessions[session_id] = [profile_name, self._clock()]
+        if owner is not None:
+            mine = [sid for sid, entry in self._sessions.items() if entry[2] == owner]
+            while len(mine) >= self.max_per_owner:
+                self._sessions.pop(mine.pop(0), None)  # owner's least-recently-used
+        self._sessions[session_id] = [profile_name, self._clock(), owner]
         while len(self._sessions) > self.max_size:
-            # drop least-recently-used (first inserted/touched)
-            oldest = next(iter(self._sessions))
-            self._sessions.pop(oldest, None)
+            victim = None
+            if owner is not None:
+                victim = next((sid for sid, entry in self._sessions.items()
+                               if entry[2] == owner and sid != session_id), None)
+            if victim is None:
+                # drop least-recently-used (first inserted/touched)
+                victim = next(iter(self._sessions))
+            self._sessions.pop(victim, None)
         self._persist()
 
     def touch(self, session_id: str) -> str | None:
@@ -173,4 +194,7 @@ class MCPSessionStore:
 
     def _persist(self) -> None:
         if self._session_store is not None:
-            self._session_store.save({sid: entry[0] for sid, entry in self._sessions.items()})
+            self._session_store.save({
+                sid: entry[0] if entry[2] is None else [entry[0], entry[2]]
+                for sid, entry in self._sessions.items()
+            })
