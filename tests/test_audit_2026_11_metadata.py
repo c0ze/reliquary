@@ -245,3 +245,39 @@ def test_search_uses_import_id_when_catalog_has_it(proxy):
     hit = call(proxy, "openai", "search", {"query": "garden"})["structuredContent"]["results"][0]
     assert hit["id"] == "garden-1"
     assert not call(proxy, "openai", "fetch", {"id": "garden-1"})["isError"]
+
+
+# --- 3. audit log: effective user and page slug ------------------------------
+
+def _rpc(proxy, path, token, name, arguments):
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=proxy), base_url="http://test",
+                                     headers={"authorization": f"Bearer {token}"}) as client:
+            response = await client.post(path, json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                                     "params": {"name": name, "arguments": arguments}})
+            assert response.status_code == 200
+            return response.json()["result"]
+    return run(go())
+
+
+def _audit_entries(path):
+    with open(path, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def test_audit_records_effective_user_and_page_slug(make_proxy, tmp_path):
+    audit_path = str(tmp_path / "audit.jsonl")
+    proxy = make_proxy(audit_log_path=audit_path)
+    s = proxy.settings
+    result = _rpc(proxy, s.openai_mcp_path, "openai-secret", "add_memory", {"text": "hello", "user_id": "mallory"})
+    assert result["structuredContent"]["user_id"] == "my_lord"
+    _rpc(proxy, s.claude_mcp_path, "claude-secret", "reliquary_compile_page",
+         {"slug": "pg", "markdown": "body", "user_id": "mallory"})
+    _rpc(proxy, s.claude_mcp_path, "claude-secret", "reliquary_delete_page", {"slug": "pg", "user_id": "mallory"})
+    _rpc(proxy, s.claude_mcp_path, "claude-secret", "reliquary_add_memory", {"text": "hi", "user_id": "alice"})
+    entries = _audit_entries(audit_path)
+    assert [e["action"] for e in entries] == ["add_memory", "reliquary_compile_page",
+                                              "reliquary_delete_page", "reliquary_add_memory"]
+    assert [e["user_id"] for e in entries] == ["my_lord", "my_lord", "my_lord", "alice"]
+    assert entries[1]["ids"].get("slug") == "pg"
+    assert entries[2]["ids"].get("slug") == "pg"

@@ -1063,8 +1063,8 @@ class ReliquaryChatProxy:
                         self.audit.record(
                             action=tool_name,
                             endpoint=profile.name,
-                            user_id=tool_arguments.get("user_id") or self.settings.user_id,
-                            ids={k: structured.get(k) for k in ("ids", "id", "memory_id", "blob_id", "deleted", "updated") if k in structured},
+                            user_id=self._audit_user_id(tool_name, tool_arguments, structured),
+                            ids={k: structured.get(k) for k in ("ids", "id", "memory_id", "blob_id", "deleted", "updated", "slug") if k in structured},
                         )
                     except Exception:
                         # The write already committed; an unwritable audit path
@@ -1085,6 +1085,22 @@ class ReliquaryChatProxy:
             self.mcp_error(request_id, -32601, f"Method not found: {request_method}"),
             extra_headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
         )
+
+    # Claude-endpoint writes whose handlers honour a caller user_id override
+    # (allow_user_id=True in _dispatch_mcp_tool). Every other write runs as the
+    # default user: the lean endpoint ignores caller ids, pages are global.
+    _USER_SCOPED_WRITE_TOOLS = frozenset({
+        "reliquary_add_memory", "reliquary_delete", "reliquary_update", "reliquary_add_image",
+        "reliquary_delete_image", "reliquary_commit_image_upload", "reliquary_propose_update",
+    })
+
+    def _audit_user_id(self, tool_name: str, arguments: dict[str, Any], structured: dict[str, Any]) -> str:
+        """The user a successful write really ran as, for the audit log."""
+        if structured.get("user_id"):
+            return str(structured["user_id"])
+        if tool_name in self._USER_SCOPED_WRITE_TOOLS and arguments.get("user_id"):
+            return str(arguments["user_id"])
+        return self.settings.user_id
 
     @staticmethod
     def _tool_category(tool_name: str) -> str:
