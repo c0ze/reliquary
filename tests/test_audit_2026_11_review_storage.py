@@ -401,3 +401,101 @@ def test_recording_the_memory_id_does_not_block_the_event_loop(proxy, monkeypatc
     assert result["isError"] is False
     assert ticks >= 10
     assert proxy.pages.get("pg").memory_id == result["structuredContent"]["memory_id"]
+
+
+# 10 -- a cancelled write keeps its locks until its worker thread finished ---
+
+async def _wait_for(event, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not event.is_set():
+        assert time.monotonic() < deadline, "worker never started"
+        await asyncio.sleep(0.005)
+
+
+def test_cancelled_compile_holds_the_page_lock_until_its_worker_finished(proxy, monkeypatch):
+    real_add = proxy.compiled_memory.add
+    started, release = threading.Event(), threading.Event()
+
+    def slow_add(*args, **kwargs):
+        started.set()
+        release.wait(5)
+        return real_add(*args, **kwargs)
+
+    monkeypatch.setattr(proxy.compiled_memory, "add", slow_add)
+
+    async def scenario():
+        compile_task = asyncio.create_task(proxy.handle_compile_page_tool({"slug": "p", "markdown": "v1"}))
+        await _wait_for(started)
+        compile_task.cancel()
+        await asyncio.sleep(0.05)
+        delete_task = asyncio.create_task(proxy.handle_delete_page_tool({"slug": "p"}))
+        await asyncio.sleep(0.2)
+        delete_ran_early = delete_task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await compile_task
+        return delete_ran_early, await delete_task
+
+    delete_ran_early, deleted = run_threaded(monkeypatch, scenario)
+    assert delete_ran_early is False
+    assert deleted["structuredContent"]["deleted"] is True
+    assert proxy.pages.get("p") is None
+    assert proxy.compiled_memory._store == {}  # no vector recreated for the deleted page
+
+
+def test_cancelled_memory_write_holds_the_writer_lock_until_its_worker_finished(proxy, fake_memory, monkeypatch):
+    real_add = fake_memory.add
+    started, release = threading.Event(), threading.Event()
+    active, overlap = [], []
+
+    def slow_add(text, **kwargs):
+        active.append(text)
+        overlap.append(len(active))
+        try:
+            if text == "first":
+                started.set()
+                release.wait(5)
+            return real_add(text, **kwargs)
+        finally:
+            active.remove(text)
+
+    monkeypatch.setattr(fake_memory, "add", slow_add)
+
+    async def scenario():
+        first = asyncio.create_task(proxy.add_memory("first", user_id="my_lord"))
+        await _wait_for(started)
+        first.cancel()
+        await asyncio.sleep(0.05)
+        second = asyncio.create_task(proxy.add_memory("second", user_id="my_lord"))
+        await asyncio.sleep(0.2)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await second
+
+    run_threaded(monkeypatch, scenario)
+    assert max(overlap) == 1
+    assert sorted(r["memory"] for r in fake_memory._store.values()) == ["first", "second"]
+
+
+def test_drain_on_cancel_survives_repeated_cancellation():
+    from runtime import drain_on_cancel
+
+    async def scenario():
+        finished = asyncio.Event()
+
+        async def work():
+            await asyncio.sleep(0.05)
+            finished.set()
+            raise ValueError("after the caller gave up")
+
+        caller = asyncio.create_task(drain_on_cancel(work()))
+        await asyncio.sleep(0.01)
+        caller.cancel()
+        await asyncio.sleep(0.01)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert finished.is_set()  # the caller only finished after the work did
+
+    run(scenario())

@@ -26,7 +26,7 @@ from oauth import OAuthProvider, RegistrationDisabledError, scope_is_write
 from catalog import CorpusCatalog
 from metadata_policy import caller_kind, clean_caller_metadata, honours_import_id, normalize_taxonomy
 from persistence import JsonFileStore
-from runtime import AsyncRWLock, MCPSessionStore, native_hybrid_active, reads_can_be_concurrent
+from runtime import AsyncRWLock, MCPSessionStore, drain_on_cancel, native_hybrid_active, reads_can_be_concurrent
 from blobs import UPLOAD_OWNER_PREFIX, BlobStore, BlobTooLarge
 from ratelimit import RateLimiter
 from metrics import Metrics
@@ -2526,7 +2526,9 @@ class ReliquaryChatProxy:
 
     async def handle_compile_page_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
         async with self.page_write_lock:
-            return await self._compile_page(arguments, allow_user_id=allow_user_id)
+            # The page transaction spans registry and index writes in worker
+            # threads; a cancelled caller must not release the lock mid-way.
+            return await drain_on_cancel(self._compile_page(arguments, allow_user_id=allow_user_id))
 
     async def _compile_page(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
         if self.pages is None or self.compiled_memory is None:
@@ -2693,7 +2695,7 @@ class ReliquaryChatProxy:
 
     async def handle_delete_page_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         async with self.page_write_lock:
-            return await self._delete_page(arguments)
+            return await drain_on_cancel(self._delete_page(arguments))
 
     async def _delete_page(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.pages is None:
@@ -4209,26 +4211,28 @@ class ReliquaryChatProxy:
         # next create_image_upload (cheap: a scan of the in-memory slot table).
         self._cleanup_expired_uploads()
         async with self.memory_lock.write():
-            result = await asyncio.to_thread(
+            # Drained so a cancelled caller keeps the writer lock until the
+            # worker thread is done (cancelling to_thread does not stop it).
+            result = await drain_on_cancel(asyncio.to_thread(
                 self.memory.add,
                 text,
                 user_id=user_id,
                 metadata=metadata,
                 infer=infer,
-            )
+            ))
         self._count_cache = None
         return result
 
     async def delete_memory(self, record_id: str) -> None:
         self._cleanup_expired_uploads()
         async with self.memory_lock.write():
-            await asyncio.to_thread(self.memory.delete, record_id)
+            await drain_on_cancel(asyncio.to_thread(self.memory.delete, record_id))
         self._count_cache = None
 
     async def update_memory(self, record_id: str, data: str, *, metadata: dict[str, Any] | None = None) -> None:
         self._cleanup_expired_uploads()
         async with self.memory_lock.write():
-            await asyncio.to_thread(self.memory.update, record_id, data, metadata)
+            await drain_on_cancel(asyncio.to_thread(self.memory.update, record_id, data, metadata))
         self._count_cache = None
 
     def is_allowed_mcp_origin(self, headers: dict[str, str]) -> bool:
@@ -4418,12 +4422,12 @@ class ReliquaryChatProxy:
             metadata["model"] = model
 
         async with self.memory_lock.write():
-            await asyncio.to_thread(
+            await drain_on_cancel(asyncio.to_thread(
                 self.memory.add,
                 [{"role": "user", "content": user_text}, {"role": "assistant", "content": assistant_text}],
                 user_id=user_id,
                 metadata=metadata,
-            )
+            ))
         if self.settings.writeback_path:
             try:
                 await asyncio.to_thread(
