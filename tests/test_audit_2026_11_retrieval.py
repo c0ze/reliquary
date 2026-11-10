@@ -340,7 +340,7 @@ def test_lean_search_shows_correction_beside_its_original_with_status(proxy):
 # 6. Cursor pagination must partition one stable ranking
 # ---------------------------------------------------------------------------
 
-def _paginate(proxy, query, *, limit, pages, endpoint="openai", **extra):
+def _paginate(proxy, query, *, limit, pages, endpoint="openai", key="id", **extra):
     tool = "search" if endpoint == "openai" else "reliquary_search"
     seen, cursor = [], None
     for _ in range(pages):
@@ -348,7 +348,7 @@ def _paginate(proxy, query, *, limit, pages, endpoint="openai", **extra):
         if cursor:
             arguments["cursor"] = cursor
         structured = call(proxy, tool, arguments, endpoint=endpoint)["structuredContent"]
-        seen += [item["id"] for item in structured["results"]]
+        seen += [item[key] for item in structured["results"]]
         cursor = structured["nextCursor"]
         if not cursor:
             break
@@ -372,11 +372,13 @@ def test_pagination_pages_partition_one_ranking(make_proxy):
         scores[added["results"][0]["id"]] = 0.90 - i * 0.004
     proxy = make_proxy(memory=memory)
 
-    by_five = _paginate(proxy, "zeppelin hangar", limit=5, pages=6)
+    # Identify records by title: without a catalog entry an import's id is its
+    # memory id, not its import_record_id.
+    by_five = _paginate(proxy, "zeppelin hangar", limit=5, pages=6, key="title")
     assert len(by_five) == 30
     assert len(set(by_five)) == 30, "a record repeated across pages"
     # The same ranking, sliced differently, gives the same sequence.
-    assert _paginate(proxy, "zeppelin hangar", limit=15, pages=2) == by_five
+    assert _paginate(proxy, "zeppelin hangar", limit=15, pages=2, key="title") == by_five
     # The vector pool is the same size on every page.
     assert len({c["top_k"] for c in memory.search_calls}) == 1
     # The quality key (lexical + recency bonus) orders the pages, not just the cut:
