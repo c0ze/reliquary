@@ -2506,17 +2506,19 @@ class ReliquaryChatProxy:
                     await asyncio.to_thread(self.compiled_memory.update, info.memory_id, text, metadata=metadata)
                     return info.memory_id
                 except Exception:
-                    LOG.exception("Compiled re-index failed for slug=%s; adding fresh", info.slug)
+                    LOG.exception("Compiled re-index failed for slug=%s", info.slug)
+                    # Mem0 writes the vector before its history row, so a failed
+                    # update may have landed. Add a replacement only once the record
+                    # is confirmed absent: a second vector would keep the old text
+                    # ranking for this page, and delete_page drops only one.
+                    existing = await asyncio.to_thread(self.compiled_memory.get, info.memory_id)
+                    if existing is not None:
+                        landed = isinstance(existing, dict) and \
+                            (existing.get("metadata") or {}).get("blob_ref") == metadata.get("blob_ref")
+                        if landed:
+                            return info.memory_id
+                        raise
             result = await asyncio.to_thread(self.compiled_memory.add, text, user_id=user_id, metadata=metadata, infer=False)
-            if info.memory_id:
-                # The failed update left the old vector behind; best-effort drop
-                # it so stale synthesis text can't outrank (and outlive) the
-                # fresh index — delete_page only removes the latest memory_id.
-                try:
-                    await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
-                except Exception:
-                    LOG.warning("Could not remove superseded compiled vector %s for slug=%s",
-                                info.memory_id, info.slug)
         ids = added_memory_ids(result)
         return ids[0] if ids else None
 
@@ -2590,11 +2592,7 @@ class ReliquaryChatProxy:
         except BlobTooLarge as exc:
             return self.mcp_tool_result(text=str(exc), structured={"error": "too_large", "size": exc.size, "max_bytes": exc.max_bytes}, is_error=True)
         user_id = str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
-        metadata = {"kind": "synthesis", "source_group": "compiled", "slug": slug,
-                    "blob_ref": info.current_blob, "derived_from": info.derived_from}
-        for key in ("domain", "hall", "room", "topic"):
-            if getattr(info, key):
-                metadata[key] = getattr(info, key)
+        metadata = self._compiled_metadata(info)
         try:
             memory_id = await self._index_compiled_page(info, markdown, user_id=user_id, metadata=metadata)
         except Exception:
@@ -2604,16 +2602,61 @@ class ReliquaryChatProxy:
             # The registry commits before the index write; without this, a
             # failure left a current revision that search never sees (or, for
             # an existing page, registry text that diverges from the index).
-            await asyncio.to_thread(self.pages.rollback_revision, slug, previous, info)
+            rolled_back = await asyncio.to_thread(self.pages.rollback_revision, slug, previous, info)
+            if not rolled_back:
+                confirmed = False
+                text = (f"Could not index page slug={slug}; another writer changed the page meanwhile, "
+                        "so it was left as that writer filed it.")
+            elif previous is None or not previous.memory_id:
+                confirmed = True
+                text = f"Could not index page slug={slug}; the page was not filed. Retry later."
+            else:
+                # The failed write may still have changed the index entry.
+                confirmed = await self._reindex_restored_page(slug, user_id=user_id)
+                text = (f"Could not index page slug={slug}; the page and its index entry are back at the "
+                        "previous revision. Retry later." if confirmed else
+                        f"Could not index page slug={slug}. Its previous revision was restored, but its index "
+                        "entry could not be confirmed to match it.")
+            if not confirmed:
+                await asyncio.to_thread(self.pages.set_index_unconfirmed, slug)
+                text += " The page is listed under `unindexed` in reliquary://needs-review until it is re-filed."
             return self.mcp_tool_result(
-                text=f"Could not index page slug={slug}; nothing was changed. Retry later.",
-                structured={"error": "index_failed", "slug": slug}, is_error=True)
+                text=text, structured={"error": "index_failed", "slug": slug, "index_confirmed": confirmed},
+                is_error=True)
         self.pages.set_memory_id(slug, memory_id)
         url = self._signed_blob_url(info.current_blob)
         return self.mcp_tool_result(
             text=f"Filed synthesis page slug={slug} (revision {info.current_blob[:12]}, status={status}).",
             structured={"slug": slug, "revision": info.current_blob, "memory_id": memory_id,
                         "url": url, "derived_from": info.derived_from, "status": status})
+
+    @staticmethod
+    def _compiled_metadata(info) -> dict[str, Any]:
+        metadata = {"kind": "synthesis", "source_group": "compiled", "slug": info.slug,
+                    "blob_ref": info.current_blob, "derived_from": info.derived_from}
+        for key in ("domain", "hall", "room", "topic"):
+            if getattr(info, key):
+                metadata[key] = getattr(info, key)
+        return metadata
+
+    async def _reindex_restored_page(self, slug: str, *, user_id: str) -> bool:
+        """After a failed compile was rolled back, make the page's index entry
+        describe the restored revision again. True once that is confirmed."""
+        from compiled import markdown_body
+        restored = self.pages.get(slug)
+        body = self.pages.read_body(slug)
+        if restored is None or body is None or not restored.memory_id:
+            return False
+        try:
+            memory_id = await self._index_compiled_page(restored, markdown_body(body[0]), user_id=user_id,
+                                                        metadata=self._compiled_metadata(restored))
+        except Exception:
+            LOG.exception("Could not restore the index entry of slug=%s after a failed compile", slug)
+            return False
+        if not memory_id:
+            return False
+        await asyncio.to_thread(self.pages.set_memory_id, slug, memory_id)
+        return True
 
     async def handle_list_pages_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.pages is None:

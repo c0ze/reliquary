@@ -235,3 +235,88 @@ def test_rollback_leaves_a_page_another_writer_replaced(tmp_path):
     assert registry.rollback_revision("pg", previous, ours) is False
     assert registry.get("pg").current_blob == theirs.current_blob
     assert registry.blobs.info(ours.current_blob).ref_count == 1  # held by history, not released
+
+
+# 3 -- a failed index write is reconciled, not assumed to have changed nothing
+
+def _update_applies_then_fails(proxy, monkeypatch, *, applies=lambda text: True):
+    """Mem0 2.0.4 writes the vector, then its history row; make the history
+    write fail after the vector update landed."""
+    store = proxy.compiled_memory._store
+
+    def update(memory_id, data, metadata=None):
+        if applies(data):
+            store[memory_id]["memory"] = data
+            store[memory_id]["metadata"] = dict(metadata or {})
+        raise RuntimeError("history database is locked")
+
+    def add(*args, **kwargs):
+        raise RuntimeError("embedder unavailable")
+
+    monkeypatch.setattr(proxy.compiled_memory, "update", update)
+    monkeypatch.setattr(proxy.compiled_memory, "add", add)
+
+
+def _get_fails_once(proxy, monkeypatch):
+    real_get = proxy.compiled_memory.get
+    calls = []
+
+    def get(memory_id):
+        calls.append(memory_id)
+        if len(calls) == 1:
+            raise ConnectionError("qdrant timeout")  # the landed update cannot be verified
+        return real_get(memory_id)
+
+    monkeypatch.setattr(proxy.compiled_memory, "get", get)
+
+
+def test_failed_reindex_is_reconciled_to_the_restored_revision(proxy, monkeypatch):
+    first = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "old text"}))["structuredContent"]
+    _update_applies_then_fails(proxy, monkeypatch)
+    _get_fails_once(proxy, monkeypatch)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "new text"}))
+    assert result["structuredContent"]["error"] == "index_failed"
+    indexed = proxy.compiled_memory._store[first["memory_id"]]
+    assert indexed["metadata"]["blob_ref"] == first["revision"] == proxy.pages.get("pg").current_blob
+    assert "old text" in indexed["memory"]
+    assert len(proxy.compiled_memory._store) == 1
+    assert result["structuredContent"]["index_confirmed"] is True
+
+
+def test_unconfirmed_index_is_reported_truthfully_and_in_needs_review(proxy, monkeypatch):
+    first = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "old text"}))["structuredContent"]
+    _update_applies_then_fails(proxy, monkeypatch, applies=lambda text: "new text" in text)
+    _get_fails_once(proxy, monkeypatch)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "new text"}))
+    assert result["structuredContent"]["index_confirmed"] is False
+    assert "nothing was changed" not in result["content"][0]["text"]
+    assert proxy.pages.get("pg").current_blob == first["revision"]
+    payload = json.loads(proxy.read_resource("reliquary://needs-review")["contents"][0]["text"])
+    assert [item["slug"] for item in payload["unindexed"]] == ["pg"]
+    # A successful re-file clears it.
+    monkeypatch.undo()
+    run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "new text"}))
+    payload = json.loads(proxy.read_resource("reliquary://needs-review")["contents"][0]["text"])
+    assert payload["unindexed"] == []
+
+
+def test_failed_update_with_the_record_present_adds_no_second_vector(proxy, monkeypatch):
+    run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "old text"}))
+
+    def update(*args, **kwargs):
+        raise RuntimeError("transient")
+
+    monkeypatch.setattr(proxy.compiled_memory, "update", update)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "new text"}))
+    assert result["structuredContent"]["error"] == "index_failed"
+    assert len(proxy.compiled_memory._store) == 1
+    assert "old text" in proxy.pages.read_body("pg")[0]
+
+
+def test_update_that_landed_before_mem0_failed_counts_as_indexed(proxy, monkeypatch):
+    run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "old text"}))
+    _update_applies_then_fails(proxy, monkeypatch)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "new text"}))
+    # The vector matches the new revision: the history-row failure is not a page failure.
+    assert result["isError"] is False, result
+    assert "new text" in proxy.pages.read_body("pg")[0]

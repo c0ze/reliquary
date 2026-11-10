@@ -709,7 +709,9 @@ Both are proposals only, surfaced the same way as everything else lint reports
 Lint also reports two integrity categories, with or without stats:
 
 - **`unindexed_pages`** — current pages with no vector-index record, so search
-  never returns them; re-file them with `reliquary_compile_page`. Also listed
+  never returns them, and pages whose index entry a failed compile could not
+  confirm matches the restored revision (`index_confirmed: false` in the
+  `index_failed` result); re-file them with `reliquary_compile_page`. Also listed
   under `unindexed` in `reliquary://needs-review`.
 - **`orphan_blobs`** — blobs with no owning memory, no page revision and no
   pending upload slot (an abandoned upload, a crash mid-write). Pass

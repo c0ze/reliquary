@@ -69,6 +69,9 @@ class PageInfo:
     # Older registries predate this field, so it can be shorter than `history`.
     revisions_meta: list[dict] = field(default_factory=list)
     memory_id: str | None = None
+    # Set when a failed compile could not confirm that the index entry matches
+    # the restored revision; cleared by the next successful index write.
+    index_unconfirmed: bool = False
 
 
 def _emit_frontmatter(info: "PageInfo") -> str:
@@ -91,6 +94,15 @@ def _emit_frontmatter(info: "PageInfo") -> str:
 
 def assemble_markdown(info: "PageInfo", body: str) -> str:
     return f"{_emit_frontmatter(info)}\n\n{body.strip()}\n"
+
+
+def markdown_body(text: str) -> str:
+    """The body assemble_markdown() wrapped: ``text`` without its frontmatter."""
+    if text.startswith("---\n"):
+        parts = text[4:].split("\n---\n", 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+    return text.strip()
 
 
 class PageRegistry:
@@ -323,6 +335,15 @@ class PageRegistry:
             if info is None:
                 return
             info.memory_id = memory_id
+            info.index_unconfirmed = False
+            self._save(info)
+
+    def set_index_unconfirmed(self, slug: str) -> None:
+        with self._locked():
+            info = self.get(slug)
+            if info is None:
+                return
+            info.index_unconfirmed = True
             self._save(info)
 
     def pages_deriving_from(self, *, ids=(), domain: str | None = None,

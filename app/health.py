@@ -38,12 +38,18 @@ def stale_pages(pages: Iterable[Any]) -> list[dict[str, Any]]:
 
 
 def unindexed_pages(pages: Iterable[Any]) -> list[dict[str, Any]]:
-    """Current pages with no vector-index record: invisible to search."""
-    return [
-        {"kind": "unindexed_page", "slug": p.slug,
-         "reason": "current page has no index record (not searchable); re-file it with compile_page"}
-        for p in pages if getattr(p, "status", None) == "current" and not getattr(p, "memory_id", None)
-    ]
+    """Current pages with no vector-index record (invisible to search), and pages
+    whose index entry a failed compile could not confirm matches them."""
+    out: list[dict[str, Any]] = []
+    for p in pages:
+        if getattr(p, "index_unconfirmed", False):
+            out.append({"kind": "unindexed_page", "slug": p.slug,
+                        "reason": "index entry may not match the page after a failed compile; "
+                                  "re-file it with compile_page"})
+        elif getattr(p, "status", None) == "current" and not getattr(p, "memory_id", None):
+            out.append({"kind": "unindexed_page", "slug": p.slug,
+                        "reason": "current page has no index record (not searchable); re-file it with compile_page"})
+    return out
 
 
 def coverage_gaps(pages: Iterable[Any], raw_counts: dict[str, int], *, min_count: int) -> list[dict[str, Any]]:
