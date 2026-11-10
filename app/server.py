@@ -4469,11 +4469,11 @@ class _GlobalRoute:
 def parse_static_tokens(raw: str | None) -> tuple[tuple[str, str, str], ...]:
     """Parse 'label:scope:token;...' into a tuple of (label, scope, token) triples.
 
-    Scope is normalised with scope_is_write: 'write' (and the legacy 'mcp' or an
-    empty scope) grants write; read words and unrecognised words grant read, with
-    a warning for the unrecognised ones.
+    Scope is normalised fail-closed with static_token_scope_is_write: 'write'
+    (and the legacy 'mcp' or an empty scope) grants write; read words and
+    unrecognised words grant read, with a warning for the unrecognised ones.
     """
-    from oauth import KNOWN_SCOPES
+    from oauth import KNOWN_SCOPES, static_token_scope_is_write
     entries: list[tuple[str, str, str]] = []
     for chunk in (raw or "").split(";"):
         chunk = chunk.strip()
@@ -4485,7 +4485,7 @@ def parse_static_tokens(raw: str | None) -> tuple[tuple[str, str, str], ...]:
             continue
         label, scope, token = (p.strip() for p in parts)
         unknown = set(scope.lower().split()) - KNOWN_SCOPES
-        raw_scope, scope = scope, ("write" if scope_is_write(scope) else "read")
+        raw_scope, scope = scope, ("write" if static_token_scope_is_write(scope) else "read")
         if unknown:
             LOG.warning("Static token %r has unrecognised scope %r; granting %s.", label, raw_scope, scope)
         if not label or not token:

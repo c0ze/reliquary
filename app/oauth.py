@@ -29,12 +29,18 @@ KNOWN_SCOPES = READ_SCOPES | WRITE_SCOPES | {LEGACY_WRITE_SCOPE}
 
 
 def scope_is_write(scope: str | None) -> bool:
-    """True only for a space-separated scope set that asks for write.
+    """OAuth grants: a space-separated scope set is read only when it holds a
+    read word and no 'write'. Everything else stays write as before ('write',
+    no scope, legacy 'mcp', and unknown-only sets such as 'openid' or a
+    client-specific word), so existing grants keep their access."""
+    words = set(str(scope or "").lower().split())
+    return bool(words & WRITE_SCOPES) or not (words & READ_SCOPES)
 
-    'write' anywhere grants write. The legacy forms existing deployments rely
-    on also grant write: no scope at all, and 'mcp' (the default stored when a
-    client requested none) unless an explicit read word sits next to it.
-    Anything else ('read offline_access', 'openid', unknown words) is read."""
+
+def static_token_scope_is_write(scope: str | None) -> bool:
+    """Static tokens (operator config), fail-closed: write only for 'write', an
+    empty scope, or legacy 'mcp' without a read word. Unrecognised words
+    ('ro', 'rw', 'reader') are read."""
     words = set(str(scope or "").lower().split())
     if not words or words & WRITE_SCOPES:
         return True

@@ -361,10 +361,13 @@ anonymous access.
 The OpenAI endpoint is symmetric with Claude: a write-scoped token (the master
 bearer, a `write` static token, or a write-scoped OAuth grant) gets the full
 write tool set (`add_memory`, `update`, `delete`, image tools); a read-scoped
-token is read-only. Scopes are space-separated word sets: write needs the word
-`write`, or a legacy form (no scope at all, or `mcp` without a read word).
-`read offline_access`, `openid` and unrecognised static-token scopes (`ro`,
-`read-only`, ...) are read-only; the server logs a warning for the latter.
+token is read-only. Scopes are space-separated word sets. An OAuth grant is
+read-only when its scope holds a read word (`read`, `readonly`, `read_only`,
+`search`) and no `write` (`read offline_access`, `openid read`, `mcp read`);
+anything else, including no scope, `mcp` and unrecognised-only scopes such as
+`openid`, keeps write. Static tokens fail closed: only `write` (or the legacy
+`mcp` or an empty scope) grants write, and an unrecognised scope (`ro`, `rw`,
+`reader`, ...) is read-only with a warning in the log.
 
 ### Claude.ai — OAuth 2.1 (with a built-in shim)
 
@@ -386,8 +389,8 @@ Claude.ai Custom Connectors speak OAuth. Reliquary ships a small OAuth 2.1 shim:
 2. Claude opens a browser authorize page (`/oauth/authorize`). **Paste your
    `RELIQUARY_CLAUDE_MCP_TOKEN`** there and authorize. The connector receives a
    **derived, revocable** token (not the master). The page shows the redirect
-   host, the client_id and whether the client asked for read-only or read and
-   write access; redirect URIs with userinfo (`user@host`), backslashes or
+   host, the client_id, the raw scope and the access it will get (read-only or
+   read and write); redirect URIs with userinfo (`user@host`), backslashes or
    control characters are refused.
 3. Once it works, pin the client and lock down registration:
    ```bash

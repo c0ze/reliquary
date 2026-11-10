@@ -157,21 +157,39 @@ def test_consent_page_never_shows_userinfo(proxy):
     assert '<span class="host">evil.example</span>' in page
 
 
-# --- 3. scope parsing fails closed --------------------------------------------
+# --- 3. scope parsing -------------------------------------------------------
 
 
-@pytest.mark.parametrize("scope", ["read offline_access", "openid read", "READ  search", "openid", "claudeai",
-                                   "ro", "read-only", "reader"])
-def test_scope_without_write_is_read(scope):
+@pytest.mark.parametrize("scope", ["read offline_access", "openid read", "READ  search", "mcp read", "read"])
+def test_oauth_scope_with_read_word_and_no_write_is_read(scope):
     from oauth import scope_is_write
     assert scope_is_write(scope) is False
 
 
 @pytest.mark.parametrize("scope", ["write", "read write", "openid write offline_access", "mcp", "", None,
-                                   "  ", "mcp offline_access"])
-def test_write_and_legacy_scopes_grant_write(scope):
+                                   "  ", "mcp offline_access", "openid", "claudeai", "client-specific"])
+def test_oauth_write_legacy_and_unknown_only_scopes_keep_write(scope):
+    # Existing grants with an unknown-only scope were write; they must not lose it on deploy.
     from oauth import scope_is_write
     assert scope_is_write(scope) is True
+
+
+def test_oauth_token_with_unknown_only_scope_is_write(proxy):
+    access, _ = proxy.oauth.issue_token_pair(client_id="c", scope="claudeai")
+    profile = proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+    assert proxy.resolve_scope(profile, {"authorization": f"Bearer {access}"}) == "write"
+
+
+def test_consent_page_shows_unknown_scope_gets_write(proxy):
+    _verifier, challenge = _pkce()
+    params = {"response_type": "code", "client_id": "c", "redirect_uri": "https://claude.ai/api/cb",
+              "code_challenge": challenge, "code_challenge_method": "S256", "scope": "claudeai"}
+    page = _call(proxy, "GET", "/oauth/authorize", query=urlencode(params).encode())["body"].decode()
+    assert "<strong>read and write</strong>" in page
+    assert '<span class="host">claudeai</span>' in page
+    params["scope"] = "read offline_access"
+    page = _call(proxy, "GET", "/oauth/authorize", query=urlencode(params).encode())["body"].decode()
+    assert "<strong>read-only</strong>" in page
 
 
 def test_oauth_token_with_multiword_read_scope_is_read(proxy):
@@ -184,12 +202,16 @@ def test_static_token_unknown_scope_is_read_and_warns(caplog):
     import logging
     from server import parse_static_tokens
     with caplog.at_level(logging.WARNING):
-        parsed = parse_static_tokens("a:ro:t1;b:read-only:t2;c:reader:t3;d:write:t4;e:mcp:t5;f:read:t6")
+        parsed = parse_static_tokens(
+            "a:ro:t1;b:read-only:t2;c:reader:t3;g:rw:t7;h:openid:t8;d:write:t4;e:mcp:t5;f:read:t6")
     assert dict((label, scope) for label, scope, _ in parsed) == {
-        "a": "read", "b": "read", "c": "read", "d": "write", "e": "write", "f": "read"}
-    warned = " ".join(r.getMessage() for r in caplog.records)
-    assert "a" in warned and "ro" in warned
-    assert "t1" not in warned  # never log the token itself
+        "a": "read", "b": "read", "c": "read", "g": "read", "h": "read",
+        "d": "write", "e": "write", "f": "read"}
+    warned = [r.getMessage() for r in caplog.records]
+    for label, raw in (("a", "ro"), ("b", "read-only"), ("c", "reader"), ("g", "rw"), ("h", "openid")):
+        assert any(f"'{label}'" in m and f"'{raw}'" in m for m in warned), (label, warned)
+    assert not any("'d'" in m or "'e'" in m or "'f'" in m for m in warned)
+    assert not any(f"t{i}" in m for m in warned for i in range(1, 9))  # never log the token itself
 
 
 # --- 4. non-ASCII credentials -------------------------------------------------

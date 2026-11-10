@@ -208,11 +208,14 @@ Run `python app/server.py --help` for the full flag list.
 
 - **Default-closed.** Every endpoint requires a valid token; there is no
   anonymous access. Write vs read is decided by the token's scope, identically
-  for the Claude and OpenAI endpoints. A scope is a space-separated word set:
-  it grants write only when it contains `write`, or in the legacy forms (no
-  scope, or `mcp` without a read word). Anything else (`read`,
-  `read offline_access`, `openid`, an unrecognised static-token scope such as
-  `ro`) is read-only.
+  for the Claude and OpenAI endpoints. A scope is a space-separated word set.
+  An OAuth grant is read-only when its scope contains a read word (`read`,
+  `readonly`, `read_only`, `search`) and no `write`, so `read offline_access`
+  is read-only; anything else (`write`, no scope, `mcp`, or only unrecognised
+  words such as `openid`) keeps write, and the authorize page shows which one
+  the client gets. Static tokens are stricter: only `write` (or the legacy
+  `mcp` or an empty scope) grants write; an unrecognised scope such as `ro`,
+  `rw` or `reader` is read-only and logged as a warning.
 - **Request size limits.** `/oauth/*` bodies are capped at 64 KiB; MCP, `/v1/*`
   and `/reliquary/search` bodies at the base64 size of `RELIQUARY_BLOB_MAX_BYTES`
   plus 1 MiB (about 41 MiB by default, enough for an inline image at the blob
