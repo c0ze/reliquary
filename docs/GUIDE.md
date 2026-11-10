@@ -361,7 +361,10 @@ anonymous access.
 The OpenAI endpoint is symmetric with Claude: a write-scoped token (the master
 bearer, a `write` static token, or a write-scoped OAuth grant) gets the full
 write tool set (`add_memory`, `update`, `delete`, image tools); a read-scoped
-token is read-only.
+token is read-only. Scopes are space-separated word sets: write needs the word
+`write`, or a legacy form (no scope at all, or `mcp` without a read word).
+`read offline_access`, `openid` and unrecognised static-token scopes (`ro`,
+`read-only`, ...) are read-only; the server logs a warning for the latter.
 
 ### Claude.ai — OAuth 2.1 (with a built-in shim)
 
@@ -382,7 +385,10 @@ Claude.ai Custom Connectors speak OAuth. Reliquary ships a small OAuth 2.1 shim:
    Claude registers itself via DCR.
 2. Claude opens a browser authorize page (`/oauth/authorize`). **Paste your
    `RELIQUARY_CLAUDE_MCP_TOKEN`** there and authorize. The connector receives a
-   **derived, revocable** token (not the master).
+   **derived, revocable** token (not the master). The page shows the redirect
+   host, the client_id and whether the client asked for read-only or read and
+   write access; redirect URIs with userinfo (`user@host`), backslashes or
+   control characters are refused.
 3. Once it works, pin the client and lock down registration:
    ```bash
    RELIQUARY_OAUTH_CLIENT_ID=<the client_id Claude registered>
@@ -733,13 +739,29 @@ sequence: `/.well-known/*` → `/oauth/register` → `/oauth/authorize` →
   Claude and OpenAI endpoints.
 - **Use distinct tokens** for the Claude and OpenAI endpoints so one leak doesn't
   grant both.
+- **Request size limits.** `/oauth/*` bodies are capped at 64 KiB; MCP, `/v1/*`
+  and `/reliquary/search` bodies at the base64 size of `RELIQUARY_BLOB_MAX_BYTES`
+  plus 1 MiB (about 41 MiB by default, enough for an inline image at the blob
+  limit; no cap when the blob limit is `0`). Larger bodies, or a larger
+  `Content-Length`, get `413`. `/uploads/*` keeps its own blob limit.
+- **`/v1/*` passthrough** refuses paths containing `..` (also percent-encoded),
+  `//` or `\` with `400`, and forwards only `Authorization`, `api-key`,
+  `x-api-key`, `Content-Type`, `Accept`, `User-Agent`, `OpenAI-Organization`,
+  `OpenAI-Project`, `OpenAI-Beta` and `X-Request-Id` upstream. The
+  `x-reliquary-query` / `x-reliquary-user-id` response headers are
+  percent-encoded UTF-8 when the text is not plain ASCII.
 - **OAuth tokens are derived & revocable.** A short-lived, resource-scoped access
   token (default 5 days) pairs with a **rotating refresh token** (non-expiring by
   default, with reuse detection) so it renews silently. The Docker Compose stack
   persists tokens across restarts by default (see `STATE_HOST_DIR`); outside
   Docker, set `RELIQUARY_STATE_DIR` yourself — without it, a restart signs
   connectors out. Revoking a *refresh* token via `/oauth/revoke` drops the whole
-  rotation family; revoking an access token removes just that token.
+  rotation family; revoking an access token removes just that token. The state
+  files store SHA-256 hashes of the tokens, never the tokens; files written by
+  older versions are converted on first load.
+- **MCP sessions are bounded per credential**: one credential holds at most 128
+  of the 512 sessions, and a full table evicts the caller's own oldest
+  session first.
 - **Publish only behind TLS**, and prefer narrowing your proxy to the
   `/claude/*`, `/openai/*`, `/uploads/*`, `/oauth/*`, `/.well-known/*`, `/healthz`
   paths. (`/uploads/*` requires the same write bearer as the MCP endpoint that
@@ -752,7 +774,8 @@ sequence: `/.well-known/*` → `/oauth/register` → `/oauth/authorize` →
 ## MCP transport notes
 
 Reliquary implements MCP's current **Streamable HTTP** transport (single
-endpoint, `POST`; advertised protocol version `2025-06-18`). A `POST` can return
+endpoint, `POST`; `initialize` echoes the client's `protocolVersion` when it is
+`2025-06-18`, `2025-03-26` or `2024-11-05`, and answers `2025-06-18` otherwise). A `POST` can return
 JSON or an SSE (`text/event-stream`) body; the optional `GET`-as-SSE stream for
 *server-initiated* messages is not offered (we return `405`, which the spec
 permits).
