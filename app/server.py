@@ -4480,12 +4480,24 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
     )
 
 
+def _env_int(name: str, default: int) -> int:
+    """Integer env var; blank means the default, a bad value names the variable."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        raise SystemExit(f"{name} must be an integer, got {raw!r}") from None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the local Reliquary chat + MCP proxy with an OAuth shim.")
     parser.add_argument("--config", default="~/.mem0/config.yaml", help="Path to the Mem0 config file.")
     parser.add_argument("--host", default="127.0.0.1", help="Listen host for the proxy.")
     parser.add_argument("--port", default=8787, type=int, help="Listen port for the proxy.")
-    parser.add_argument("--user-id", default="default", help="Default Reliquary user_id for retrieval.")
+    parser.add_argument("--user-id", default=os.getenv("RELIQUARY_USER_ID") or "default",
+                        help="Default Reliquary user_id for retrieval (env RELIQUARY_USER_ID).")
     parser.add_argument("--memory-limit", default=5, type=int, help="Maximum number of memories to inject.")
     parser.add_argument("--memory-threshold", default=None, type=float, help="Optional minimum similarity score for memory hits.")
     parser.add_argument("--memory-max-chars", default=500, type=int, help="Maximum characters per injected memory snippet.")
@@ -4538,9 +4550,9 @@ def parse_args() -> argparse.Namespace:
         help="Return the master bearer itself as the OAuth access_token (old behavior) instead of a "
         "derived, revocable token. Default false.",
     )
-    parser.add_argument("--oauth-access-token-ttl", type=int, default=int(os.getenv("RELIQUARY_OAUTH_ACCESS_TOKEN_TTL", "432000")),
+    parser.add_argument("--oauth-access-token-ttl", type=int, default=_env_int("RELIQUARY_OAUTH_ACCESS_TOKEN_TTL", 432000),
                         help="Access-token lifetime in seconds (default 5 days). Refresh rotation renews it.")
-    parser.add_argument("--oauth-refresh-token-ttl", type=int, default=int(os.getenv("RELIQUARY_OAUTH_REFRESH_TOKEN_TTL", "0")),
+    parser.add_argument("--oauth-refresh-token-ttl", type=int, default=_env_int("RELIQUARY_OAUTH_REFRESH_TOKEN_TTL", 0),
                         help="Refresh-token lifetime in seconds (0 = non-expiring).")
     parser.add_argument(
         "--dataset",
@@ -4566,13 +4578,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--blob-max-bytes",
         type=int,
-        default=int(os.getenv("RELIQUARY_BLOB_MAX_BYTES", str(30 * 1024 * 1024))),
+        default=_env_int("RELIQUARY_BLOB_MAX_BYTES", 30 * 1024 * 1024),
         help="Max blob size in bytes (0 disables the cap). Default 30 MB.",
     )
     parser.add_argument(
         "--blob-url-ttl",
         type=int,
-        default=int(os.getenv("RELIQUARY_BLOB_URL_TTL", "3600")),
+        default=_env_int("RELIQUARY_BLOB_URL_TTL", 3600),
         help="Lifetime in seconds of signed blob URLs. Default 3600.",
     )
     parser.add_argument(
@@ -4593,9 +4605,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrieval-stats-path", default=os.getenv("RELIQUARY_RETRIEVAL_STATS_PATH"),
         help="Append a JSONL retrieval-event line per search hit / fetch to this path, so app/lint.py can propose "
         "archive/compile actions from usage. Unset = disabled.")
-    parser.add_argument("--rate-limit-writes", type=int, default=int(os.getenv("RELIQUARY_RATE_LIMIT_WRITES", "0")),
+    parser.add_argument("--rate-limit-writes", type=int, default=_env_int("RELIQUARY_RATE_LIMIT_WRITES", 0),
         help="Max write tool calls per token per minute (0 = unlimited).")
-    parser.add_argument("--rate-limit-searches", type=int, default=int(os.getenv("RELIQUARY_RATE_LIMIT_SEARCHES", "0")),
+    parser.add_argument("--rate-limit-searches", type=int, default=_env_int("RELIQUARY_RATE_LIMIT_SEARCHES", 0),
         help="Max search/fetch tool calls per token per minute (0 = unlimited).")
     parser.add_argument("--metrics-public", action=argparse.BooleanOptionalAction,
         default=os.getenv("RELIQUARY_METRICS_PUBLIC", "false").lower() in {"1", "true", "yes"},
@@ -4616,9 +4628,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--schema-path", default=os.getenv("RELIQUARY_SCHEMA_PATH"),
                         help="Path to the editable memory constitution (reliquary://schema). Unset uses a built-in default.")
-    parser.add_argument("--lint-coverage-min", type=int, default=int(os.getenv("RELIQUARY_LINT_COVERAGE_MIN", "8")),
+    parser.add_argument("--lint-coverage-min", type=int, default=_env_int("RELIQUARY_LINT_COVERAGE_MIN", 8),
                         help="Min raw records in a domain/topic with no synthesis before lint flags a coverage gap.")
-    parser.add_argument("--lint-cold-min-events", type=int, default=int(os.getenv("RELIQUARY_LINT_COLD_MIN_EVENTS", "200")),
+    parser.add_argument("--lint-cold-min-events", type=int, default=_env_int("RELIQUARY_LINT_COLD_MIN_EVENTS", 200),
                         help="Minimum total retrieval events before the needs-review resource proposes never-retrieved records for archive (guards against sparse-data false positives).")
     return parser.parse_args()
 
