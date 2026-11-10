@@ -73,6 +73,9 @@ class PageInfo:
     # Set when a failed compile could not confirm that the index entry matches
     # the restored revision; cleared by the next successful index write.
     index_unconfirmed: bool = False
+    # Bumped by every stale mark, so a rollback can tell that the page was
+    # invalidated after its snapshot even when its status already read "stale".
+    invalidations: int = 0
 
 
 def _emit_frontmatter(info: "PageInfo") -> str:
@@ -326,6 +329,8 @@ class PageRegistry:
             if info is None:
                 return None
             info.status = status
+            if status == "stale":
+                info.invalidations += 1
             info.updated_at = time.time()
             self._save(info)
             return info
@@ -346,6 +351,27 @@ class PageRegistry:
                 return
             info.index_unconfirmed = True
             self._save(info)
+
+    def mark_stale_deriving_from(self, *, ids=(), taxonomies=((None, None),)) -> "list[str]":
+        """Mark stale every current page that pages_deriving_from() matches for
+        ``ids`` and any (domain, topic) in ``taxonomies``; returns their slugs.
+        Matching and marking happen under one registry lock, so a revision filed
+        in between is judged on its own provenance."""
+        with self._locked():
+            matched: dict[str, PageInfo] = {}
+            for domain, topic in taxonomies:
+                for info in self.pages_deriving_from(ids=ids, domain=domain, topic=topic):
+                    matched[info.slug] = info
+            flagged = []
+            for info in matched.values():
+                if info.status != "current":
+                    continue
+                info.status = "stale"
+                info.invalidations += 1
+                info.updated_at = time.time()
+                self._save(info)
+                flagged.append(info.slug)
+            return flagged
 
     def pages_deriving_from(self, *, ids=(), domain: str | None = None,
                             topic: str | None = None) -> "list[PageInfo]":

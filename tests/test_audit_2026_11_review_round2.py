@@ -187,3 +187,29 @@ def test_commit_drops_its_slot_before_fan_out(proxy, monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         run(call(proxy, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "cat"}))
     assert slot not in proxy.pending_uploads
+
+
+# c -- dependency match and stale mark happen together ----------------------
+
+def test_fan_out_does_not_stale_a_revision_filed_after_the_match(proxy, monkeypatch):
+    run(call(proxy, "reliquary_compile_page", {"slug": "p", "markdown": "v1", "derived_from": ["x"]}))
+    real_match = proxy.pages.pages_deriving_from
+    refiler = []
+
+    def match_then_compile_lands(**kwargs):
+        matches = real_match(**kwargs)
+        if not refiler:
+            # A compile replaces p (now deriving only from y) right after the match.
+            thread = threading.Thread(target=proxy.pages.put_revision,
+                                      args=("p", "v2", {"derived_from": ["y"], "status": "current"}))
+            refiler.append(thread)
+            thread.start()
+            thread.join(0.3)
+        return matches
+
+    monkeypatch.setattr(proxy.pages, "pages_deriving_from", match_then_compile_lands)
+    run(proxy._fan_out_staleness(["x"], {}))
+    refiler[0].join(5)
+    page = proxy.pages.get("p")
+    assert page.derived_from == ["y"]
+    assert page.status == "current"

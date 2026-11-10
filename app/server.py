@@ -2463,22 +2463,20 @@ class ReliquaryChatProxy:
             is_error=True,
         )
 
-    async def _fan_out_staleness(self, source_ids: list[str], metadata: dict[str, Any]) -> None:
+    async def _fan_out_staleness(self, source_ids: list[str], *metadatas: dict[str, Any]) -> None:
         """Flag current synthesis pages deriving from a changed raw memory
-        (pages with no declared provenance fall back to a domain+topic match).
-        Flips the status flag only — never rewrites page content or mints a
-        revision; the page surfaces in needs-review for a human-driven recompile.
-        Wrapped so it can never break the write. Registry work runs in worker
-        threads: set_status waits for a cross-process file lock (ingest)."""
+        (pages with no declared provenance fall back to a domain+topic match,
+        for each taxonomy in ``metadatas``). Flips the status flag only — never
+        rewrites page content or mints a revision; the page surfaces in
+        needs-review for a human-driven recompile. Wrapped so it can never break
+        the write. Matching and marking run as one registry operation in a worker
+        thread: it waits for a cross-process file lock (ingest), and a revision
+        filed between a match and its mark must not be marked."""
         if self.pages is None:
             return
         try:
-            domain = (metadata or {}).get("domain")
-            topic = (metadata or {}).get("topic")
-            for page in await asyncio.to_thread(self.pages.pages_deriving_from,
-                                                ids=source_ids, domain=domain, topic=topic):
-                if page.status == "current":
-                    await asyncio.to_thread(self.pages.set_status, page.slug, "stale")
+            taxonomies = [((m or {}).get("domain"), (m or {}).get("topic")) for m in metadatas] or [(None, None)]
+            await asyncio.to_thread(self.pages.mark_stale_deriving_from, ids=source_ids, taxonomies=taxonomies)
         except Exception:
             LOG.exception("Staleness fan-out failed (non-fatal)")
 
@@ -3742,9 +3740,7 @@ class ReliquaryChatProxy:
             metadata.pop(key, None)  # never valid on a user-write (pre-fix forgeries)
         metadata["source_group"] = "user-write"
         await self.update_memory(record_id, new_text, metadata=metadata)
-        await self._fan_out_staleness([record_id], existing_metadata)
-        if metadata != existing_metadata:
-            await self._fan_out_staleness([record_id], metadata)
+        await self._fan_out_staleness([record_id], existing_metadata, metadata)
         return self.mcp_tool_result(
             text=f"Updated memory id={record_id}: {trim_text(new_text, 160)}",
             structured={"updated": True, "id": record_id, "metadata": metadata},
