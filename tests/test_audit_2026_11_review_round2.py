@@ -323,3 +323,31 @@ def test_interrupted_ingest_marks_pages_of_already_updated_records_stale(tmp_pat
         ingest_records(memory, changed, user_id="u", page_registry=registry)
     assert registry.get("by-id").status == "stale"
     assert registry.get("by-tax").status == "stale"  # filed under r1's taxonomy before the update
+
+
+# g -- sessions without a recorded owner are dropped, never adopted ----------
+
+def test_ownerless_persisted_session_is_not_usable_by_any_credential(make_proxy, tmp_path):
+    from test_audit_2026_11_review_taxonomy_auth import CLAUDE, READER, _initialize, _ping
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "mcp_sessions.json").write_text(json.dumps({"legacy": "claude", "legacy-2": "openai"}))
+    tokens = (("ro", "read", "read-tok"), ("rw", "write", "both-tok"))
+    p = make_proxy(state_dir=str(state), static_tokens=tokens)
+    for headers in (CLAUDE, READER, {"authorization": "Bearer both-tok"}):
+        assert _ping(p, headers, "legacy") == 404
+    assert json.loads((state / "mcp_sessions.json").read_text()) == {}
+    session = _initialize(p, CLAUDE)  # the client re-initialises as after an idle timeout
+    assert _ping(p, CLAUDE, session) == 200
+
+
+def test_claim_never_assigns_an_owner(tmp_path):
+    from runtime import MCPSessionStore
+
+    store = MCPSessionStore(max_size=8, ttl=1000, clock=lambda: 0.0, max_per_owner=2)
+    store.add("unowned", "claude")  # e.g. built in memory without a credential
+    assert store.claim("unowned", "claude", "master:claude") is False
+    for n in range(3):
+        store.add(f"mine-{n}", "claude", owner="static:a")
+    assert sum(store.claim(f"mine-{n}", "claude", "static:a") for n in range(3)) == 2  # quota holds

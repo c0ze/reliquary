@@ -408,20 +408,19 @@ def test_session_store_per_owner_cap():
     assert [sid for sid in ("s0", "s1", "s2", "s3", "s4") if sid in store] == ["s2", "s3", "s4"]
 
 
-def test_session_store_loads_old_format_and_round_trips_owner(tmp_path):
+def test_session_store_drops_old_format_and_round_trips_owner(tmp_path):
     from persistence import JsonFileStore
     from runtime import MCPSessionStore
     path = tmp_path / "mcp_sessions.json"
     path.write_text(json.dumps({"old-sess": "claude", "junk": 5}))
     file_store = JsonFileStore(str(path))
     store = MCPSessionStore(max_size=8, ttl=1000, clock=lambda: 0.0, session_store=file_store)
-    assert store.touch("old-sess") == "claude"
+    assert store.touch("old-sess") is None  # no recorded owner: dropped, the client re-initialises
     assert store.touch("junk") is None
     store.add("new-sess", "openai", owner="static:ro")
     reloaded = MCPSessionStore(max_size=8, ttl=1000, clock=lambda: 0.0, session_store=file_store)
-    assert reloaded.touch("old-sess") == "claude"
     assert reloaded.touch("new-sess") == "openai"
-    assert json.loads(path.read_text())["old-sess"] == "claude"  # owner-less entries keep the old shape
+    assert json.loads(path.read_text()) == {"new-sess": ["openai", "static:ro"]}
 
 
 # --- 10. rate limit follows the credential, not the token string -------------

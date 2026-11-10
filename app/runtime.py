@@ -162,14 +162,19 @@ class MCPSessionStore:
         self._sessions: "dict[str, list]" = {}
         self._session_store = session_store
         if self._session_store is not None:
-            for sid, value in self._session_store.load().items():
-                # Old files store "profile"; owned sessions store ["profile", "owner"].
-                if isinstance(value, list) and len(value) == 2:
-                    profile_name, owner = value
-                else:
-                    profile_name, owner = value, None
-                if isinstance(sid, str) and isinstance(profile_name, str) and (owner is None or isinstance(owner, str)):
+            loaded = self._session_store.load()
+            for sid, value in loaded.items():
+                # Owned sessions are stored as ["profile", "owner"]. Sessions saved
+                # before owners were recorded ("profile") are dropped: no
+                # credential can prove it created them, so their clients get the
+                # usual 404 and initialise again, as after an idle timeout.
+                if not (isinstance(value, list) and len(value) == 2):
+                    continue
+                profile_name, owner = value
+                if isinstance(sid, str) and isinstance(profile_name, str) and isinstance(owner, str):
                     self._sessions[sid] = [profile_name, self._clock(), owner]
+            if len(self._sessions) != len(loaded):
+                self._persist()
 
     def add(self, session_id: str, profile_name: str, owner: str | None = None) -> None:
         self._evict_expired()
@@ -208,20 +213,15 @@ class MCPSessionStore:
 
     def claim(self, session_id: str, profile_name: str, owner: str | None) -> bool:
         """Whether ``owner`` may use the live session ``session_id`` on
-        ``profile_name`` (refreshing its recency if so). A session persisted
-        before owners were recorded adopts the first credential that presents
-        it on its own profile, so an upgrade does not end every session."""
+        ``profile_name`` (refreshing its recency if so): only the credential
+        that created it, on its own endpoint. A session without an owner is
+        usable by nobody."""
         entry = self._sessions.get(session_id)
         if entry is None or entry[0] != profile_name:
             return False
-        if entry[2] is not None and entry[2] != owner:
+        if entry[2] is None or entry[2] != owner:
             return False
-        if self.touch(session_id) is None:
-            return False
-        if entry[2] is None and owner is not None:
-            entry[2] = owner
-            self._persist()
-        return True
+        return self.touch(session_id) is not None
 
     def remove(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
@@ -254,6 +254,5 @@ class MCPSessionStore:
     def _persist(self) -> None:
         if self._session_store is not None:
             self._session_store.save({
-                sid: entry[0] if entry[2] is None else [entry[0], entry[2]]
-                for sid, entry in self._sessions.items()
+                sid: [entry[0], entry[2]] for sid, entry in self._sessions.items() if entry[2] is not None
             })
