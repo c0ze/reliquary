@@ -159,7 +159,7 @@ def test_legacy_slots_are_reconciled_against_caption_upload_ids(make_proxy, tmp_
     retry = run(call(proxy, "reliquary_commit_image_upload", {"upload_id": "upl_X", "caption": "again"}))
     assert retry["structuredContent"]["error"] == "already_committed"
     proxy.pending_uploads["upl_Y"].expires_at = 1
-    proxy._cleanup_expired_uploads()
+    run(proxy._reap_expired_uploads())
     info = proxy.blobs.info(blob)
     assert info.owners == [caption] and info.ref_count == 1
 

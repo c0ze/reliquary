@@ -44,6 +44,11 @@ VALID_STATUSES = ("current", "stale", "draft", "archived")
 MAX_SLUG_LENGTH = 120
 
 
+def taxonomy_pairs(domain, topic) -> "set[tuple[str, str]]":
+    """(domain, topic) match-key pairs: two taxonomies match when these meet."""
+    return {(d, t) for d in taxonomy_match_keys(domain) for t in taxonomy_match_keys(topic)}
+
+
 def slugify(value: str) -> str:
     """Lowercase, collapse runs of non-alphanumerics to single hyphens, trim."""
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
@@ -356,41 +361,42 @@ class PageRegistry:
             info.index_unconfirmed = True
             self._save(info)
 
-    def mark_stale_deriving_from(self, *, ids=(), taxonomies=((None, None),)) -> "list[str]":
-        """Mark stale every current page that pages_deriving_from() matches for
-        ``ids`` and any (domain, topic) in ``taxonomies``; returns their slugs.
-        Matching and marking happen under one registry lock, so a revision filed
-        in between is judged on its own provenance."""
+    def mark_stale_deriving_from(self, *, ids=(), taxonomies=(), pairs=()) -> "list[str]":
+        """Invalidate every page that pages_deriving_from() matches for ``ids``,
+        any (domain, topic) in ``taxonomies`` and any match-key pair in
+        ``pairs``: its invalidation counter advances (also when it is already
+        stale, so a compile rollback can see it) and a current page becomes
+        stale. Returns the slugs marked stale. Matching and marking happen under
+        one registry lock, so a revision filed in between is judged on its own
+        provenance."""
+        keys = set(pairs)
+        for domain, topic in taxonomies:
+            keys |= taxonomy_pairs(domain, topic)
         with self._locked():
-            matched: dict[str, PageInfo] = {}
-            for domain, topic in taxonomies:
-                for info in self.pages_deriving_from(ids=ids, domain=domain, topic=topic):
-                    matched[info.slug] = info
             flagged = []
-            for info in matched.values():
-                if info.status != "current":
-                    continue
-                info.status = "stale"
+            for info in self.pages_deriving_from(ids=ids, pairs=keys):
                 info.invalidations += 1
-                info.updated_at = time.time()
+                if info.status == "current":
+                    info.status = "stale"
+                    info.updated_at = time.time()
+                    flagged.append(info.slug)
                 self._save(info)
-                flagged.append(info.slug)
             return flagged
 
     def pages_deriving_from(self, *, ids=(), domain: str | None = None,
-                            topic: str | None = None) -> "list[PageInfo]":
+                            topic: str | None = None, pairs=()) -> "list[PageInfo]":
         """Pages whose synthesis derives from any of ``ids``. Pages that declare
-        no ``derived_from`` at all fall back to a ``domain`` AND ``topic`` match;
-        a page that declares its sources is judged on them alone (#69). Taxonomy
-        compares on match keys, so pages filed under an older spelling match."""
+        no ``derived_from`` at all fall back to a ``domain`` AND ``topic`` match
+        (or a match on any (domain, topic) key pair in ``pairs``); a page that
+        declares its sources is judged on them alone (#69). Taxonomy compares on
+        match keys, so pages filed under an older spelling match."""
         idset = set(ids)
-        domain_keys, topic_keys = taxonomy_match_keys(domain), taxonomy_match_keys(topic)
+        keys = set(pairs) | taxonomy_pairs(domain, topic)
         out = []
         for info in self._iter_pages():
             if idset and idset.intersection(info.derived_from or ()):
                 out.append(info)
-            elif not info.derived_from and domain_keys and topic_keys \
-                    and domain_keys & taxonomy_match_keys(info.domain) \
-                    and topic_keys & taxonomy_match_keys(info.topic):
+            elif not info.derived_from and keys \
+                    and not keys.isdisjoint(taxonomy_pairs(info.domain, info.topic)):
                 out.append(info)
         return out
