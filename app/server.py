@@ -372,6 +372,9 @@ class PendingUpload:
     # Endpoint that minted the slot ("claude"/"openai"). A slot can only be
     # finalized through the same endpoint it was created on.
     profile: str | None = None
+    # Recorded before a commit writes the caption, so a commit cut short (crash)
+    # can be reconciled: the caption may exist while the blob still names the slot.
+    commit_user_id: str | None = None
 
 
 class ReliquaryChatProxy:
@@ -2460,22 +2463,20 @@ class ReliquaryChatProxy:
             is_error=True,
         )
 
-    async def _fan_out_staleness(self, source_ids: list[str], metadata: dict[str, Any]) -> None:
+    async def _fan_out_staleness(self, source_ids: list[str], *metadatas: dict[str, Any]) -> None:
         """Flag current synthesis pages deriving from a changed raw memory
-        (pages with no declared provenance fall back to a domain+topic match).
-        Flips the status flag only — never rewrites page content or mints a
-        revision; the page surfaces in needs-review for a human-driven recompile.
-        Wrapped so it can never break the write. Registry work runs in worker
-        threads: set_status waits for a cross-process file lock (ingest)."""
+        (pages with no declared provenance fall back to a domain+topic match,
+        for each taxonomy in ``metadatas``). Flips the status flag only — never
+        rewrites page content or mints a revision; the page surfaces in
+        needs-review for a human-driven recompile. Wrapped so it can never break
+        the write. Matching and marking run as one registry operation in a worker
+        thread: it waits for a cross-process file lock (ingest), and a revision
+        filed between a match and its mark must not be marked."""
         if self.pages is None:
             return
         try:
-            domain = (metadata or {}).get("domain")
-            topic = (metadata or {}).get("topic")
-            for page in await asyncio.to_thread(self.pages.pages_deriving_from,
-                                                ids=source_ids, domain=domain, topic=topic):
-                if page.status == "current":
-                    await asyncio.to_thread(self.pages.set_status, page.slug, "stale")
+            taxonomies = [((m or {}).get("domain"), (m or {}).get("topic")) for m in metadatas] or [(None, None)]
+            await asyncio.to_thread(self.pages.mark_stale_deriving_from, ids=source_ids, taxonomies=taxonomies)
         except Exception:
             LOG.exception("Staleness fan-out failed (non-fatal)")
 
@@ -2632,16 +2633,28 @@ class ReliquaryChatProxy:
                 text = (f"Could not index page slug={slug}; another writer changed the page meanwhile, "
                         "so it was left as that writer filed it.")
             elif previous is None or not previous.memory_id:
-                confirmed = True
-                text = f"Could not index page slug={slug}; the page was not filed. Retry later."
+                # Mem0 inserts the vector before it can fail, so a failed add may
+                # still have left one behind; remove it.
+                confirmed = await self._purge_untracked_vectors(slug, user_id=user_id, keep=None)
+                if previous is None:
+                    text = (f"Could not index page slug={slug}; the page was not filed. Retry later."
+                            if confirmed else
+                            f"Could not index page slug={slug}; the page was not filed, but an index entry "
+                            "for it may remain (search ignores it while no page has this slug).")
+                else:
+                    text = f"Could not index page slug={slug}; the page was left as it was."
             else:
                 # The failed write may still have changed the index entry.
                 confirmed = await self._reindex_restored_page(slug, user_id=user_id)
+                restored = self.pages.get(slug)
+                purged = await self._purge_untracked_vectors(
+                    slug, user_id=user_id, keep=restored.memory_id if restored else None)
+                confirmed = confirmed and purged
                 text = (f"Could not index page slug={slug}; the page and its index entry are back at the "
                         "previous revision. Retry later." if confirmed else
                         f"Could not index page slug={slug}. Its previous revision was restored, but its index "
                         "entry could not be confirmed to match it.")
-            if not confirmed:
+            if not confirmed and previous is not None:
                 await asyncio.to_thread(self.pages.set_index_unconfirmed, slug)
                 text += " The page is listed under `unindexed` in reliquary://needs-review until it is re-filed."
             return self.mcp_tool_result(
@@ -2662,6 +2675,30 @@ class ReliquaryChatProxy:
             if getattr(info, key):
                 metadata[key] = getattr(info, key)
         return metadata
+
+    async def _purge_untracked_vectors(self, slug: str, *, user_id: str, keep: str | None) -> bool:
+        """Delete compiled vectors that carry ``slug`` in their metadata but are
+        not the page's tracked record ``keep`` (a failed add can land its vector
+        before Mem0 raises). True once none is left; False when the index could
+        not be listed or a stray could not be removed."""
+        try:
+            async with self.memory_lock.write():
+                get_all = self.compiled_memory.get_all
+                result = await asyncio.to_thread(get_all, **self._get_all_kwargs(
+                    get_all, user_id=user_id, top_k=100, metadata_filters={"slug": slug}))
+                strays = [str(record["id"]) for record in self._memory_results(result)
+                          if isinstance(record, dict) and record.get("id") and str(record["id"]) != keep
+                          and (record.get("metadata") or {}).get("slug") == slug]
+                for memory_id in strays:
+                    try:
+                        await asyncio.to_thread(self.compiled_memory.delete, memory_id)
+                    except Exception:
+                        if await asyncio.to_thread(self.compiled_memory.get, memory_id) is not None:
+                            raise
+        except Exception:
+            LOG.exception("Could not check the compiled index for stray vectors of slug=%s", slug)
+            return False
+        return True
 
     async def _reindex_restored_page(self, slug: str, *, user_id: str) -> bool:
         """After a failed compile was rolled back, make the page's index entry
@@ -2822,12 +2859,23 @@ class ReliquaryChatProxy:
             # release exactly that reference instead of leaking it.
             blob_id = rec.get("blob_id") if isinstance(rec, dict) else None
             if isinstance(blob_id, str) and re.fullmatch(r"[0-9a-f]{64}", blob_id):
-                owner = f"{UPLOAD_OWNER_PREFIX}{upload_id}"
-                if not self.blobs.delete(blob_id, owner=owner) and \
-                        self._reconcile_unmarked_slot(upload_id, blob_id) == "pending":
+                if self.blobs.is_owner(blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
+                    commit_user_id = rec.get("commit_user_id")
+                    slot = PendingUpload(id=upload_id, created_at=0.0, expires_at=0.0, blob_id=blob_id,
+                                         commit_user_id=commit_user_id if isinstance(commit_user_id, str) else None)
+                    if slot.commit_user_id is None or self._reconcile_committing_slot(slot) == "pending":
+                        self._release_slot_reference(slot)
+                elif self._reconcile_unmarked_slot(upload_id, blob_id) == "pending":
                     self.blobs.delete(blob_id)  # the legacy slot's unmarked reference
         for upload_id, upload in list(restored.items()):
-            if not upload.blob_id or self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
+            if not upload.blob_id:
+                continue
+            if self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
+                if upload.commit_user_id is not None:
+                    # A commit was cut short: hand the reference to its caption if
+                    # one was written, else this is an ordinary pending slot again.
+                    self._reconcile_committing_slot(upload)
+                    dropped = True  # persist the outcome
                 continue
             # Written before per-slot markers: mark the reference it holds. A
             # slot that outlived its commit stays until it expires or a retried
@@ -2838,6 +2886,42 @@ class ReliquaryChatProxy:
         if dropped:
             self._save_pending_uploads()
         self._cleanup_expired_uploads()
+
+    def _reconcile_committing_slot(self, upload: PendingUpload) -> str | None:
+        """For a marked slot whose commit began (``commit_user_id`` recorded) but
+        never handed its reference over: give the reference to a caption that
+        carries this slot's server-set upload_id ("committed"), or, when none was
+        written, clear the commit mark ("pending"). None when the memory backend
+        could not be read; the slot then keeps its mark and is never released."""
+        try:
+            get_all = self.memory.get_all
+            result = get_all(**self._get_all_kwargs(get_all, user_id=upload.commit_user_id, top_k=20,
+                                                    metadata_filters={"upload_id": upload.id}))
+        except Exception:
+            LOG.warning("Could not reconcile interrupted commit of upload slot %s", upload.id, exc_info=True)
+            return None
+        for record in self._memory_results(result):
+            metadata = (record.get("metadata") or {}) if isinstance(record, dict) else {}
+            if record.get("id") and metadata.get("upload_id") == upload.id and metadata.get("blob_ref") == upload.blob_id:
+                self.blobs.transfer_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload.id}", str(record["id"]))
+                upload.commit_user_id = None
+                return "committed"
+        upload.commit_user_id = None
+        return "pending"
+
+    def _release_slot_reference(self, upload: PendingUpload) -> None:
+        """Release exactly the slot's own reference (its "upload:<id>" owner). A
+        slot that outlived its commit no longer holds one: the commit handed it
+        to the caption memory. A commit that was cut short and could not be
+        reconciled keeps it: its caption may exist (a leak lint shows, never a
+        caption without bytes)."""
+        if not upload.blob_id:
+            return
+        if upload.commit_user_id is not None:
+            LOG.warning("Keeping the blob reference of upload slot %s: its interrupted commit is unreconciled",
+                        upload.id)
+            return
+        self.blobs.delete(upload.blob_id, owner=f"{UPLOAD_OWNER_PREFIX}{upload.id}")
 
     def _reconcile_unmarked_slot(self, upload_id: str, blob_id: str) -> str | None:
         """Decide whether a slot whose blob carries no "upload:<id>" marker (one
@@ -2870,7 +2954,8 @@ class ReliquaryChatProxy:
         fields: dict[str, Any] = {}
         for name, kinds in (("id", str), ("created_at", (int, float)), ("expires_at", (int, float)),
                             ("expected_mimetype", str), ("expected_size", int), ("filename", str),
-                            ("blob_id", str), ("mimetype", str), ("size", int), ("profile", str)):
+                            ("blob_id", str), ("mimetype", str), ("size", int), ("profile", str),
+                            ("commit_user_id", str)):
             value = rec.get(name)
             if value is None:
                 if name in ("id", "created_at", "expires_at"):
@@ -2905,11 +2990,8 @@ class ReliquaryChatProxy:
         ]
         for upload_id in expired:
             upload = self.pending_uploads.pop(upload_id, None)
-            if upload and upload.blob_id:
-                # Release exactly the slot's own reference (its "upload:<id>"
-                # owner). A slot that outlived its commit no longer holds one:
-                # the commit handed it to the caption memory.
-                self.blobs.delete(upload.blob_id, owner=f"{UPLOAD_OWNER_PREFIX}{upload_id}")
+            if upload:
+                self._release_slot_reference(upload)
         if expired:
             self._save_pending_uploads()
 
@@ -3138,9 +3220,7 @@ class ReliquaryChatProxy:
                 structured={"error": "upload_in_progress", "upload_id": upload_id}, is_error=True)
         if upload.expires_at <= time.time():
             self._drop_upload(upload_id)
-            if upload.blob_id:
-                # As in _cleanup_expired_uploads: only the slot's own reference.
-                self.blobs.delete(upload.blob_id, owner=f"{UPLOAD_OWNER_PREFIX}{upload_id}")
+            self._release_slot_reference(upload)  # as in _cleanup_expired_uploads
             return self.mcp_tool_result(
                 text=f"Upload slot {upload_id} has expired.",
                 structured={"error": "upload_expired", "upload_id": upload_id},
@@ -3153,7 +3233,17 @@ class ReliquaryChatProxy:
                 is_error=True,
             )
         state = "pending"
-        if not self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
+        if upload.commit_user_id is not None and self.blobs.is_owner(upload.blob_id,
+                                                                     f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
+            # An earlier commit was cut short and startup could not reconcile it.
+            async with self._read_lock():
+                state = await asyncio.to_thread(self._reconcile_committing_slot, upload)
+            if state is None:
+                return self.mcp_tool_result(
+                    text=f"Could not check whether upload slot {upload_id} was already committed; retry shortly.",
+                    structured={"error": "upload_in_progress", "upload_id": upload_id}, is_error=True)
+            self._save_pending_uploads()
+        elif not self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
             # No marker: the commit already handed the slot's reference to its
             # caption (crash before the slot was dropped), or the slot predates
             # markers and could not be reconciled at startup.
@@ -3201,7 +3291,13 @@ class ReliquaryChatProxy:
 
         self._busy_uploads.add(upload_id)
         try:
-            return await self._commit_upload(upload, caption, user_id, metadata)
+            # Write-ahead: if the process stops between the caption write and the
+            # ownership transfer, startup finds the caption by this slot's id.
+            upload.commit_user_id = user_id
+            self._save_pending_uploads()
+            # Drained: a cancelled caller must not leave a caption whose bytes
+            # are still held only by the slot.
+            return await drain_on_cancel(self._commit_upload(upload, caption, user_id, metadata))
         finally:
             self._busy_uploads.discard(upload_id)
 
@@ -3251,11 +3347,11 @@ class ReliquaryChatProxy:
                 is_error=True,
             )
 
-        await self._fan_out_staleness([memory_id], metadata)
         blob_id = upload.blob_id
         mimetype = upload.mimetype
         size = upload.size
-        self._drop_upload(upload_id)
+        self._drop_upload(upload_id)  # before the awaited fan-out, which can be cancelled
+        await self._fan_out_staleness([memory_id], metadata)
         return self.mcp_tool_result(
             text=f"Committed uploaded image (blob_id={blob_id}, memory_id={memory_id}): {trim_text(caption, 160)}",
             structured={
@@ -3528,8 +3624,11 @@ class ReliquaryChatProxy:
                 is_error=True,
             )
         await self.delete_memory(memory_id)
-        await self._fan_out_staleness([memory_id], metadata)
+        # Release the owner's reference before awaiting the fan-out: a request
+        # cancelled there would otherwise leave a blob owned by a deleted memory,
+        # which no API call can remove.
         unlinked = self.blobs.delete(str(blob_ref), owner=memory_id)
+        await self._fan_out_staleness([memory_id], metadata)
         return self.mcp_tool_result(
             text=f"Deleted image memory_id={memory_id} (blob_id={blob_ref}, blob_unlinked={bool(unlinked)}).",
             structured={
@@ -3677,9 +3776,7 @@ class ReliquaryChatProxy:
             metadata.pop(key, None)  # never valid on a user-write (pre-fix forgeries)
         metadata["source_group"] = "user-write"
         await self.update_memory(record_id, new_text, metadata=metadata)
-        await self._fan_out_staleness([record_id], existing_metadata)
-        if metadata != existing_metadata:
-            await self._fan_out_staleness([record_id], metadata)
+        await self._fan_out_staleness([record_id], existing_metadata, metadata)
         return self.mcp_tool_result(
             text=f"Updated memory id={record_id}: {trim_text(new_text, 160)}",
             structured={"updated": True, "id": record_id, "metadata": metadata},

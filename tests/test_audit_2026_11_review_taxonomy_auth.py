@@ -132,22 +132,6 @@ def test_a_session_is_bound_to_its_endpoint(make_proxy):
     assert _ping(p, both, session, "/claude/mcp") == 200
 
 
-def test_ownerless_persisted_session_adopts_its_first_credential(make_proxy, tmp_path):
-    state = tmp_path / "state"
-    state.mkdir()
-    (state / "mcp_sessions.json").write_text(json.dumps({"legacy": "claude"}))
-    tokens = (("ro", "read", "read-tok"), ("rw", "write", "both-tok"))
-    p = make_proxy(state_dir=str(state), static_tokens=tokens)
-    both = {"authorization": "Bearer both-tok"}
-    assert _ping(p, both, "legacy", "/openai/mcp") == 404  # the wrong endpoint does not adopt it
-    assert _ping(p, CLAUDE, "legacy") == 200
-    assert _ping(p, READER, "legacy") == 404
-    assert json.loads((state / "mcp_sessions.json").read_text())["legacy"] == ["claude", "master:claude"]
-    restarted = make_proxy(state_dir=str(state), static_tokens=tokens)
-    assert _ping(restarted, READER, "legacy") == 404
-    assert _ping(restarted, CLAUDE, "legacy") == 200
-
-
 # --- 5. explicit search filters accept the spelling writes accept --------------
 
 

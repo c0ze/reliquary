@@ -180,46 +180,51 @@ def ingest_records(
     touched_ids: set[str] = set()
     touched_tax: set[tuple[str, str]] = set()
 
-    for item in records:
-        metadata = import_metadata(item)
-        current_hash = metadata["import_content_hash"]
-        previous = existing.get(str(item["id"]))
-        copies = previous["copies"] if previous else []
-        summary["duplicates"] += max(0, len(copies) - 1)
-        if previous and not hasattr(memory, "update"):
-            if previous["content_hash"] == current_hash:
-                summary["skipped"] += 1
+    # Invalidation is recorded before each write and fanned out in `finally`:
+    # a run that stops halfway has already updated some records, which the
+    # retry skips as current, so their dependent pages must be marked now.
+    try:
+        for item in records:
+            metadata = import_metadata(item)
+            current_hash = metadata["import_content_hash"]
+            previous = existing.get(str(item["id"]))
+            copies = previous["copies"] if previous else []
+            summary["duplicates"] += max(0, len(copies) - 1)
+            if previous and not hasattr(memory, "update"):
+                if previous["content_hash"] == current_hash:
+                    summary["skipped"] += 1
+                    continue
+            elif copies:
+                # Every trusted copy is brought to the current text and metadata, so
+                # an old duplicate cannot outrank the current one with an obsolete
+                # snippet. Nothing is deleted, and a run that stops halfway leaves
+                # the remaining copies outdated for the next run to finish.
+                changed = [copy for copy in copies if copy["content_hash"] != current_hash]
+                # Same content, but imported before the importer derived slugged
+                # taxonomy and source dates: rewrite the metadata once, without
+                # marking compiled pages stale.
+                migrated = [copy for copy in copies if copy["content_hash"] == current_hash
+                            and not _derived_fields_current(copy["metadata"], item)]
+                if not changed and not migrated:
+                    summary["skipped"] += 1
+                    continue
+                if changed:
+                    touched_ids.add(str(item["id"]))
+                    touched_tax |= _taxonomy_pairs(metadata.get("domain"), metadata.get("topic"))
+                    for copy in changed:  # pages filed under the taxonomy the record had
+                        touched_tax |= _taxonomy_pairs(copy["metadata"].get("domain"),
+                                                       copy["metadata"].get("topic"))
+                for copy in changed + migrated:
+                    memory.update(copy["id"], item["text"], metadata)
+                summary["updated"] += 1
                 continue
-        elif copies:
-            # Every trusted copy is brought to the current text and metadata, so
-            # an old duplicate cannot outrank the current one with an obsolete
-            # snippet. Nothing is deleted, and a run that stops halfway leaves
-            # the remaining copies outdated for the next run to finish.
-            changed = [copy for copy in copies if copy["content_hash"] != current_hash]
-            # Same content, but imported before the importer derived slugged
-            # taxonomy and source dates: rewrite the metadata once, without
-            # marking compiled pages stale.
-            migrated = [copy for copy in copies if copy["content_hash"] == current_hash
-                        and not _derived_fields_current(copy["metadata"], item)]
-            if not changed and not migrated:
-                summary["skipped"] += 1
-                continue
-            for copy in changed + migrated:
-                memory.update(copy["id"], item["text"], metadata)
-            summary["updated"] += 1
-            if changed:
-                touched_ids.add(str(item["id"]))
-                touched_tax |= _taxonomy_pairs(metadata.get("domain"), metadata.get("topic"))
-                for copy in changed:  # pages filed under the taxonomy the record had
-                    touched_tax |= _taxonomy_pairs(copy["metadata"].get("domain"), copy["metadata"].get("topic"))
-            continue
-        memory.add(item["text"], user_id=user_id, metadata=metadata, infer=infer)
-        summary["added"] += 1
-        touched_ids.add(str(item["id"]))
-        touched_tax |= _taxonomy_pairs(metadata.get("domain"), metadata.get("topic"))
-
-    if page_registry is not None and (touched_ids or touched_tax):
-        _fan_out_bulk(page_registry, touched_ids, touched_tax)
+            touched_ids.add(str(item["id"]))
+            touched_tax |= _taxonomy_pairs(metadata.get("domain"), metadata.get("topic"))
+            memory.add(item["text"], user_id=user_id, metadata=metadata, infer=infer)
+            summary["added"] += 1
+    finally:
+        if page_registry is not None and (touched_ids or touched_tax):
+            _fan_out_bulk(page_registry, touched_ids, touched_tax)
 
     return summary
 

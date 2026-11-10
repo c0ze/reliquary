@@ -96,3 +96,12 @@ reads hashed token stores, or put the pre-upgrade copies of both files back
 together with the older image; tokens issued since the upgrade are then lost
 and those connectors re-authorise. Never run an older image on the migrated
 files.
+
+Upload-marker compatibility boundary: a pending upload slot now marks the blob
+reference it holds as an `upload:<upload_id>` owner in the blob's sidecar
+(`<blob_dir>/<ab>/<sha256>.json`), and hands it to the caption memory on
+commit. A build older than this one misreads that marker: it treats the upload
+as already committed and never reclaims its bytes. Before starting an older
+build, let pending uploads commit or expire (a slot lives at most the upload
+TTL, 10 minutes), or remove the `upload:` entries from the sidecars' `owners`
+by hand without changing `ref_count`.

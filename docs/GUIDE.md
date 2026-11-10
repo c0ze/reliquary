@@ -877,8 +877,9 @@ sequence: `/.well-known/*` → `/oauth/register` → `/oauth/authorize` →
   session first. A session belongs to the credential and endpoint that
   initialised it: any other credential, or the other endpoint, gets `404`
   (unknown session) when it uses the id, and its `DELETE` leaves the session
-  alone. Sessions saved by versions that did not record an owner are adopted
-  by the first credential that uses them on their own endpoint.
+  alone. Sessions saved by versions that did not record an owner are dropped
+  at startup; their clients get `404` and initialise a new session, as after
+  the idle timeout.
 - **Publish only behind TLS**, and prefer narrowing your proxy to the
   `/claude/*`, `/openai/*`, `/uploads/*`, `/oauth/*`, `/.well-known/*`, `/healthz`
   paths. (`/uploads/*` requires the same write bearer as the MCP endpoint that
