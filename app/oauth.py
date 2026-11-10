@@ -379,6 +379,16 @@ class OAuthProvider:
                 return None
         return entry.scope or "mcp"
 
+    def access_token_identity(self, candidate: str | None) -> str | None:
+        """A stable, non-secret id for a known access token's grant: its rotation
+        family (unchanged across refreshes), else its client. None if unknown."""
+        if not candidate:
+            return None
+        entry = self._access_tokens.get(candidate.strip())
+        if entry is None:
+            return None
+        return f"family:{entry.family_id}" if entry.family_id else f"client:{entry.client_id}"
+
     def revoke_access_token(self, token: str | None) -> bool:
         removed = self._access_tokens.pop((token or "").strip(), None) is not None
         if removed:

@@ -937,7 +937,7 @@ class ReliquaryChatProxy:
                 requested_version if requested_version in SUPPORTED_MCP_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
             )
             session_id = secrets.token_urlsafe(24)
-            self.mcp_sessions.add(session_id, profile.name)
+            self.mcp_sessions.add(session_id, profile.name, owner=self._credential_key(headers))
             await self.send_json(
                 send,
                 200,
@@ -3956,6 +3956,27 @@ class ReliquaryChatProxy:
         if oauth_scope is not None:
             return "write" if scope_is_write(oauth_scope) else "read"
         return None
+
+    def _credential_key(self, headers: dict[str, str]) -> str:
+        """Stable identity of the credential behind a request, for per-credential
+        bounds (MCP sessions, rate limits): an endpoint's master token, a static
+        token's label, or an OAuth grant's rotation family. Never the raw token,
+        which changes on every refresh, and never a secret."""
+        scheme, _, token = headers.get("authorization", "").strip().partition(" ")
+        token = token.strip()
+        if scheme.lower() != "bearer" or not token:
+            return "anon"
+        candidate = token.encode("utf-8")
+        for endpoint in self.endpoint_profiles.values():
+            if endpoint.token and secrets.compare_digest(candidate, endpoint.token.encode("utf-8")):
+                return f"master:{endpoint.name}"
+        for label, _scope, static_token in self.settings.static_tokens:
+            if secrets.compare_digest(candidate, static_token.encode("utf-8")):
+                return f"static:{label}"
+        identity = self.oauth.access_token_identity(token)
+        if identity:
+            return f"oauth:{identity}"
+        return "token:" + hashlib.sha256(candidate).hexdigest()[:16]
 
     def is_allowed_token(self, profile: EndpointProfile, headers: dict[str, str]) -> bool:
         return self.resolve_scope(profile, headers) is not None

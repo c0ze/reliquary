@@ -341,3 +341,62 @@ def test_chat_proxy_user_id_is_validated(make_proxy):
         resp = _chat(p, {"model": "m", "messages": msgs, "reliquary_user_id": bad})
         assert resp["status"] == 400, bad
     p.client.request.assert_not_called()
+
+
+# --- 9. MCP sessions are bounded per credential --------------------------------
+
+
+def _initialize(p, token):
+    resp = _call(p, "POST", "/claude/mcp", body=_rpc("initialize", {"protocolVersion": "2025-06-18"}),
+                 headers={"authorization": f"Bearer {token}"})
+    assert resp["status"] == 200
+    return resp["headers"]["mcp-session-id"]
+
+
+def test_read_token_cannot_evict_other_sessions(make_proxy):
+    import server
+    p = make_proxy(static_tokens=(("ro", "read", "read-tok"),))
+    owner_session = _initialize(p, "claude-secret")
+    for _ in range(server.MCP_MAX_SESSIONS + 1):
+        _initialize(p, "read-tok")
+    assert owner_session in p.mcp_sessions
+    resp = _call(p, "POST", "/claude/mcp", body=_rpc("ping"),
+                 headers={**CLAUDE, "mcp-session-id": owner_session})
+    assert resp["status"] == 200
+
+
+def test_session_store_evicts_callers_own_sessions_first():
+    from runtime import MCPSessionStore
+    now = [0.0]
+    store = MCPSessionStore(max_size=4, ttl=1000, clock=lambda: now[0], max_per_owner=4)
+    store.add("victim", "claude", owner="alice")
+    for i in range(10):
+        now[0] += 1
+        store.add(f"m{i}", "claude", owner="mallory")
+    assert "victim" in store
+    assert len(store) == 4
+    assert "m9" in store and "m0" not in store
+
+
+def test_session_store_per_owner_cap():
+    from runtime import MCPSessionStore
+    store = MCPSessionStore(max_size=100, ttl=1000, clock=lambda: 0.0, max_per_owner=3)
+    for i in range(5):
+        store.add(f"s{i}", "claude", owner="bob")
+    assert [sid for sid in ("s0", "s1", "s2", "s3", "s4") if sid in store] == ["s2", "s3", "s4"]
+
+
+def test_session_store_loads_old_format_and_round_trips_owner(tmp_path):
+    from persistence import JsonFileStore
+    from runtime import MCPSessionStore
+    path = tmp_path / "mcp_sessions.json"
+    path.write_text(json.dumps({"old-sess": "claude", "junk": 5}))
+    file_store = JsonFileStore(str(path))
+    store = MCPSessionStore(max_size=8, ttl=1000, clock=lambda: 0.0, session_store=file_store)
+    assert store.touch("old-sess") == "claude"
+    assert store.touch("junk") is None
+    store.add("new-sess", "openai", owner="static:ro")
+    reloaded = MCPSessionStore(max_size=8, ttl=1000, clock=lambda: 0.0, session_store=file_store)
+    assert reloaded.touch("old-sess") == "claude"
+    assert reloaded.touch("new-sess") == "openai"
+    assert json.loads(path.read_text())["old-sess"] == "claude"  # owner-less entries keep the old shape
