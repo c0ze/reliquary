@@ -213,3 +213,38 @@ def test_fan_out_does_not_stale_a_revision_filed_after_the_match(proxy, monkeypa
     page = proxy.pages.get("p")
     assert page.derived_from == ["y"]
     assert page.status == "current"
+
+
+# d -- rollback keeps an invalidation even when the attempt was filed stale --
+
+def test_rollback_of_a_stale_filed_revision_keeps_a_concurrent_invalidation(proxy, monkeypatch):
+    run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "v1"}))
+
+    marked = []
+
+    def fails_after_a_source_change(*args, **kwargs):
+        if not marked:
+            marked.append(True)
+            proxy.pages.set_status("pg", "stale")  # a live write invalidates the page meanwhile
+        raise RuntimeError("embedder unavailable")
+
+    monkeypatch.setattr(proxy.compiled_memory, "update", fails_after_a_source_change)
+    monkeypatch.setattr(proxy.compiled_memory, "add", fails_after_a_source_change)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "v2", "status": "stale"}))
+    assert result["isError"] is True
+    assert "v1" in proxy.pages.read_body("pg")[0]
+    assert proxy.pages.get("pg").status == "stale"
+
+
+def test_page_json_without_the_invalidation_counter_loads(tmp_path):
+    from blobs import BlobStore
+    from compiled import PageRegistry
+
+    registry = PageRegistry(str(tmp_path / "compiled"), BlobStore(str(tmp_path / "blobs"), b"k"))
+    registry.put_revision("pg", "v1", {})
+    path = Path(registry._path("pg"))
+    data = json.loads(path.read_text())
+    data.pop("invalidations")
+    path.write_text(json.dumps(data))
+    assert registry.get("pg").invalidations == 0
+    assert registry.set_status("pg", "stale").invalidations == 1

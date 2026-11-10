@@ -247,9 +247,13 @@ class PageRegistry:
             else:
                 restored = PageInfo(**asdict(previous))
                 # A source changed while the index write was in flight: keep the
-                # stale mark instead of resurrecting the snapshot's "current".
-                if current.status == "stale" != written.status and restored.status == "current":
+                # stale mark instead of resurrecting the snapshot's "current". The
+                # counter tells even when the attempted revision was filed stale.
+                invalidated = current.invalidations > written.invalidations or \
+                    current.status == "stale" != written.status
+                if invalidated and restored.status == "current":
                     restored.status = "stale"
+                restored.invalidations = max(restored.invalidations, current.invalidations)
                 self._save(restored)
             # An identical re-file already balanced its own reference.
             new_blob = written.current_blob
