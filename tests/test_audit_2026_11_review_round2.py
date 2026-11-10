@@ -98,9 +98,8 @@ def test_restart_hands_a_marked_slot_reference_to_its_existing_caption(make_prox
     slot, caption = _crash_between_caption_and_transfer(make_proxy, state, memory, monkeypatch)
     restarted = make_proxy(memory=memory, state_dir=state)
     blob = restarted.pending_uploads[slot].blob_id
-    assert restarted.blobs.info(blob).owners == [caption]
     restarted.pending_uploads[slot].expires_at = 1
-    restarted._cleanup_expired_uploads()
+    run(restarted._reap_expired_uploads())
     info = restarted.blobs.info(blob)
     assert info is not None and info.owners == [caption] and info.ref_count == 1
     fetched = run(call(restarted, "reliquary_fetch_image", {"id": blob}))
@@ -158,8 +157,10 @@ def test_malformed_marked_slot_releases_only_its_own_reference(make_proxy, tmp_p
         "upl_bad": {**_legacy_slot("upl_bad", blob), "expires_at": None},
         "upl_good": _legacy_slot("upl_good", blob)}))
     proxy = make_proxy(state_dir=str(state))
+    run(proxy._reap_expired_uploads())  # settled by the first pass after start
     info = proxy.blobs.info(blob)
-    assert info is not None and info.ref_count == 1 and info.owners == ["upload:upl_good"]
+    assert info is not None and info.ref_count == 1 and info.owners == []
+    assert "upl_good" in proxy.pending_uploads  # still holds its unmarked reference
 
 
 # b -- must-do steps run before the awaited staleness fan-out ---------------

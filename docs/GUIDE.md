@@ -731,13 +731,14 @@ Lint also reports two integrity categories, with or without stats:
   `--state-dir` (or set `RELIQUARY_STATE_DIR`) so lint can see the server's
   pending upload slots; without it, in-flight uploads are listed too.
 
-Expired upload slots are reaped on every memory write, an expired upload POST
-or commit, and at startup. A slot that still holds uploaded bytes is first
-checked for a caption memory carrying its `upload_id` (a commit can stop after
-writing the caption): the bytes go to that caption, or are released if there is
-none. While the memory backend cannot be read, the slot is kept in
-`pending_uploads.json` and retried (at most once a minute on writes, and at each
-startup), so lint does not report its blob as an orphan.
+Expired upload slots are reaped by a background pass that startup, memory
+writes, new upload slots and expired upload POSTs or commits start; no request
+waits for it. A slot that still holds uploaded bytes is first checked for a
+caption memory carrying its `upload_id` (a commit can stop after writing the
+caption): the bytes go to that caption, or are released if there is none. While
+the memory backend cannot be read, the slot is kept in `pending_uploads.json`
+and retried at most once a minute, so lint does not report its blob as an
+orphan. A commit retry runs the same check first.
 
 ---
 

@@ -86,6 +86,7 @@ def test_marked_slot_without_commit_record_hands_its_reference_to_an_existing_ca
     (state / "pending_uploads.json").write_text(json.dumps(saved))
 
     restarted = make_proxy(memory=memory, state_dir=str(state))
+    run(restarted._reap_expired_uploads())  # settled by the first pass after start
     info = restarted.blobs.info(blob)
     assert info is not None and info.owners == [caption] and info.ref_count == 1
 
@@ -289,10 +290,12 @@ def test_malformed_slot_with_an_unknown_commit_outcome_is_kept(make_proxy, tmp_p
     real_get_all = memory.get_all
     memory.get_all = _backend_down
     restarted = make_proxy(memory=memory, state_dir=str(state))
+    run(restarted._reap_expired_uploads())
     assert restarted.blobs.info(blob).owners == [f"upload:{slot}"]
     assert slot in restarted.pending_uploads
     memory.get_all = real_get_all
     reloaded = make_proxy(memory=memory, state_dir=str(state))
+    run(reloaded._reap_expired_uploads())
     assert reloaded.blobs.info(blob).owners == [caption]
     assert slot not in reloaded.pending_uploads
 

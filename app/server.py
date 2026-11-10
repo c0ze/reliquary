@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import hashlib
 import inspect
 import json
@@ -171,6 +172,9 @@ UPLOAD_PATH_RE = re.compile(r"/uploads/(upl_[A-Za-z0-9_-]+)\Z")
 UPLOAD_SLOT_TTL = 600.0
 # Back-off before retrying expired slots whose commit outcome could not be read.
 UPLOAD_RECONCILE_RETRY = 60.0
+# A settling pass stops starting new lookups after this many seconds; the rest
+# wait for the next pass.
+UPLOAD_SETTLE_BUDGET = 10.0
 # Passive raster image types safe to serve inline same-origin. Anything else
 # (SVG, PDF, HTML, unknown) is forced to an octet-stream download by /blobs/{id}.
 _INLINE_SAFE_MIMETYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
@@ -514,6 +518,8 @@ class ReliquaryChatProxy:
         # (expired or not) until a reconciliation gives a definite answer.
         self._unresolved_legacy: set[str] = set()
         self._reap_retry_at = 0.0
+        # The one background settling pass (see _schedule_reap), if running.
+        self._reap_task: asyncio.Task | None = None
         self.pending_upload_store = (
             JsonFileStore(os.path.join(settings.state_dir, "pending_uploads.json"))
             if settings.state_dir
@@ -787,6 +793,7 @@ class ReliquaryChatProxy:
             message = await receive()
             message_type = message["type"]
             if message_type == "lifespan.startup":
+                self._schedule_reap()  # settle slots left from before the restart
                 await send({"type": "lifespan.startup.complete"})
             elif message_type == "lifespan.shutdown":
                 await self.client.aclose()
@@ -2871,38 +2878,24 @@ class ReliquaryChatProxy:
                 restored[upload_id] = PendingUpload(
                     id=upload_id, created_at=0.0, expires_at=0.0, blob_id=blob_id,
                     commit_user_id=commit_user_id if isinstance(commit_user_id, str) else None)
-        for upload_id, upload in list(restored.items()):
-            if not upload.blob_id or self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
-                continue
-            # Written before per-slot markers: mark the reference it holds. A
-            # slot that outlived its commit stays until it expires or a retried
-            # commit reports already_committed; it holds no reference to release.
-            state = self._reconcile_unmarked_slot(upload_id, upload.blob_id)
-            if state == "pending":
-                self.blobs.register_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}")
-            elif state is None:
+        for upload_id, upload in restored.items():
+            # Written before per-slot markers (or outlived its commit): whether it
+            # still holds an unmarked reference needs a memory lookup, which
+            # startup never waits for; a commit retry or the settling pass asks.
+            if upload.blob_id and not self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
                 self._unresolved_legacy.add(upload_id)
-        for upload_id, upload in list(restored.items()):
-            # A commit cut short (or any expired slot still holding a reference)
-            # is settled now if the memory backend answers, else kept for retry.
-            due = upload.commit_user_id is not None or upload.expires_at <= time.time()
-            if due and self._slot_needs_settling(upload):
-                dropped = True  # persist the outcome
-                if self._settle_slot(upload) and upload.expires_at <= time.time():
-                    del restored[upload_id]
         self.pending_uploads = restored
         if dropped:
             self._save_pending_uploads()
         self._cleanup_expired_uploads()
 
-    def _reconcile_committing_slot(self, upload: PendingUpload) -> tuple[str | None, str | None]:
-        """For a marked slot: look for a caption memory carrying this slot's
-        server-set upload_id and blob_ref (a commit can write the caption and
-        stop before handing the slot's reference over), under the recorded
-        commit user and the default user. Found: the reference goes to it,
-        ("committed", caption_id). None found: the commit mark is cleared,
-        ("pending", None). The backend could not be read: (None, None), and the
-        slot keeps its mark and record."""
+    def _find_slot_caption(self, upload: PendingUpload) -> tuple[str | None, str | None]:
+        """Read-only lookup (worker thread) for a caption memory carrying this
+        slot's server-set upload_id and blob_ref (a commit can write the caption
+        and stop before handing the slot's reference over), under the recorded
+        commit user and the default user: ("committed", caption_id),
+        ("pending", None) when there is none, (None, None) when the memory
+        backend could not be read."""
         users = list(dict.fromkeys(user for user in (upload.commit_user_id, self.settings.user_id) if user))
         get_all = getattr(self.memory, "get_all", None)
         for user in users:
@@ -2916,11 +2909,63 @@ class ReliquaryChatProxy:
                 metadata = (record.get("metadata") or {}) if isinstance(record, dict) else {}
                 if record.get("id") and metadata.get("upload_id") == upload.id \
                         and metadata.get("blob_ref") == upload.blob_id:
-                    self.blobs.transfer_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload.id}", str(record["id"]))
-                    upload.commit_user_id = None
                     return "committed", str(record["id"])
-        upload.commit_user_id = None
         return "pending", None
+
+    def _slot_lookup(self, upload: PendingUpload) -> tuple[str, str | None, str | None]:
+        """Read-only (worker thread): what the slot's reference needs. Returns
+        (kind, state, caption): kind "marked" (it holds an "upload:<id>" owner;
+        see _find_slot_caption), "legacy" (an unmarked pre-marker reference of
+        unknown outcome; see _reconcile_unmarked_slot) or "none" (holds nothing)."""
+        if upload.blob_id and self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload.id}"):
+            return ("marked", *self._find_slot_caption(upload))
+        if upload.blob_id and upload.id in self._unresolved_legacy:
+            return "legacy", self._reconcile_unmarked_slot(upload.id, upload.blob_id), None
+        return "none", "committed", None
+
+    def _apply_slot_lookup(self, upload: PendingUpload, kind: str, state: str | None, caption: str | None) -> bool:
+        """Act on a _slot_lookup result, on the event loop with no await, after
+        re-checking that the slot still is as the lookup saw it (a stale result
+        changes nothing). Hands the reference to the caption, releases it (only
+        for an expired slot), or marks a still-live pre-marker reference. True
+        once settled; False when the outcome is unknown and the record stays."""
+        marker = f"{UPLOAD_OWNER_PREFIX}{upload.id}"
+        if state is None:
+            return False
+        if kind == "marked":
+            if not upload.blob_id or not self.blobs.is_owner(upload.blob_id, marker):
+                return True  # settled meanwhile
+            if state == "committed":
+                self.blobs.transfer_owner(upload.blob_id, marker, caption)
+            elif upload.expires_at <= time.time():
+                self.blobs.delete(upload.blob_id, owner=marker)
+            upload.commit_user_id = None
+            return True
+        if kind == "legacy":
+            if upload.id not in self._unresolved_legacy or self.blobs.is_owner(upload.blob_id, marker):
+                return True  # settled meanwhile
+            self._unresolved_legacy.discard(upload.id)
+            if state == "pending":
+                if upload.expires_at <= time.time():
+                    self.blobs.delete(upload.blob_id)  # its unmarked pre-marker reference
+                else:
+                    self.blobs.register_owner(upload.blob_id, marker)
+        return True
+
+    def _settling_lock(self):
+        """Lock for settling lookups, which only read: none with a server-backed
+        store (concurrent reads are safe, and a slow backend must not hold
+        writers back), the exclusive lock with an embedded store (not
+        thread-safe)."""
+        return contextlib.nullcontext() if self._concurrent_reads else self.memory_lock.write()
+
+    async def _look_up_slot(self, upload: PendingUpload) -> tuple[str, str | None, str | None]:
+        """_slot_lookup in a worker thread, drained: a cancelled caller keeps
+        its claim on the slot until the worker has finished."""
+        async def lookup():
+            async with self._settling_lock():
+                return await asyncio.to_thread(self._slot_lookup, upload)
+        return await drain_on_cancel(lookup())
 
     def _slot_needs_settling(self, upload: PendingUpload) -> bool:
         """Whether the slot may still hold a blob reference: its marker, or an
@@ -2929,32 +2974,6 @@ class ReliquaryChatProxy:
             return False
         return upload.id in self._unresolved_legacy or \
             self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload.id}")
-
-    def _settle_slot(self, upload: PendingUpload) -> bool:
-        """Resolve the reference an expired (or interrupted) slot holds: hand it
-        to the slot's caption if one exists, else release exactly that
-        reference. True once settled; False when the memory backend could not be
-        read, and the slot must be kept and retried (dropping it would leave a
-        caption's bytes owned by nobody, or release them)."""
-        marker = f"{UPLOAD_OWNER_PREFIX}{upload.id}"
-        if upload.blob_id and self.blobs.is_owner(upload.blob_id, marker):
-            state, _caption = self._reconcile_committing_slot(upload)
-            if state is None:
-                return False
-            if state == "pending" and upload.expires_at <= time.time():
-                self.blobs.delete(upload.blob_id, owner=marker)
-            return True
-        if upload.blob_id and upload.id in self._unresolved_legacy:
-            state = self._reconcile_unmarked_slot(upload.id, upload.blob_id)
-            if state is None:
-                return False
-            self._unresolved_legacy.discard(upload.id)
-            if state == "pending":
-                if upload.expires_at <= time.time():
-                    self.blobs.delete(upload.blob_id)  # its unmarked pre-marker reference
-                else:
-                    self.blobs.register_owner(upload.blob_id, marker)
-        return True
 
     def _reconcile_unmarked_slot(self, upload_id: str, blob_id: str) -> str | None:
         """Decide whether a slot whose blob carries no "upload:<id>" marker (one
@@ -3029,33 +3048,69 @@ class ReliquaryChatProxy:
         if expired:
             self._save_pending_uploads()
 
-    async def _reap_expired_uploads(self) -> None:
-        """Settle expired slots that still hold a blob reference (worker thread,
-        one memory lookup each), keeping those whose outcome cannot be read for
-        a later retry, with a back-off so a backend outage costs writes nothing
-        but one attempt per UPLOAD_RECONCILE_RETRY. Never raises."""
+    def _schedule_reap(self) -> None:
+        """Forget empty expired slots, and start the single background pass that
+        settles expired slots still holding a blob reference, unless one is
+        running or the back-off after an unanswered lookup is in force. Callers
+        never wait for it, so a slow or hung memory backend holds up no request."""
         self._cleanup_expired_uploads()
+        if self._reap_task is not None and not self._reap_task.done():
+            return
         if time.monotonic() < self._reap_retry_at:
             return
         now = time.time()
+        if not any(upload.expires_at <= now and upload_id not in self._busy_uploads
+                   for upload_id, upload in self.pending_uploads.items()):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._reap_task = loop.create_task(self._settle_expired_uploads())
+
+    async def _settle_expired_uploads(self) -> None:
+        """The settling pass. Claims its slots when it starts; each lookup runs
+        in a worker thread and is drained, so the claim (which keeps any other
+        pass, commit or POST off the slot) outlives a cancelled pass until the
+        worker is done. Results are applied on the loop after re-checking the
+        slot. Unanswered lookups keep their records and set the back-off at once;
+        a pass stops starting lookups after UPLOAD_SETTLE_BUDGET seconds."""
+        now = time.time()
         due = [upload for upload_id, upload in self.pending_uploads.items()
                if upload.expires_at <= now and upload_id not in self._busy_uploads]
-        if not due:
-            return
         self._busy_uploads.update(upload.id for upload in due)
+        deadline = time.monotonic() + UPLOAD_SETTLE_BUDGET
+        settled: list[str] = []
         try:
-            async with self._read_lock():
-                settled = await asyncio.to_thread(lambda: [u.id for u in due if self._settle_slot(u)])
-        except Exception:
-            LOG.exception("Settling expired upload slots failed")
-            settled = []
+            for upload in due:
+                if time.monotonic() >= deadline:
+                    self._reap_retry_at = time.monotonic() + UPLOAD_RECONCILE_RETRY
+                    break
+                try:
+                    result = await self._look_up_slot(upload)
+                    done = self._apply_slot_lookup(upload, *result)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOG.exception("Settling upload slot %s failed", upload.id)
+                    done = False
+                if done:
+                    settled.append(upload.id)
+                else:
+                    self._reap_retry_at = time.monotonic() + UPLOAD_RECONCILE_RETRY
         finally:
             self._busy_uploads.difference_update(upload.id for upload in due)
-        for upload_id in settled:
-            self.pending_uploads.pop(upload_id, None)
-        if len(settled) < len(due):
-            self._reap_retry_at = time.monotonic() + UPLOAD_RECONCILE_RETRY
-        self._save_pending_uploads()
+            for upload_id in settled:
+                self.pending_uploads.pop(upload_id, None)
+            self._save_pending_uploads()
+
+    async def _reap_expired_uploads(self) -> None:
+        """Schedule a settling pass and wait for the running one to finish (for
+        tests and maintenance; request paths only schedule). Never raises."""
+        self._schedule_reap()
+        task = self._reap_task
+        if task is not None and not task.done():
+            await asyncio.wait({task})
 
     def _new_upload_id(self) -> str:
         while True:
@@ -3066,7 +3121,7 @@ class ReliquaryChatProxy:
     def handle_create_image_upload_tool(
         self, arguments: dict[str, Any], *, profile: EndpointProfile | None = None
     ) -> dict[str, Any]:
-        self._cleanup_expired_uploads()
+        self._schedule_reap()
         mimetype = str(arguments.get("mimetype") or "application/octet-stream").strip()
         filename_raw = arguments.get("filename")
         filename = str(filename_raw).strip() if filename_raw is not None else None
@@ -3175,7 +3230,7 @@ class ReliquaryChatProxy:
             await self.send_json(send, 409, {"error": "upload_in_progress", "upload_id": upload_id})
             return
         if upload.expires_at <= time.time():
-            await self._reap_expired_uploads()
+            self._schedule_reap()
             await self.send_json(send, 410, {"error": "upload_expired", "upload_id": upload_id})
             return
         if upload.blob_id:
@@ -3282,8 +3337,8 @@ class ReliquaryChatProxy:
                 structured={"error": "upload_in_progress", "upload_id": upload_id}, is_error=True)
         if upload.expires_at <= time.time():
             # Settled (reference released or handed to its caption) by the
-            # expiry reaper, which looks the caption up first.
-            await self._reap_expired_uploads()
+            # background settling pass, which looks the caption up first.
+            self._schedule_reap()
             return self.mcp_tool_result(
                 text=f"Upload slot {upload_id} has expired.",
                 structured={"error": "upload_expired", "upload_id": upload_id},
@@ -3295,30 +3350,23 @@ class ReliquaryChatProxy:
                 structured={"error": "upload_not_ready", "upload_id": upload_id},
                 is_error=True,
             )
-        state = "pending"
-        if upload.commit_user_id is not None and self.blobs.is_owner(upload.blob_id,
-                                                                     f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
-            # An earlier commit was cut short and startup could not reconcile it.
-            async with self._read_lock():
-                state, _caption = await asyncio.to_thread(self._reconcile_committing_slot, upload)
-            if state is None:
-                return self.mcp_tool_result(
-                    text=f"Could not check whether upload slot {upload_id} was already committed; retry shortly.",
-                    structured={"error": "upload_in_progress", "upload_id": upload_id}, is_error=True)
-            self._save_pending_uploads()
-        elif not self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
-            # No marker: the commit already handed the slot's reference to its
-            # caption (crash before the slot was dropped), or the slot predates
-            # markers and could not be reconciled at startup.
-            async with self._read_lock():
-                state = await asyncio.to_thread(self._reconcile_unmarked_slot, upload_id, upload.blob_id)
-            if state is None:
-                return self.mcp_tool_result(
-                    text=f"Could not check whether upload slot {upload_id} was already committed; retry shortly.",
-                    structured={"error": "upload_in_progress", "upload_id": upload_id}, is_error=True)
-            self._unresolved_legacy.discard(upload_id)
-            if state == "pending":
-                self.blobs.register_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}")
+        # Before (re)trying a commit, settle what the slot holds: an earlier
+        # commit may have written its caption and stopped before handing the
+        # reference over (whatever the slot recorded), and a pre-marker slot's
+        # reference may already belong to its caption. Claimed meanwhile.
+        self._busy_uploads.add(upload_id)
+        try:
+            kind, state, caption_id = await self._look_up_slot(upload)
+        finally:
+            self._busy_uploads.discard(upload_id)
+        if state is None:
+            return self.mcp_tool_result(
+                text=f"Could not check whether upload slot {upload_id} was already committed; retry shortly.",
+                structured={"error": "upload_in_progress", "upload_id": upload_id}, is_error=True)
+        # kind "none" (no marker, no unresolved pre-marker reference) reads as
+        # "committed": the reference was handed over already.
+        self._apply_slot_lookup(upload, kind, state, caption_id)
+        self._save_pending_uploads()
         if state == "committed":
             # Committing again would double-own the blob, and a failed retry's
             # rollback would unlink the committed memory's bytes.
@@ -3374,8 +3422,8 @@ class ReliquaryChatProxy:
         except Exception:
             # Mem0 inserts the vector before its history write, so the caption
             # may exist although add() raised: look for it before releasing.
-            async with self._read_lock():
-                state, caption_landed = await asyncio.to_thread(self._reconcile_committing_slot, upload)
+            async with self._settling_lock():
+                state, caption_landed = await asyncio.to_thread(self._find_slot_caption, upload)
             if state is None:
                 self._save_pending_uploads()  # keep the slot's recovery record
                 raise
@@ -3383,6 +3431,7 @@ class ReliquaryChatProxy:
                 self.blobs.delete(upload.blob_id, owner=slot_owner)
                 self._drop_upload(upload_id)
                 raise
+            self.blobs.transfer_owner(upload.blob_id, slot_owner, caption_landed)
             LOG.warning("Caption for upload %s landed although Mem0 raised; committed it", upload_id)
             result = {"results": [{"id": caption_landed, "event": "ADD"}]}
         new_ids = added_memory_ids(result)
@@ -4407,9 +4456,9 @@ class ReliquaryChatProxy:
         metadata: dict[str, Any] | None = None,
         infer: bool = False,
     ) -> Any:
-        # Reap abandoned upload slots on the write path too, not only on the
-        # next create_image_upload (cheap unless an expired slot holds bytes).
-        await self._reap_expired_uploads()
+        # Reap abandoned upload slots on the write path too; settling the ones
+        # that hold bytes runs in the background and is never waited for.
+        self._schedule_reap()
         async with self.memory_lock.write():
             # Drained so a cancelled caller keeps the writer lock until the
             # worker thread is done (cancelling to_thread does not stop it).
@@ -4424,13 +4473,13 @@ class ReliquaryChatProxy:
         return result
 
     async def delete_memory(self, record_id: str) -> None:
-        await self._reap_expired_uploads()
+        self._schedule_reap()
         async with self.memory_lock.write():
             await drain_on_cancel(asyncio.to_thread(self.memory.delete, record_id))
         self._count_cache = None
 
     async def update_memory(self, record_id: str, data: str, *, metadata: dict[str, Any] | None = None) -> None:
-        await self._reap_expired_uploads()
+        self._schedule_reap()
         async with self.memory_lock.write():
             await drain_on_cancel(asyncio.to_thread(self.memory.update, record_id, data, metadata))
         self._count_cache = None
