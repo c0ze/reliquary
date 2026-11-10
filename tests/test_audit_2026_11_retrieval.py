@@ -513,3 +513,143 @@ def test_get_all_kwargs_pass_source_group_on_mem0_1x_and_2x_signatures():
     assert server.ReliquaryChatProxy._get_all_kwargs(get_all_2x, user_id="u", top_k=7, metadata_filters=meta) == {
         "filters": {"user_id": "u", "source_group": "user-write"}, "top_k": 7,
     }
+
+
+# ---------------------------------------------------------------------------
+# 7. A backend outage is an error, not an empty result or a healthy status
+# ---------------------------------------------------------------------------
+
+class DownMemory(ScoredMemory):
+    down = False
+    down_filters: set[str] = set()  # metadata keys whose routes fail; empty = all
+
+    def search(self, query, *, top_k=20, filters=None, threshold=None):
+        if self.down and (not self.down_filters or self.down_filters & set(filters or {})):
+            raise ConnectionError("embedder unreachable at http://admin:key@ollama.internal")
+        return super().search(query, top_k=top_k, filters=filters, threshold=threshold)
+
+    def get(self, memory_id):
+        if self.down:
+            raise ConnectionError("qdrant unreachable")
+        return super().get(memory_id)
+
+
+def _error_payload(result):
+    return result.get("structuredContent") or json.loads(result["content"][0]["text"])
+
+
+def _down_proxy(make_proxy):
+    memory, compiled = DownMemory(lambda q, r: 0.8), DownMemory(lambda q, r: 0.8)
+    proxy = make_proxy(memory=memory, compiled_memory=compiled)
+    added = call(proxy, "reliquary_add_memory", {"text": "the wifi password note"}, endpoint="claude")
+    memory.down = compiled.down = True
+    return proxy, memory, compiled, added["structuredContent"]["ids"][0]
+
+
+@pytest.mark.parametrize("endpoint,tool", [("openai", "search"), ("claude", "reliquary_search")])
+def test_search_with_backend_down_is_an_error(make_proxy, endpoint, tool):
+    proxy, *_ = _down_proxy(make_proxy)
+    result = call(proxy, tool, {"query": "wifi password"}, endpoint=endpoint)
+    assert result["isError"] is True
+    assert _error_payload(result)["error"] == "backend_unavailable"
+    assert "ollama.internal" not in json.dumps(result)
+
+
+def test_search_with_one_route_down_still_returns_the_others(make_proxy):
+    memory = DownMemory(lambda q, r: 0.8)
+    proxy = make_proxy(memory=memory)
+    call(proxy, "reliquary_add_memory", {"text": "the wifi password note"}, endpoint="claude")
+
+    class Route:
+        def __init__(self, filters, description):
+            self.filters, self.description = filters, description
+
+    class TwoRouteCatalog:
+        records_by_id: dict = {}
+        routeable_domains = ["home"]
+
+        def build_routes(self, query):
+            return [Route({"domain": "home"}, "domain=home"), Route(None, "global")]
+
+    proxy.catalog = TwoRouteCatalog()
+    memory.down, memory.down_filters = True, {"domain"}
+    result = call(proxy, "reliquary_search", {"query": "wifi"}, endpoint="claude")
+    assert result["isError"] is False
+    assert [item["text"] for item in result["structuredContent"]["results"]] == ["the wifi password note"]
+
+
+def test_search_returns_syntheses_when_only_the_raw_store_is_down(make_proxy):
+    memory, compiled = DownMemory(lambda q, r: 0.8), DownMemory(lambda q, r: 0.8)
+    proxy = make_proxy(memory=memory, compiled_memory=compiled)
+    call(proxy, "reliquary_compile_page", {"slug": "wifi", "markdown": "wifi page"}, endpoint="claude")
+    memory.down = True
+    result = call(proxy, "reliquary_search", {"query": "wifi"}, endpoint="claude")
+    assert result["isError"] is False
+    assert [item["id"] for item in result["structuredContent"]["results"]] == ["wifi"]
+
+
+def test_chat_proxy_memory_lookup_still_swallows_backend_failures(make_proxy):
+    proxy, *_ = _down_proxy(make_proxy)
+    hits = asyncio.run(proxy.search_memories("wifi", user_id="my_lord", limit=5, threshold=None, filters=None))
+    assert hits == [] and not hits
+
+
+@pytest.mark.parametrize("tool,arguments", [
+    ("reliquary_delete", {"id": None}),
+    ("reliquary_update", {"id": None, "text": "new"}),
+    ("reliquary_fetch", {"id": None}),
+    ("reliquary_propose_update", {"target_id": None, "reason": "x"}),
+])
+def test_record_lookups_with_backend_down_report_unavailable_not_missing(make_proxy, tool, arguments):
+    proxy, _memory, _compiled, record_id = _down_proxy(make_proxy)
+    arguments = {key: (record_id if value is None else value) for key, value in arguments.items()}
+    result = call(proxy, tool, arguments, endpoint="claude")
+    assert result["isError"] is True
+    assert result["structuredContent"] == {"error": "backend_unavailable"}
+    assert "No deletable memory" not in result["content"][0]["text"]
+
+
+def test_lookup_of_a_non_vector_id_is_still_not_found_when_the_store_rejects_it(make_proxy):
+    proxy, *_ = _down_proxy(make_proxy)
+    result = call(proxy, "fetch", {"id": "imported-record-7"})
+    assert result["isError"] is True
+    assert _error_payload(result)["error"] == "not_found"
+
+
+class _FailingCountClient:
+    def count(self, **kwargs):
+        raise ConnectionError("qdrant unreachable")
+
+
+class _CountingClient:
+    def count(self, **kwargs):
+        class Result:
+            count = 3
+        return Result()
+
+
+@pytest.mark.parametrize("client,status,count", [(_FailingCountClient(), "degraded", None),
+                                                 (_CountingClient(), "ok", 3)])
+def test_status_reports_degraded_when_the_count_probe_fails(make_proxy, client, status, count):
+    from types import SimpleNamespace
+
+    memory = ScoredMemory()
+    memory.vector_store = SimpleNamespace(client=client, collection_name="reliquary")
+    proxy = make_proxy(memory=memory)
+
+    tool = call(proxy, "reliquary_status", {}, endpoint="claude")
+    assert tool["isError"] is False
+    assert tool["structuredContent"]["status"] == status
+    assert tool["structuredContent"]["approx_memory_count"] == count
+    assert ("degraded" in tool["content"][0]["text"]) is (status == "degraded")
+
+    async def request():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy), base_url="https://example.org",
+            headers={"authorization": "Bearer claude-secret"},
+        ) as client_:
+            return (await client_.get("/status")).json()
+
+    body = asyncio.run(request())
+    assert body["status"] == status
+    assert body["approx_memory_count"] == count

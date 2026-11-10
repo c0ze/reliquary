@@ -422,6 +422,7 @@ class ReliquaryChatProxy:
             if self._native_hybrid else "dense + get_all lexical fallback",
         )
         self._count_cache: tuple[float, int | None] | None = None
+        self._count_probe_failed = False  # last memory-count probe raised
         token_store = None
         refresh_token_store = None
         session_store = None
@@ -768,11 +769,14 @@ class ReliquaryChatProxy:
         await self.send_json(send, 200, {"status": "ok", "name": MCP_SERVER_NAME})
 
     async def handle_status(self, send) -> None:
+        memory_count = await self.get_memory_count()
         await self.send_json(
             send,
             200,
             {
-                "status": "ok",
+                # A failed count probe means the memory backend did not answer.
+                "status": "degraded" if self._count_probe_failed else "ok",
+                "memory_backend": "unavailable" if self._count_probe_failed else "ok",
                 "upstream_base_url": self.settings.upstream_base_url,
                 "embedder_base_url": self.settings.embedder_base_url,
                 "default_user_id": self.settings.user_id,
@@ -791,7 +795,7 @@ class ReliquaryChatProxy:
                 "catalog_records": len(self.catalog.records_by_id) if self.catalog else 0,
                 "catalog_domains": self.catalog.routeable_domains if self.catalog else [],
                 "vector_store_path": ((self.config.get("vector_store") or {}).get("config") or {}).get("path"),
-                "approx_memory_count": await self.get_memory_count(),
+                "approx_memory_count": memory_count,
                 "note": "Embedded local Qdrant allows only one Reliquary process at a time.",
             },
         )
@@ -1985,9 +1989,13 @@ class ReliquaryChatProxy:
             if tool_name == "reliquary_capabilities":
                 return self.handle_capabilities_tool(profile, context=context, can_write=can_write)
             if tool_name == "reliquary_status":
+                memory_count = await self.get_memory_count()
+                degraded = self._count_probe_failed
                 status = {
+                    "status": "degraded" if degraded else "ok",
+                    "memory_backend": "unavailable" if degraded else "ok",
                     "user_id": self.settings.user_id,
-                    "approx_memory_count": await self.get_memory_count(),
+                    "approx_memory_count": memory_count,
                     "claude_mcp_path": self.settings.claude_mcp_path,
                     "openai_mcp_path": self.settings.openai_mcp_path,
                     "catalog_loaded": self.catalog is not None,
@@ -1996,7 +2004,11 @@ class ReliquaryChatProxy:
                     "search_mode": "hybrid" if self._native_hybrid else "dense+lexical-fallback",
                 }
                 return self.mcp_tool_result(
-                    text=f"Reliquary is available. Approximate memory count: {status['approx_memory_count']}.",
+                    text=(
+                        "Reliquary is degraded: the memory backend did not answer the count probe."
+                        if degraded
+                        else f"Reliquary is available. Approximate memory count: {status['approx_memory_count']}."
+                    ),
                     structured=status,
                 )
             if tool_name == "reliquary_list_domains":
@@ -2057,6 +2069,12 @@ class ReliquaryChatProxy:
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_propose_update_tool(arguments, allow_user_id=True)
+        except MemoryBackendUnavailable:
+            return self.mcp_tool_result(
+                text=f"{tool_name} could not reach the memory backend; retry shortly.",
+                structured={"error": "backend_unavailable"},
+                is_error=True,
+            )
         except Exception:
             # The exception text can carry backend hosts or credentials in URLs;
             # log it under an id and give the client only the id.
@@ -2144,6 +2162,7 @@ class ReliquaryChatProxy:
                 query, user_id=user_id, limit=result_cap, threshold=threshold, filters=explicit,
                 lexical_min_hits=limit,
             )
+            raw_routes, failed_routes = 1, int(isinstance(hits, _BackendFailure))
             by_key: dict[str, dict[str, Any]] = {}
             for hit in hits:
                 enriched = self._enrich_hit(hit, route="explicit-filter")
@@ -2171,11 +2190,13 @@ class ReliquaryChatProxy:
             # while the global route matches the same record strongly (e.g. an exact
             # lexical hit at score ~2.0). Route priority must not shadow the better copy.
             by_key = {}
+            raw_routes, failed_routes = len(routes), 0
             for route in routes:
                 hits = await self.search_memories(
                     query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters,
                     lexical_min_hits=limit,
                 )
+                failed_routes += isinstance(hits, _BackendFailure)
                 for hit in hits:
                     enriched = self._enrich_hit(hit, route=route.description)
                     key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
@@ -2199,6 +2220,15 @@ class ReliquaryChatProxy:
                 query, user_id=user_id, limit=result_cap, threshold=threshold)
             routes_used = [route.description for route in routes]
 
+        if raw_routes and failed_routes == raw_routes and not synthesis_results:
+            # Every memory route raised and no synthesis answered: report the
+            # outage rather than a successful search with no results. (One
+            # route down while others answer is still a result.)
+            return self.mcp_tool_result(
+                text="The memory backend is unavailable, so the search could not run; retry shortly.",
+                structured={"error": "backend_unavailable"},
+                is_error=True,
+            )
         # Use result_cap (not limit) so paginated pages past the first still see syntheses.
         # synthesis ids are slugs, raw ids are mem0 uuids — disjoint namespaces, so this
         # dedupe is a safety guard, not a real overlap risk.
@@ -3448,9 +3478,18 @@ class ReliquaryChatProxy:
         try:
             async with self._read_lock():
                 result = await asyncio.to_thread(self.memory.get, record_id)
-        except Exception:
+        except Exception as exc:
             LOG.exception("Could not fetch live memory id=%s", record_id)
-            return None
+            # Vector ids are UUIDs (or integers); the store rejects any other
+            # id, so that is a plain miss. A well-formed id that raised means
+            # the backend is down: say so rather than "not found".
+            import uuid
+            try:
+                uuid.UUID(record_id)
+            except ValueError:
+                if not record_id.isdigit():
+                    return None
+            raise MemoryBackendUnavailable(str(exc)) from exc
         if not isinstance(result, dict):
             return None
         metadata = dict(result.get("metadata") or {})
@@ -3621,7 +3660,7 @@ class ReliquaryChatProxy:
                 result = await asyncio.to_thread(self.memory.search, query, **kwargs)
         except Exception:
             LOG.exception("Mem0 search failed for user_id=%s", user_id)
-            return []
+            return _BackendFailure()
 
         if not isinstance(result, dict):
             return []
@@ -3760,7 +3799,7 @@ class ReliquaryChatProxy:
                 result = await asyncio.to_thread(self.compiled_memory.search, query, **kwargs)
         except Exception:
             LOG.exception("Compiled search failed for user_id=%s", user_id)
-            return []
+            return _BackendFailure()
         hits = result.get("results") if isinstance(result, dict) else None
         if not isinstance(hits, list):
             return []
@@ -4227,7 +4266,9 @@ class ReliquaryChatProxy:
             count = int(getattr(result, "count", 0))
         except Exception:
             LOG.debug("Could not read memory count for collection=%s; returning None", collection_name)
+            self._count_probe_failed = True
             return None
+        self._count_probe_failed = False
         self._count_cache = (time.monotonic(), count)
         return count
 
@@ -4470,6 +4511,18 @@ class ReliquaryChatProxy:
 
 
 @dataclass
+class _BackendFailure(list):
+    """An empty search result recording that the memory backend raised.
+
+    Callers that must never fail on memory (the chat proxy) use it as the
+    empty list it is; the MCP search tool checks for it to report an outage
+    instead of a successful empty search."""
+
+
+class MemoryBackendUnavailable(RuntimeError):
+    """The memory store could not be reached for a record lookup."""
+
+
 class _GlobalRoute:
     filters: dict[str, Any] | None = None
     description: str = "global"
