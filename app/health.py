@@ -129,10 +129,13 @@ def hot_topics_without_synthesis(pages: Iterable[Any], stats_by_topic: dict[str,
 def orphan_blobs(blob_infos: Iterable[Any], *, page_refs: set[str], pending_refs: set[str],
                  limit: int = 50) -> list[dict[str, Any]]:
     """Blobs nothing references: no owning memory, no page revision, no pending
-    upload slot. Leaked references (an abandoned upload, a crash mid-write)."""
+    upload slot. Leaked references (an abandoned upload, a crash mid-write).
+    An "upload:<id>" owner marks a slot's reference; it keeps the blob alive only
+    while that slot is pending (``pending_refs``)."""
     out: list[dict[str, Any]] = []
     for info in blob_infos:
-        if info.owners or info.id in page_refs or info.id in pending_refs:
+        memory_owners = [o for o in info.owners if not str(o).startswith("upload:")]
+        if memory_owners or info.id in page_refs or info.id in pending_refs:
             continue
         out.append({"kind": "orphan_blob", "id": info.id, "size": info.size, "ref_count": info.ref_count,
                     "reason": "blob has no owning memory, page revision or pending upload; candidate to remove"})

@@ -27,7 +27,7 @@ from catalog import CorpusCatalog
 from metadata_policy import caller_kind, clean_caller_metadata, honours_import_id, normalize_taxonomy
 from persistence import JsonFileStore
 from runtime import AsyncRWLock, MCPSessionStore, native_hybrid_active, reads_can_be_concurrent
-from blobs import BlobStore, BlobTooLarge
+from blobs import UPLOAD_OWNER_PREFIX, BlobStore, BlobTooLarge
 from ratelimit import RateLimiter
 from metrics import Metrics
 from audit import AuditLog
@@ -2748,16 +2748,47 @@ class ReliquaryChatProxy:
                 continue
             dropped = True
             # A malformed slot can still name the blob it holds a reference on;
-            # release it with the cleanup guard instead of leaking it.
+            # release exactly that reference instead of leaking it.
             blob_id = rec.get("blob_id") if isinstance(rec, dict) else None
             if isinstance(blob_id, str) and re.fullmatch(r"[0-9a-f]{64}", blob_id):
-                info = self.blobs.info(blob_id)
-                if info is not None and info.ref_count > len(info.owners):
-                    self.blobs.delete(blob_id)
+                owner = f"{UPLOAD_OWNER_PREFIX}{upload_id}"
+                if not self.blobs.delete(blob_id, owner=owner) and \
+                        self._reconcile_unmarked_slot(upload_id, blob_id) == "pending":
+                    self.blobs.delete(blob_id)  # the legacy slot's unmarked reference
+        for upload_id, upload in list(restored.items()):
+            if not upload.blob_id or self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
+                continue
+            # Written before per-slot markers: mark the reference it holds. A
+            # slot that outlived its commit stays until it expires or a retried
+            # commit reports already_committed; it holds no reference to release.
+            if self._reconcile_unmarked_slot(upload_id, upload.blob_id) == "pending":
+                self.blobs.register_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}")
         self.pending_uploads = restored
         if dropped:
             self._save_pending_uploads()
         self._cleanup_expired_uploads()
+
+    def _reconcile_unmarked_slot(self, upload_id: str, blob_id: str) -> str | None:
+        """Decide whether a slot whose blob carries no "upload:<id>" marker (one
+        persisted before markers existed, or one whose reference already went to
+        its caption) still holds a reference: "committed" when an owning memory's
+        server-set upload_id names the slot or no unmarked reference is left,
+        "pending" otherwise, None when the memory backend could not be read."""
+        info = self.blobs.info(blob_id)
+        if info is None or info.ref_count <= len(info.owners):
+            return "committed"
+        for owner in info.owners:
+            if owner.startswith(UPLOAD_OWNER_PREFIX):
+                continue
+            try:
+                record = self.memory.get(owner)
+            except Exception:
+                LOG.warning("Could not reconcile upload slot %s against memory %s", upload_id, owner,
+                            exc_info=True)
+                return None
+            if isinstance(record, dict) and (record.get("metadata") or {}).get("upload_id") == upload_id:
+                return "committed"
+        return "pending"
 
     @staticmethod
     def _pending_upload_from_record(upload_id: str, rec: Any) -> PendingUpload | None:
@@ -2804,15 +2835,10 @@ class ReliquaryChatProxy:
         for upload_id in expired:
             upload = self.pending_uploads.pop(upload_id, None)
             if upload and upload.blob_id:
-                # Reclaim the slot's ref only when one is actually unaccounted
-                # for: each owner holds one ref, so ref_count > len(owners) means
-                # the extra ref is this uncommitted upload's (covers bytes that
-                # deduped onto an already-owned blob). ref_count <= owners means
-                # the slot outlived a successful commit (crash before drop) and
-                # its ref now backs a committed memory — never delete those.
-                info = self.blobs.info(upload.blob_id)
-                if info is not None and info.ref_count > len(info.owners):
-                    self.blobs.delete(upload.blob_id)
+                # Release exactly the slot's own reference (its "upload:<id>"
+                # owner). A slot that outlived its commit no longer holds one:
+                # the commit handed it to the caption memory.
+                self.blobs.delete(upload.blob_id, owner=f"{UPLOAD_OWNER_PREFIX}{upload_id}")
         if expired:
             self._save_pending_uploads()
 
@@ -2978,7 +3004,7 @@ class ReliquaryChatProxy:
             return
         content_type = headers.get("content-type") or upload.expected_mimetype
         try:
-            info = self.blobs.put(data, mimetype=content_type)
+            info = self.blobs.put(data, mimetype=content_type, owner=f"{UPLOAD_OWNER_PREFIX}{upload_id}")
         except BlobTooLarge as exc:
             await self.send_json(
                 send,
@@ -3042,12 +3068,8 @@ class ReliquaryChatProxy:
         if upload.expires_at <= time.time():
             self._drop_upload(upload_id)
             if upload.blob_id:
-                # Same guard as _cleanup_expired_uploads: release the slot's ref
-                # only when one is unaccounted for (ref_count > owners); a slot
-                # that outlived a successful commit backs a committed memory.
-                blob_info = self.blobs.info(upload.blob_id)
-                if blob_info is not None and blob_info.ref_count > len(blob_info.owners):
-                    self.blobs.delete(upload.blob_id)
+                # As in _cleanup_expired_uploads: only the slot's own reference.
+                self.blobs.delete(upload.blob_id, owner=f"{UPLOAD_OWNER_PREFIX}{upload_id}")
             return self.mcp_tool_result(
                 text=f"Upload slot {upload_id} has expired.",
                 structured={"error": "upload_expired", "upload_id": upload_id},
@@ -3059,12 +3081,22 @@ class ReliquaryChatProxy:
                 structured={"error": "upload_not_ready", "upload_id": upload_id},
                 is_error=True,
             )
-        blob_info = self.blobs.info(upload.blob_id)
-        if blob_info is None or blob_info.ref_count <= len(blob_info.owners):
-            # Same guard as _cleanup_expired_uploads: no unaccounted reference
-            # means this slot outlived a successful commit (crash before the slot
-            # was dropped). Committing again would double-own the blob, and a
-            # failed retry's rollback would unlink the committed memory's bytes.
+        state = "pending"
+        if not self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
+            # No marker: the commit already handed the slot's reference to its
+            # caption (crash before the slot was dropped), or the slot predates
+            # markers and could not be reconciled at startup.
+            async with self._read_lock():
+                state = await asyncio.to_thread(self._reconcile_unmarked_slot, upload_id, upload.blob_id)
+            if state is None:
+                return self.mcp_tool_result(
+                    text=f"Could not check whether upload slot {upload_id} was already committed; retry shortly.",
+                    structured={"error": "upload_in_progress", "upload_id": upload_id}, is_error=True)
+            if state == "pending":
+                self.blobs.register_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}")
+        if state == "committed":
+            # Committing again would double-own the blob, and a failed retry's
+            # rollback would unlink the committed memory's bytes.
             self._drop_upload(upload_id)
             return self.mcp_tool_result(
                 text=f"Upload slot {upload_id} was already committed.",
@@ -3104,16 +3136,17 @@ class ReliquaryChatProxy:
 
     async def _commit_upload(self, upload: PendingUpload, caption: str, user_id: str, metadata: dict) -> dict[str, Any]:
         upload_id = upload.id
+        slot_owner = f"{UPLOAD_OWNER_PREFIX}{upload_id}"
         try:
             result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)
         except Exception:
-            self.blobs.delete(upload.blob_id)
+            self.blobs.delete(upload.blob_id, owner=slot_owner)
             self._drop_upload(upload_id)
             raise
         new_ids = added_memory_ids(result)
         memory_id = new_ids[0] if new_ids else None
         if memory_id is None:
-            self.blobs.delete(upload.blob_id)
+            self.blobs.delete(upload.blob_id, owner=slot_owner)
             self._drop_upload(upload_id)
             return self.mcp_tool_result(
                 text="Uploaded the blob but failed to create its caption memory; rolled back.",
@@ -3121,7 +3154,9 @@ class ReliquaryChatProxy:
                 is_error=True,
             )
         try:
-            self.blobs.register_owner(upload.blob_id, memory_id)
+            # The slot's reference becomes the caption's, in one sidecar write.
+            if not self.blobs.transfer_owner(upload.blob_id, slot_owner, memory_id):
+                raise RuntimeError("the upload slot no longer holds a blob reference")
         except Exception:
             LOG.exception(
                 "Failed to register uploaded blob owner blob_id=%s memory_id=%s; rolling back",
@@ -3132,7 +3167,7 @@ class ReliquaryChatProxy:
                 await self.delete_memory(memory_id)
             except Exception:
                 LOG.exception("Rollback delete_memory failed for memory_id=%s", memory_id)
-            self.blobs.delete(upload.blob_id)
+            self.blobs.delete(upload.blob_id, owner=slot_owner)
             self._drop_upload(upload_id)
             return self.mcp_tool_result(
                 text="Failed to finalize upload ownership; rolled back.",
