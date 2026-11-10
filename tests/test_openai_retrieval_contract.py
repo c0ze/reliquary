@@ -43,6 +43,16 @@ def assert_json_mirror(result):
     assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
 
 
+def assert_json_error(result):
+    # Error payloads do not match the advertised outputSchema, so they travel
+    # as JSON text only, without structuredContent (validating clients throw).
+    assert result["isError"] is True
+    assert "structuredContent" not in result
+    assert len(result["content"]) == 1
+    assert result["content"][0]["type"] == "text"
+    return json.loads(result["content"][0]["text"])
+
+
 @pytest.mark.parametrize("tool", ["search", "fetch"])
 def test_openai_retrieval_mirrors_json_for_every_document_source(proxy, document, tool):
     arguments = {"query": "protocol"} if tool == "search" else {"id": document["id"]}
@@ -72,22 +82,18 @@ def test_openai_empty_search_mirrors_json(proxy):
     ("fetch", {"id": ""}, "missing_id"),
     ("fetch", {"id": "not-present"}, "not_found"),
 ])
-def test_openai_retrieval_errors_preserve_error_flag_and_mirror_json(proxy, tool, arguments, error):
+def test_openai_retrieval_errors_preserve_error_flag_and_return_json_text(proxy, tool, arguments, error):
     result = call(proxy, tool, arguments)
-    assert result["isError"] is True
-    assert_json_mirror(result)
-    assert result["structuredContent"]["error"] == error
+    assert assert_json_error(result)["error"] == error
 
 
-def test_openai_unexpected_retrieval_error_mirrors_json(proxy, monkeypatch):
+def test_openai_unexpected_retrieval_error_returns_json_text(proxy, monkeypatch):
     async def fail(*args, **kwargs):
         raise RuntimeError("synthetic failure")
 
     monkeypatch.setattr(proxy, "handle_search_tool", fail)
     result = call(proxy, "search", {"query": "protocol"})
-    assert result["isError"] is True
-    assert_json_mirror(result)
-    assert result["structuredContent"] == {"error": "synthetic failure"}
+    assert assert_json_error(result) == {"error": "synthetic failure"}
 
 
 @pytest.mark.parametrize("tool", ["search", "fetch"])
@@ -167,10 +173,10 @@ def test_rate_limited_retrieval_keeps_endpoint_response_format(proxy, monkeypatc
             assert response.status_code == 200
             result = response.json()["result"]
             assert result["isError"] is True
-            assert result["structuredContent"] == {"error": "rate_limited", "category": "read"}
             if endpoint == "openai":
-                assert_json_mirror(result)
+                assert assert_json_error(result) == {"error": "rate_limited", "category": "read"}
             else:
+                assert result["structuredContent"] == {"error": "rate_limited", "category": "read"}
                 assert result["content"][0]["text"] == "Rate limit exceeded; slow down and retry shortly."
 
     asyncio.run(request())

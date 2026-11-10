@@ -1889,6 +1889,15 @@ class ReliquaryChatProxy:
         # and every other tool's existing presentation unchanged.
         if profile.name != "openai" or tool_name not in {"search", "fetch"}:
             return result
+        if result.get("isError"):
+            # structuredContent must conform to the advertised outputSchema, and
+            # error payloads do not (no results / id,title,text,url). Clients
+            # that validate (the TypeScript SDK) would throw instead of showing
+            # the error, so errors carry the JSON as text only.
+            return {
+                "content": [{"type": "text", "text": json.dumps(result["structuredContent"], ensure_ascii=False)}],
+                "isError": True,
+            }
         return {
             **result,
             "content": [{"type": "text", "text": json.dumps(result["structuredContent"], ensure_ascii=False)}],
