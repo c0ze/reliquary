@@ -24,6 +24,7 @@ import health
 from ingest import load_config
 from oauth import OAuthProvider, RegistrationDisabledError, scope_is_write
 from catalog import CorpusCatalog
+from metadata_policy import caller_kind, clean_caller_metadata, honours_import_id
 from persistence import JsonFileStore
 from runtime import AsyncRWLock, MCPSessionStore, native_hybrid_active, reads_can_be_concurrent
 from blobs import BlobStore, BlobTooLarge
@@ -2354,8 +2355,9 @@ class ReliquaryChatProxy:
                 structured={"error": "invalid_metadata"},
                 is_error=True,
             )
+        metadata = clean_caller_metadata(metadata)
         metadata.setdefault("source", str(arguments.get("source") or "mcp"))
-        metadata.setdefault("kind", str(arguments.get("kind") or "memory_note"))
+        metadata.setdefault("kind", caller_kind(arguments.get("kind")))
         metadata["source_group"] = "user-write"
         for key in ("title", "source_ref", "domain", "hall", "room", "topic"):
             value = arguments.get(key)
@@ -2878,7 +2880,7 @@ class ReliquaryChatProxy:
                 structured={"error": "invalid_metadata"},
                 is_error=True,
             )
-        metadata = dict(raw_metadata)
+        metadata = clean_caller_metadata(raw_metadata)
         metadata.setdefault("source", "mcp")
         metadata["kind"] = "image"
         metadata["source_group"] = "user-write"
@@ -3039,7 +3041,7 @@ class ReliquaryChatProxy:
                 structured={"error": "invalid_metadata"},
                 is_error=True,
             )
-        metadata = dict(raw_metadata)
+        metadata = clean_caller_metadata(raw_metadata)
 
         fetched_mimetype: str | None = None
         if has_url:
@@ -3353,12 +3355,14 @@ class ReliquaryChatProxy:
         existing_metadata = existing.get("metadata") or {}
         metadata = dict(existing_metadata)
         if isinstance(provided_metadata, dict):
-            metadata.update(provided_metadata)
+            metadata.update(clean_caller_metadata(provided_metadata))
         for key in ("source_group", "kind", "blob_ref", "blob_mime", "blob_size"):
             if key in existing_metadata:
                 metadata[key] = existing_metadata[key]
             else:
                 metadata.pop(key, None)
+        for key in ("import_record_id", "import_content_hash"):
+            metadata.pop(key, None)  # never valid on a user-write (pre-fix forgeries)
         metadata["source_group"] = "user-write"
         await self.update_memory(record_id, new_text, metadata=metadata)
         self._fan_out_staleness([record_id], existing_metadata)
@@ -3371,7 +3375,8 @@ class ReliquaryChatProxy:
 
     def _enrich_hit(self, hit: dict[str, Any], *, route: str) -> dict[str, Any]:
         metadata = dict(hit.get("metadata") or {})
-        record_id = str(metadata.get("import_record_id") or hit.get("id") or metadata.get("source_ref") or "")
+        import_id = metadata.get("import_record_id") if honours_import_id(metadata) else None
+        record_id = str(import_id or hit.get("id") or metadata.get("source_ref") or "")
         record = self.catalog.records_by_id.get(record_id) if self.catalog else None
         title = str(metadata.get("title") or (record.title if record else "<untitled>"))
         text = str(hit.get("memory") or (record.text if record else "")).strip()
@@ -3389,7 +3394,10 @@ class ReliquaryChatProxy:
     def _document_url(self, record_id: str, metadata: dict[str, Any]) -> str:
         blob_ref = metadata.get("blob_ref")
         if isinstance(blob_ref, str) and blob_ref:
-            return self._signed_blob_url(blob_ref)
+            try:
+                return self._signed_blob_url(blob_ref)
+            except ValueError:
+                pass  # malformed blob_ref (forged before caller metadata was cleaned)
         source_url = metadata.get("source_url")
         if isinstance(source_url, str) and source_url.startswith(("http://", "https://")):
             return source_url
