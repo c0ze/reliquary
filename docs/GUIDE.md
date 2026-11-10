@@ -637,10 +637,12 @@ Key environment variables:
 **Retrieval usage stats.** When `RELIQUARY_RETRIEVAL_STATS_PATH` is set, the
 server appends an event to that JSONL log for each search hit and fetch. Nothing
 reads it live — `python app/lint.py` aggregates it offline (`--stats-path`, or the
-env var) into two additional proposal categories, alongside the existing ones:
+env var) into two additional proposal categories, alongside the existing ones.
+The log rotates at 16 MiB, keeping one previous file (`<path>.1`), so it stays
+bounded and older events age out of the counts:
 
-- **`cold_records`** — imported records that have never been retrieved since
-  stats collection began; candidates to archive. Suppressed until the log has
+- **`cold_records`** — imported records that have not been retrieved within the
+  retained log; candidates to archive. Suppressed until the log has
   at least `RELIQUARY_LINT_COLD_MIN_EVENTS` (default `200`, `--cold-min-events`)
   total events, so a freshly-enabled or sparse log doesn't flag live corpus.
 - **`hot_topics`** — domain/topic pairs with `>= --hot-topic-min` retrievals
@@ -649,6 +651,19 @@ env var) into two additional proposal categories, alongside the existing ones:
 
 Both are proposals only, surfaced the same way as everything else lint reports
 (and via the `reliquary://needs-review` MCP resource) — nothing is auto-applied.
+
+Lint also reports two integrity categories, with or without stats:
+
+- **`unindexed_pages`** — current pages with no vector-index record, so search
+  never returns them; re-file them with `reliquary_compile_page`. Also listed
+  under `unindexed` in `reliquary://needs-review`.
+- **`orphan_blobs`** — blobs with no owning memory, no page revision and no
+  pending upload slot (an abandoned upload, a crash mid-write). Pass
+  `--state-dir` (or set `RELIQUARY_STATE_DIR`) so lint can see the server's
+  pending upload slots; without it, in-flight uploads are listed too.
+
+Expired upload slots are reaped on every memory write as well as on the next
+`create_image_upload`, an expired upload POST and at startup.
 
 ---
 

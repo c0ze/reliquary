@@ -522,6 +522,15 @@ class ReliquaryChatProxy:
                 compiled_config = copy.deepcopy(self.config)
                 compiled_config.setdefault("vector_store", {}).setdefault("config", {})
                 compiled_config["vector_store"]["config"]["collection_name"] = settings.compiled_collection
+                compiled_store = compiled_config["vector_store"]
+                raw_store = getattr(self.memory, "vector_store", None)
+                if (str(compiled_store.get("provider") or "qdrant").lower() == "qdrant"
+                        and (compiled_store["config"].get("path") or getattr(raw_store, "is_local", False))
+                        and getattr(raw_store, "client", None) is not None):
+                    # Embedded Qdrant locks its storage folder to one client; a
+                    # second QdrantClient(path=...) fails at startup. Share the raw
+                    # store's client, as mem0 does for its own entity store.
+                    compiled_store["config"]["client"] = raw_store.client
                 self.compiled_memory = Memory.from_config(compiled_config)
 
         self.metrics = Metrics()
@@ -1006,7 +1015,8 @@ class ReliquaryChatProxy:
 
         if request_method == "resources/read":
             uri = str(params.get("uri") or "")
-            contents = self.read_resource(uri)
+            # needs-review folds the whole retrieval-stats log: keep it off the loop.
+            contents = await asyncio.to_thread(self.read_resource, uri)
             if contents is None:
                 await self.send_json(send, 200, self.mcp_error(request_id, -32602, f"Unknown resource: {uri}"))
                 return
@@ -1242,6 +1252,7 @@ class ReliquaryChatProxy:
                                     cold_min_events=self.settings.lint_cold_min_events)
             payload = {
                 "stale": [self._page_summary(p) for p in pages if p.status == "stale"],
+                "unindexed": report["unindexed_pages"],
                 "coverage_gaps": report["coverage_gaps"],
                 "cold_records": report["cold_records"],
                 "hot_topics": report["hot_topics"],
@@ -1881,8 +1892,8 @@ class ReliquaryChatProxy:
                             "markdown": {"type": "string", "description": "The synthesis body (markdown)."},
                             "slug": {"type": "string", "description": "Stable page id; derived from title/topic if omitted."},
                             "title": {"type": "string"},
-                            "derived_from": {"type": "array", "items": {"type": "string"}, "description": "Raw memory ids this synthesis is based on."},
-                            "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Slugs this page supersedes."},
+                            "derived_from": {"type": "array", "items": {"type": "string"}, "description": "Raw memory ids this synthesis is based on. Omit on a re-file to keep the page's list; [] clears it."},
+                            "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Slugs this page supersedes. Omit on a re-file to keep the page's list; [] clears it."},
                             "domain": {"type": "string"}, "hall": {"type": "string"}, "room": {"type": "string"}, "topic": {"type": "string"},
                             "status": {"type": "string", "description": "current | stale | draft | archived (default current)."},
                         },
@@ -2441,7 +2452,7 @@ class ReliquaryChatProxy:
         if self.pages is None or self.compiled_memory is None:
             return self.mcp_tool_result(text="The compiled layer is not configured.",
                                         structured={"error": "compiled_disabled"}, is_error=True)
-        from compiled import slugify, VALID_STATUSES
+        from compiled import slugify, MAX_SLUG_LENGTH, VALID_STATUSES
         markdown = str(arguments.get("markdown") or "").strip()
         if not markdown:
             return self.mcp_tool_result(text="A non-empty `markdown` is required.",
@@ -2463,7 +2474,7 @@ class ReliquaryChatProxy:
         for key in ("derived_from", "supersedes"):
             value = arguments.get(key)
             if value is None:
-                value = []
+                continue  # omitted: a re-file inherits the page's provenance
             elif isinstance(value, (str, bytes)):
                 value = [value]
             elif not isinstance(value, (list, tuple)):
@@ -2471,10 +2482,28 @@ class ReliquaryChatProxy:
                     text=f"`{key}` must be an array of memory ids.",
                     structured={"error": "invalid_argument", "key": key}, is_error=True)
             id_lists[key] = [str(x).strip() for x in value if str(x).strip()]
-        derived_from = id_lists["derived_from"]
-        supersedes = id_lists["supersedes"]
-        frontmatter: dict[str, Any] = {"title": title or slug, "status": status,
-                                       "derived_from": derived_from, "supersedes": supersedes}
+        previous = self.pages.get(slug)
+        if previous is None and len(slug) > MAX_SLUG_LENGTH:
+            return self.mcp_tool_result(
+                text=f"The page slug is {len(slug)} characters; pass a `slug` of at most {MAX_SLUG_LENGTH}.",
+                structured={"error": "slug_too_long", "max_length": MAX_SLUG_LENGTH}, is_error=True)
+        if previous is None:
+            # fetch resolves pages before catalog records and live memories, so a
+            # new slug must not take over an existing record id.
+            shadowed = bool(self.catalog and slug in self.catalog.records_by_id)
+            if not shadowed:
+                try:
+                    async with self._read_lock():
+                        shadowed = await asyncio.to_thread(self.memory.get, slug) is not None
+                except Exception:
+                    LOG.debug("Slug collision probe failed for %s", slug, exc_info=True)
+            if shadowed:
+                return self.mcp_tool_result(
+                    text=f"The slug {slug!r} is already a record id; pass a different `slug`.",
+                    structured={"error": "slug_conflict", "slug": slug}, is_error=True)
+        frontmatter: dict[str, Any] = {"status": status, **id_lists}
+        if title or previous is None:
+            frontmatter["title"] = title or slug
         for key in ("domain", "hall", "room", "topic"):
             value = arguments.get(key)
             if value is not None and str(value).strip():
@@ -2486,18 +2515,29 @@ class ReliquaryChatProxy:
             return self.mcp_tool_result(text=str(exc), structured={"error": "too_large", "size": exc.size, "max_bytes": exc.max_bytes}, is_error=True)
         user_id = str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
         metadata = {"kind": "synthesis", "source_group": "compiled", "slug": slug,
-                    "blob_ref": info.current_blob, "derived_from": derived_from}
+                    "blob_ref": info.current_blob, "derived_from": info.derived_from}
         for key in ("domain", "hall", "room", "topic"):
             if getattr(info, key):
                 metadata[key] = getattr(info, key)
-        memory_id = await self._index_compiled_page(info, markdown, user_id=user_id, metadata=metadata)
-        if memory_id:
-            self.pages.set_memory_id(slug, memory_id)
+        try:
+            memory_id = await self._index_compiled_page(info, markdown, user_id=user_id, metadata=metadata)
+        except Exception:
+            LOG.exception("Compiled indexing failed for slug=%s; restoring the previous page state", slug)
+            memory_id = None
+        if not memory_id:
+            # The registry commits before the index write; without this, a
+            # failure left a current revision that search never sees (or, for
+            # an existing page, registry text that diverges from the index).
+            await asyncio.to_thread(self.pages.rollback_revision, slug, previous, info.current_blob)
+            return self.mcp_tool_result(
+                text=f"Could not index page slug={slug}; nothing was changed. Retry later.",
+                structured={"error": "index_failed", "slug": slug}, is_error=True)
+        self.pages.set_memory_id(slug, memory_id)
         url = self._signed_blob_url(info.current_blob)
         return self.mcp_tool_result(
             text=f"Filed synthesis page slug={slug} (revision {info.current_blob[:12]}, status={status}).",
             structured={"slug": slug, "revision": info.current_blob, "memory_id": memory_id,
-                        "url": url, "derived_from": derived_from, "status": status})
+                        "url": url, "derived_from": info.derived_from, "status": status})
 
     async def handle_list_pages_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.pages is None:
@@ -2555,7 +2595,14 @@ class ReliquaryChatProxy:
                 # Same lock every other compiled-store op takes: embedded local
                 # Qdrant is not safe under concurrent read/write.
                 async with self.memory_lock.write():
-                    await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
+                    try:
+                        await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
+                    except Exception:
+                        # mem0 raises for an id it does not hold. A vector that is
+                        # already gone (collection rebuilt/restored, or a crash after
+                        # an earlier vector delete) must not wedge the page forever.
+                        if await asyncio.to_thread(self.compiled_memory.get, info.memory_id) is not None:
+                            raise
                 deleted_memory = info.memory_id
             except Exception as exc:
                 LOG.warning("delete_page: aborting; could not delete indexed memory %s for %s: %s",
@@ -2617,15 +2664,47 @@ class ReliquaryChatProxy:
         if not self.pending_upload_store:
             return
         restored: dict[str, PendingUpload] = {}
+        dropped = False
         for upload_id, rec in self.pending_upload_store.load().items():
-            if not isinstance(rec, dict):
+            upload = self._pending_upload_from_record(upload_id, rec)
+            if upload is not None:
+                restored[upload_id] = upload
                 continue
-            try:
-                restored[upload_id] = PendingUpload(**rec)
-            except TypeError:
-                continue
+            dropped = True
+            # A malformed slot can still name the blob it holds a reference on;
+            # release it with the cleanup guard instead of leaking it.
+            blob_id = rec.get("blob_id") if isinstance(rec, dict) else None
+            if isinstance(blob_id, str) and re.fullmatch(r"[0-9a-f]{64}", blob_id):
+                info = self.blobs.info(blob_id)
+                if info is not None and info.ref_count > len(info.owners):
+                    self.blobs.delete(blob_id)
         self.pending_uploads = restored
+        if dropped:
+            self._save_pending_uploads()
         self._cleanup_expired_uploads()
+
+    @staticmethod
+    def _pending_upload_from_record(upload_id: str, rec: Any) -> PendingUpload | None:
+        """Type-check one persisted slot; None when it is unusable. Unknown keys
+        are ignored so a slot written by a newer version still loads."""
+        if not isinstance(rec, dict) or rec.get("id") != upload_id:
+            return None
+        fields: dict[str, Any] = {}
+        for name, kinds in (("id", str), ("created_at", (int, float)), ("expires_at", (int, float)),
+                            ("expected_mimetype", str), ("expected_size", int), ("filename", str),
+                            ("blob_id", str), ("mimetype", str), ("size", int), ("profile", str)):
+            value = rec.get(name)
+            if value is None:
+                if name in ("id", "created_at", "expires_at"):
+                    return None
+                continue
+            if isinstance(value, bool) or not isinstance(value, kinds):
+                return None
+            fields[name] = value
+        blob_id = fields.get("blob_id")
+        if blob_id is not None and not re.fullmatch(r"[0-9a-f]{64}", blob_id):
+            return None
+        return PendingUpload(**fields)
 
     def _save_pending_uploads(self) -> None:
         if not self.pending_upload_store:
@@ -2904,6 +2983,18 @@ class ReliquaryChatProxy:
                 structured={"error": "upload_not_ready", "upload_id": upload_id},
                 is_error=True,
             )
+        blob_info = self.blobs.info(upload.blob_id)
+        if blob_info is None or blob_info.ref_count <= len(blob_info.owners):
+            # Same guard as _cleanup_expired_uploads: no unaccounted reference
+            # means this slot outlived a successful commit (crash before the slot
+            # was dropped). Committing again would double-own the blob, and a
+            # failed retry's rollback would unlink the committed memory's bytes.
+            self._drop_upload(upload_id)
+            return self.mcp_tool_result(
+                text=f"Upload slot {upload_id} was already committed.",
+                structured={"error": "already_committed", "upload_id": upload_id, "blob_id": upload.blob_id},
+                is_error=True,
+            )
 
         user_id = (
             str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
@@ -2978,6 +3069,7 @@ class ReliquaryChatProxy:
                 is_error=True,
             )
 
+        self._fan_out_staleness([memory_id], metadata)
         blob_id = upload.blob_id
         mimetype = upload.mimetype
         size = upload.size
@@ -3161,6 +3253,7 @@ class ReliquaryChatProxy:
                 structured={"error": "ownership_registration_failed", "blob_id": info.id, "memory_id": memory_id},
                 is_error=True,
             )
+        self._fan_out_staleness([memory_id], metadata)
         url = self._signed_blob_url(info.id)
         return self.mcp_tool_result(
             text=f"Stored image (blob_id={info.id}, memory_id={memory_id}): {trim_text(caption, 160)}",
@@ -3909,6 +4002,9 @@ class ReliquaryChatProxy:
         metadata: dict[str, Any] | None = None,
         infer: bool = False,
     ) -> Any:
+        # Reap abandoned upload slots on the write path too, not only on the
+        # next create_image_upload (cheap: a scan of the in-memory slot table).
+        self._cleanup_expired_uploads()
         async with self.memory_lock.write():
             result = await asyncio.to_thread(
                 self.memory.add,
@@ -3921,11 +4017,13 @@ class ReliquaryChatProxy:
         return result
 
     async def delete_memory(self, record_id: str) -> None:
+        self._cleanup_expired_uploads()
         async with self.memory_lock.write():
             await asyncio.to_thread(self.memory.delete, record_id)
         self._count_cache = None
 
     async def update_memory(self, record_id: str, data: str, *, metadata: dict[str, Any] | None = None) -> None:
+        self._cleanup_expired_uploads()
         async with self.memory_lock.write():
             await asyncio.to_thread(self.memory.update, record_id, data, metadata)
         self._count_cache = None

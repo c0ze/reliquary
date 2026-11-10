@@ -85,11 +85,17 @@ class AsyncRWLock:
     async def write(self) -> AsyncIterator[None]:
         async with self._cond:
             self._writers_waiting += 1
+            acquired = False
             try:
                 while self._writer_active or self._readers > 0:
                     await self._cond.wait()
+                acquired = True
             finally:
                 self._writers_waiting -= 1
+                if not acquired:
+                    # A cancelled waiting writer was holding new readers back;
+                    # wake them, or they sleep until some unrelated release.
+                    self._cond.notify_all()
             self._writer_active = True
         try:
             yield

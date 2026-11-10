@@ -259,7 +259,7 @@ def test_run_all_returns_all_four_keys():
     ]
     records = [_Rec("orphan-1", {})]
     out = health.run_all(pages, raw_counts={"infra": 20}, min_count=8, records=records)
-    assert set(out.keys()) == {"stale_pages", "coverage_gaps", "supersession", "orphans",
+    assert set(out.keys()) == {"stale_pages", "unindexed_pages", "coverage_gaps", "supersession", "orphans",
                                 "cold_records", "hot_topics"}
     assert [item["slug"] for item in out["stale_pages"]] == ["stale-one"]
     assert {item["domain"] for item in out["coverage_gaps"]} == {"infra"}

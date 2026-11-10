@@ -22,6 +22,8 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 
+from persistence import atomic_write
+
 _BLOB_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_BLOB_ID_RE = re.compile(r"^[0-9a-zA-Z_\-]+$")
 
@@ -115,11 +117,7 @@ class BlobStore:
             return None
 
     def _write_sidecar(self, info: BlobInfo) -> None:
-        path = self._sidecar_path(info.id)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(asdict(info), fh)
-        os.replace(tmp, path)
+        atomic_write(self._sidecar_path(info.id), json.dumps(asdict(info)).encode("utf-8"))
 
     # --- store / fetch -------------------------------------------------------
     def put(self, data: bytes, *, mimetype: str | None = None) -> BlobInfo:
@@ -138,10 +136,8 @@ class BlobStore:
                     # out-of-band removal) — otherwise this "successful" dedup
                     # would keep pointing at bytes that no longer exist.
                     os.makedirs(self._shard_dir(blob_id), exist_ok=True)
-                    tmp = f"{blob_path}.tmp"
-                    with open(tmp, "wb") as fh:
-                        fh.write(data)
-                    os.replace(tmp, blob_path)
+                    # The sidecar write below fsyncs the shared directory.
+                    atomic_write(blob_path, data, sync_dir=False)
                 self._write_sidecar(existing)
                 return existing
 
@@ -153,11 +149,8 @@ class BlobStore:
                 final_mime = sniffed_mime
 
             os.makedirs(self._shard_dir(blob_id), exist_ok=True)
-            blob_path = self._blob_path(blob_id, ext)
-            tmp = f"{blob_path}.tmp"
-            with open(tmp, "wb") as fh:
-                fh.write(data)
-            os.replace(tmp, blob_path)
+            # The sidecar write below fsyncs the shared directory.
+            atomic_write(self._blob_path(blob_id, ext), data, sync_dir=False)
 
             info = BlobInfo(
                 id=blob_id,
@@ -169,6 +162,22 @@ class BlobStore:
             )
             self._write_sidecar(info)
             return info
+
+    def iter_infos(self):
+        """Yield the BlobInfo of every blob with a readable sidecar."""
+        try:
+            shards = sorted(os.listdir(self.blob_dir))
+        except FileNotFoundError:
+            return
+        for shard in shards:
+            shard_path = os.path.join(self.blob_dir, shard)
+            if not os.path.isdir(shard_path):
+                continue
+            for name in sorted(os.listdir(shard_path)):
+                if name.endswith(".json") and _BLOB_ID_RE.match(name[:-5]):
+                    info = self.info(name[:-5])
+                    if info is not None:
+                        yield info
 
     def get(self, blob_id: str) -> tuple[bytes, str] | None:
         _validate_blob_id(blob_id)

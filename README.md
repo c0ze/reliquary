@@ -140,15 +140,22 @@ relevant *current* synthesis and surfaces raw memories as its evidence. New raw
 writes flag dependent pages `stale` (a queued suggestion, never an auto-rewrite).
 Inspect pages with `reliquary_list_pages` / `reliquary_page_history` (the latter
 reports per-revision timestamp + status), archive a page by re-filing it with
-`status=archived`, or permanently remove one with `reliquary_delete_page`. Read the
+`status=archived`, or permanently remove one with `reliquary_delete_page`. A re-file
+that omits `title`, `derived_from` or `supersedes` keeps the page's current values
+(pass an empty list to clear one). A new page's slug may not reuse an imported
+record id or a live memory id (`slug_conflict`) and is at most 120 characters. Read the
 `reliquary://schema`, `reliquary://recent`, `reliquary://needs-review`, and
 `reliquary://domain/<d>/index` resources. It is on by default; set
 `RELIQUARY_COMPILED_COLLECTION=` (empty) to disable (an empty layer is a query-time
 no-op). Two cron-friendly CLIs support it: `python app/lint.py` proposes refreshes
 (never applies them) — with `RELIQUARY_RETRIEVAL_STATS_PATH` set, it also proposes
 archive candidates (imported records never retrieved) and compile candidates (hot
-topics with no synthesis page) — and `python app/export_vault.py --out vault/`
-exports pages to an Obsidian-style vault. See [`docs/GUIDE.md`](docs/GUIDE.md#compilation-layer).
+topics with no synthesis page); it also lists current pages with no index record
+(`unindexed_pages`) and blobs nothing references (`orphan_blobs`; pass
+`--state-dir` so pending uploads are not counted) — and `python app/export_vault.py --out vault/`
+exports pages to an Obsidian-style vault (a re-run removes the files it wrote
+earlier for pages since deleted or moved to another domain, tracked in
+`.reliquary-export.json`; other files in the vault are left alone). See [`docs/GUIDE.md`](docs/GUIDE.md#compilation-layer).
 
 **Project context & governance.** Reliquary is a generic personal-memory tool by
 default, but a coding agent can opt into light, *soft* project-awareness. Pass a

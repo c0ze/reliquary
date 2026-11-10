@@ -37,6 +37,15 @@ def stale_pages(pages: Iterable[Any]) -> list[dict[str, Any]]:
     ]
 
 
+def unindexed_pages(pages: Iterable[Any]) -> list[dict[str, Any]]:
+    """Current pages with no vector-index record: invisible to search."""
+    return [
+        {"kind": "unindexed_page", "slug": p.slug,
+         "reason": "current page has no index record (not searchable); re-file it with compile_page"}
+        for p in pages if getattr(p, "status", None) == "current" and not getattr(p, "memory_id", None)
+    ]
+
+
 def coverage_gaps(pages: Iterable[Any], raw_counts: dict[str, int], *, min_count: int) -> list[dict[str, Any]]:
     pages = list(pages)
     covered = {p.domain for p in pages if p.status == "current" and p.domain}
@@ -117,6 +126,21 @@ def hot_topics_without_synthesis(pages: Iterable[Any], stats_by_topic: dict[str,
     return out
 
 
+def orphan_blobs(blob_infos: Iterable[Any], *, page_refs: set[str], pending_refs: set[str],
+                 limit: int = 50) -> list[dict[str, Any]]:
+    """Blobs nothing references: no owning memory, no page revision, no pending
+    upload slot. Leaked references (an abandoned upload, a crash mid-write)."""
+    out: list[dict[str, Any]] = []
+    for info in blob_infos:
+        if info.owners or info.id in page_refs or info.id in pending_refs:
+            continue
+        out.append({"kind": "orphan_blob", "id": info.id, "size": info.size, "ref_count": info.ref_count,
+                    "reason": "blob has no owning memory, page revision or pending upload; candidate to remove"})
+        if len(out) >= limit:
+            break
+    return out
+
+
 def run_all(pages: Iterable[Any], *, raw_counts: dict[str, int], min_count: int,
             records: Iterable[Any] = (), stats: dict[str, Any] | None = None,
             hot_topic_min: int | None = None,
@@ -132,6 +156,7 @@ def run_all(pages: Iterable[Any], *, raw_counts: dict[str, int], min_count: int,
     cold_floor = cold_min_events if cold_min_events is not None else COLD_RECORD_MIN_EVENTS
     return {
         "stale_pages": stale_pages(pages),
+        "unindexed_pages": unindexed_pages(pages),
         "coverage_gaps": coverage_gaps(pages, raw_counts, min_count=min_count),
         "supersession": supersession(pages),
         "orphans": orphans(records),

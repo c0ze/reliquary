@@ -3,7 +3,12 @@
 Best-effort telemetry, NOT a security record: unlike audit.py's AuditLog, record() must
 never raise into its caller — a stats-write failure can never be allowed to break a live
 search/fetch, so any error is swallowed and debug-logged instead. The hot path only
-appends; aggregation (reducing the JSONL back into counts) is done offline by lint.py.
+appends; aggregation (reducing the JSONL back into counts) is done by lint.py and, off
+the event loop, by the needs-review resource.
+
+The log rotates once it passes ``max_bytes``: the current file becomes ``<path>.1``
+(replacing the previous one), so the log and every aggregation over it stay bounded
+at about twice ``max_bytes``. Older events age out.
 """
 
 from __future__ import annotations
@@ -16,11 +21,15 @@ import time
 
 logger = logging.getLogger(__name__)
 
+# ~150k events per file at ~110 bytes per event.
+DEFAULT_MAX_BYTES = 16 * 1024 * 1024
+
 
 class RetrievalStatsLog:
-    def __init__(self, path: str | None, clock=time.time) -> None:
+    def __init__(self, path: str | None, clock=time.time, max_bytes: int = DEFAULT_MAX_BYTES) -> None:
         self.path = path or None
         self._clock = clock
+        self.max_bytes = max_bytes
         self._lock = threading.Lock()
 
     def record(self, event: str, items: list[dict]) -> None:
@@ -49,12 +58,16 @@ class RetrievalStatsLog:
                 os.makedirs(directory, exist_ok=True)
                 with open(self.path, "a", encoding="utf-8") as fh:
                     fh.writelines(lines)
+                    size = fh.tell()
+                if self.max_bytes and size > self.max_bytes:
+                    os.replace(self.path, f"{self.path}.1")
         except Exception:
             logger.debug("retrieval_stats: failed to write to %s", self.path, exc_info=True)
 
 
 def aggregate(path: str | None) -> dict:
-    """Pure reducer: read the JSONL log back and fold it into summary counts.
+    """Pure reducer: read the JSONL log (the rotated ``<path>.1`` first, then ``path``)
+    back and fold it into summary counts.
 
     Tolerant of a missing file, an unreadable path, or malformed/id-less lines — those
     are skipped rather than raising. Streams the file line-by-line rather than loading
@@ -63,13 +76,18 @@ def aggregate(path: str | None) -> dict:
     result = {"by_id": {}, "by_domain": {}, "by_topic": {}, "events": 0}
     if not path:
         return result
+    _fold(f"{path}.1", result)
+    _fold(path, result)
+    return result
 
+
+def _fold(path: str, result: dict) -> None:
     try:
         # errors="replace" so one corrupt byte can't blow up the whole aggregation;
         # a garbled line just fails json.loads below and is skipped like any bad line.
         fh = open(path, "r", encoding="utf-8", errors="replace")
     except OSError:
-        return result
+        return
 
     with fh:
         for line in fh:
@@ -122,5 +140,3 @@ def aggregate(path: str | None) -> dict:
                     # embedded tabs don't occur in practice.
                     key = f"{domain}\t{topic}"
                     result["by_topic"][key] = result["by_topic"].get(key, 0) + 1
-
-    return result
