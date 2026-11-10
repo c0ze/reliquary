@@ -1849,8 +1849,8 @@ class ReliquaryChatProxy:
                             "markdown": {"type": "string", "description": "The synthesis body (markdown)."},
                             "slug": {"type": "string", "description": "Stable page id; derived from title/topic if omitted."},
                             "title": {"type": "string"},
-                            "derived_from": {"type": "array", "items": {"type": "string"}, "description": "Raw memory ids this synthesis is based on."},
-                            "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Slugs this page supersedes."},
+                            "derived_from": {"type": "array", "items": {"type": "string"}, "description": "Raw memory ids this synthesis is based on. Omit on a re-file to keep the page's list; [] clears it."},
+                            "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Slugs this page supersedes. Omit on a re-file to keep the page's list; [] clears it."},
                             "domain": {"type": "string"}, "hall": {"type": "string"}, "room": {"type": "string"}, "topic": {"type": "string"},
                             "status": {"type": "string", "description": "current | stale | draft | archived (default current)."},
                         },
@@ -2429,7 +2429,7 @@ class ReliquaryChatProxy:
         for key in ("derived_from", "supersedes"):
             value = arguments.get(key)
             if value is None:
-                value = []
+                continue  # omitted: a re-file inherits the page's provenance
             elif isinstance(value, (str, bytes)):
                 value = [value]
             elif not isinstance(value, (list, tuple)):
@@ -2437,22 +2437,21 @@ class ReliquaryChatProxy:
                     text=f"`{key}` must be an array of memory ids.",
                     structured={"error": "invalid_argument", "key": key}, is_error=True)
             id_lists[key] = [str(x).strip() for x in value if str(x).strip()]
-        derived_from = id_lists["derived_from"]
-        supersedes = id_lists["supersedes"]
-        frontmatter: dict[str, Any] = {"title": title or slug, "status": status,
-                                       "derived_from": derived_from, "supersedes": supersedes}
+        previous = self.pages.get(slug)
+        frontmatter: dict[str, Any] = {"status": status, **id_lists}
+        if title or previous is None:
+            frontmatter["title"] = title or slug
         for key in ("domain", "hall", "room", "topic"):
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 frontmatter[key] = str(value).strip()
-        previous = self.pages.get(slug)
         try:
             info = await asyncio.to_thread(self.pages.put_revision, slug, markdown, frontmatter)
         except BlobTooLarge as exc:
             return self.mcp_tool_result(text=str(exc), structured={"error": "too_large", "size": exc.size, "max_bytes": exc.max_bytes}, is_error=True)
         user_id = str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
         metadata = {"kind": "synthesis", "source_group": "compiled", "slug": slug,
-                    "blob_ref": info.current_blob, "derived_from": derived_from}
+                    "blob_ref": info.current_blob, "derived_from": info.derived_from}
         for key in ("domain", "hall", "room", "topic"):
             if getattr(info, key):
                 metadata[key] = getattr(info, key)
@@ -2474,7 +2473,7 @@ class ReliquaryChatProxy:
         return self.mcp_tool_result(
             text=f"Filed synthesis page slug={slug} (revision {info.current_blob[:12]}, status={status}).",
             structured={"slug": slug, "revision": info.current_blob, "memory_id": memory_id,
-                        "url": url, "derived_from": derived_from, "status": status})
+                        "url": url, "derived_from": info.derived_from, "status": status})
 
     async def handle_list_pages_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.pages is None:

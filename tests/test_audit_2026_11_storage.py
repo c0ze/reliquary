@@ -108,3 +108,37 @@ def test_needs_review_and_lint_report_current_page_without_index(proxy, tmp_path
     report = lint.build_report(compiled_dir=proxy.settings.compiled_dir, blob_dir=proxy.settings.blob_dir,
                                dataset_path=None, min_count=8)
     assert [item["slug"] for item in report["unindexed_pages"]] == ["broken"]
+
+
+# 5 -- a re-file without derived_from/title keeps them ----------------------
+
+def test_refile_without_provenance_keeps_it_and_still_goes_stale(proxy):
+    async def scenario():
+        added = await call(proxy, "reliquary_add_memory", {"text": "source fact"})
+        source = added["structuredContent"]["ids"][0]
+        await call(proxy, "reliquary_compile_page", {"slug": "syn", "title": "Syn Title", "markdown": "v1",
+                                                     "derived_from": [source], "supersedes": ["older"]})
+        refiled = await call(proxy, "reliquary_compile_page", {"slug": "syn", "markdown": "v2"})
+        page = proxy.pages.get("syn")
+        await call(proxy, "reliquary_update", {"id": source, "text": "source fact changed"})
+        return source, refiled, page, proxy.pages.get("syn")
+
+    source, refiled, page, final = run(scenario())
+    assert page.derived_from == [source]
+    assert page.supersedes == ["older"]
+    assert page.title == "Syn Title"
+    assert refiled["structuredContent"]["derived_from"] == [source]
+    indexed = proxy.compiled_memory._store[refiled["structuredContent"]["memory_id"]]
+    assert indexed["metadata"]["derived_from"] == [source]
+    assert indexed["memory"].startswith("Syn Title")
+    assert final.status == "stale"
+
+
+def test_refile_with_explicit_empty_lists_clears_provenance(proxy):
+    run(call(proxy, "reliquary_compile_page", {"slug": "syn", "markdown": "v1",
+                                               "derived_from": ["m1"], "supersedes": ["older"]}))
+    run(call(proxy, "reliquary_compile_page", {"slug": "syn", "markdown": "v2",
+                                               "derived_from": [], "supersedes": []}))
+    page = proxy.pages.get("syn")
+    assert page.derived_from == [] and page.supersedes == []
+    assert page.title == "syn"  # a new page with no title still defaults to its slug

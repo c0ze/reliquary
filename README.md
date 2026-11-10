@@ -140,7 +140,9 @@ relevant *current* synthesis and surfaces raw memories as its evidence. New raw
 writes flag dependent pages `stale` (a queued suggestion, never an auto-rewrite).
 Inspect pages with `reliquary_list_pages` / `reliquary_page_history` (the latter
 reports per-revision timestamp + status), archive a page by re-filing it with
-`status=archived`, or permanently remove one with `reliquary_delete_page`. Read the
+`status=archived`, or permanently remove one with `reliquary_delete_page`. A re-file
+that omits `title`, `derived_from` or `supersedes` keeps the page's current values
+(pass an empty list to clear one). Read the
 `reliquary://schema`, `reliquary://recent`, `reliquary://needs-review`, and
 `reliquary://domain/<d>/index` resources. It is on by default; set
 `RELIQUARY_COMPILED_COLLECTION=` (empty) to disable (an empty layer is a query-time
