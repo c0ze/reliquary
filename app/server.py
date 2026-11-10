@@ -3313,11 +3313,11 @@ class ReliquaryChatProxy:
                 is_error=True,
             )
 
-        await self._fan_out_staleness([memory_id], metadata)
         blob_id = upload.blob_id
         mimetype = upload.mimetype
         size = upload.size
-        self._drop_upload(upload_id)
+        self._drop_upload(upload_id)  # before the awaited fan-out, which can be cancelled
+        await self._fan_out_staleness([memory_id], metadata)
         return self.mcp_tool_result(
             text=f"Committed uploaded image (blob_id={blob_id}, memory_id={memory_id}): {trim_text(caption, 160)}",
             structured={
@@ -3590,8 +3590,11 @@ class ReliquaryChatProxy:
                 is_error=True,
             )
         await self.delete_memory(memory_id)
-        await self._fan_out_staleness([memory_id], metadata)
+        # Release the owner's reference before awaiting the fan-out: a request
+        # cancelled there would otherwise leave a blob owned by a deleted memory,
+        # which no API call can remove.
         unlinked = self.blobs.delete(str(blob_ref), owner=memory_id)
+        await self._fan_out_staleness([memory_id], metadata)
         return self.mcp_tool_result(
             text=f"Deleted image memory_id={memory_id} (blob_id={blob_ref}, blob_unlinked={bool(unlinked)}).",
             structured={

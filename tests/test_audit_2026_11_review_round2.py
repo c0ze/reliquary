@@ -160,3 +160,30 @@ def test_malformed_marked_slot_releases_only_its_own_reference(make_proxy, tmp_p
     proxy = make_proxy(state_dir=str(state))
     info = proxy.blobs.info(blob)
     assert info is not None and info.ref_count == 1 and info.owners == ["upload:upl_good"]
+
+
+# b -- must-do steps run before the awaited staleness fan-out ---------------
+
+def _cancel_fan_out(proxy, monkeypatch):
+    async def cancelled(*args, **kwargs):
+        raise asyncio.CancelledError()  # the request is cancelled while fan-out waits
+
+    monkeypatch.setattr(proxy, "_fan_out_staleness", cancelled)
+
+
+def test_delete_image_releases_the_blob_before_fan_out(proxy, monkeypatch):
+    added = run(call(proxy, "reliquary_add_image",
+                     {"caption": "cat", "image_base64": base64.b64encode(PNG).decode()}))["structuredContent"]
+    _cancel_fan_out(proxy, monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        run(call(proxy, "reliquary_delete_image", {"memory_id": added["memory_id"]}))
+    assert proxy.memory.get(added["memory_id"]) is None
+    assert proxy.blobs.info(added["blob_id"]) is None  # no blob owned by a deleted memory
+
+
+def test_commit_drops_its_slot_before_fan_out(proxy, monkeypatch):
+    slot = run(new_upload(proxy))
+    _cancel_fan_out(proxy, monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        run(call(proxy, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "cat"}))
+    assert slot not in proxy.pending_uploads
