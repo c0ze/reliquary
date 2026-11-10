@@ -906,7 +906,9 @@ class ReliquaryChatProxy:
         if method == "DELETE":
             session_id = headers.get("mcp-session-id")
             if session_id:
-                self.mcp_sessions.remove(session_id)
+                # Another credential's (or endpoint's) session is left alone and
+                # answered like an unknown one.
+                self.mcp_sessions.remove_owned(session_id, profile.name, self._credential_key(headers))
             await self.send_empty(send, 204)
             return
 
@@ -991,7 +993,7 @@ class ReliquaryChatProxy:
             return
 
         session_id = headers.get("mcp-session-id")
-        if session_id and session_id not in self.mcp_sessions:
+        if session_id and not self.mcp_sessions.claim(session_id, profile.name, self._credential_key(headers)):
             await self.send_json(send, 404, self.mcp_error(request_id, -32001, "Unknown MCP session"))
             return
 

@@ -88,3 +88,61 @@ def test_verbatim_mode_read_grant_cannot_write_through_the_server(make_proxy):
     names = {tool["name"] for tool in json.loads(resp["body"])["result"]["tools"]}
     assert "reliquary_search" in names
     assert "reliquary_delete" not in names and "reliquary_add_memory" not in names
+
+
+# --- 8. MCP sessions belong to the credential and endpoint that made them -----
+
+CLAUDE = {"authorization": "Bearer claude-secret"}
+READER = {"authorization": "Bearer read-tok"}
+
+
+def _initialize(p, headers, path="/claude/mcp"):
+    resp = _call(p, "POST", path, headers=headers, body=_rpc("initialize", {"protocolVersion": "2025-06-18"}))
+    assert resp["status"] == 200
+    return resp["headers"]["mcp-session-id"]
+
+
+def _ping(p, headers, session_id, path="/claude/mcp"):
+    return _call(p, "POST", path, headers={**headers, "mcp-session-id": session_id}, body=_rpc("ping"))["status"]
+
+
+def test_another_credential_cannot_use_a_session(make_proxy):
+    p = make_proxy(static_tokens=(("ro", "read", "read-tok"),))
+    session = _initialize(p, CLAUDE)
+    assert _ping(p, READER, session) == 404
+    assert _ping(p, CLAUDE, session) == 200
+
+
+def test_another_credential_cannot_delete_a_session(make_proxy):
+    p = make_proxy(static_tokens=(("ro", "read", "read-tok"),))
+    session = _initialize(p, CLAUDE)
+    resp = _call(p, "DELETE", "/claude/mcp", headers={**READER, "mcp-session-id": session})
+    assert resp["status"] == 204  # answered like an unknown session
+    assert _ping(p, CLAUDE, session) == 200
+    assert _call(p, "DELETE", "/claude/mcp", headers={**CLAUDE, "mcp-session-id": session})["status"] == 204
+    assert _ping(p, CLAUDE, session) == 404
+
+
+def test_a_session_is_bound_to_its_endpoint(make_proxy):
+    p = make_proxy(static_tokens=(("rw", "write", "both-tok"),))
+    both = {"authorization": "Bearer both-tok"}
+    session = _initialize(p, both, "/claude/mcp")
+    assert _ping(p, both, session, "/openai/mcp") == 404
+    _call(p, "DELETE", "/openai/mcp", headers={**both, "mcp-session-id": session})
+    assert _ping(p, both, session, "/claude/mcp") == 200
+
+
+def test_ownerless_persisted_session_adopts_its_first_credential(make_proxy, tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "mcp_sessions.json").write_text(json.dumps({"legacy": "claude"}))
+    tokens = (("ro", "read", "read-tok"), ("rw", "write", "both-tok"))
+    p = make_proxy(state_dir=str(state), static_tokens=tokens)
+    both = {"authorization": "Bearer both-tok"}
+    assert _ping(p, both, "legacy", "/openai/mcp") == 404  # the wrong endpoint does not adopt it
+    assert _ping(p, CLAUDE, "legacy") == 200
+    assert _ping(p, READER, "legacy") == 404
+    assert json.loads((state / "mcp_sessions.json").read_text())["legacy"] == ["claude", "master:claude"]
+    restarted = make_proxy(state_dir=str(state), static_tokens=tokens)
+    assert _ping(restarted, READER, "legacy") == 404
+    assert _ping(restarted, CLAUDE, "legacy") == 200
