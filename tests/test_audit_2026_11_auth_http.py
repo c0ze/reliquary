@@ -455,3 +455,92 @@ def test_audit_log_is_created_owner_only(tmp_path):
         os.umask(old)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert [json.loads(line)["action"] for line in path.read_text().splitlines()] == ["add", "delete"]
+
+
+# --- 12. tokens are hashed at rest ------------------------------------------
+
+
+def _stores(tmp_path):
+    from persistence import JsonFileStore
+    return dict(token_store=JsonFileStore(str(tmp_path / "oauth_tokens.json")),
+                refresh_token_store=JsonFileStore(str(tmp_path / "oauth_refresh_tokens.json")))
+
+
+def _state_text(tmp_path):
+    return (tmp_path / "oauth_tokens.json").read_text() + (tmp_path / "oauth_refresh_tokens.json").read_text()
+
+
+def test_new_tokens_are_not_stored_in_plaintext(tmp_path):
+    from oauth import OAuthProvider
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", **_stores(tmp_path))
+    access, refresh = p.issue_token_pair(client_id="c", scope="write")
+    text = _state_text(tmp_path)
+    assert access not in text and refresh not in text
+    restored = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", **_stores(tmp_path))
+    assert restored.access_token_scope(access) == "write"
+    resp, err = restored.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
+    assert err is None
+
+
+def test_plaintext_state_files_migrate_and_keep_connectors_signed_in(tmp_path):
+    import time
+    from oauth import OAuthProvider
+    old_access, old_refresh, consumed_refresh = "A" * 43, "R" * 43, "C" * 43
+    now = time.time()
+    (tmp_path / "oauth_tokens.json").write_text(json.dumps({old_access: {
+        "client_id": "claude", "scope": "mcp", "expires_at": now + 3600,
+        "resource": "https://h/claude/mcp", "family_id": "fam1"}}))
+    (tmp_path / "oauth_refresh_tokens.json").write_text(json.dumps({
+        old_refresh: {"client_id": "claude", "scope": "mcp", "resource": "https://h/claude/mcp",
+                      "family_id": "fam1", "created_at": now, "expires_at": None,
+                      "consumed": False, "consumed_at": None},
+        consumed_refresh: {"client_id": "other", "scope": "mcp", "resource": None, "family_id": "fam2",
+                           "created_at": now - 10, "expires_at": None, "consumed": True, "consumed_at": now - 5},
+    }))
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", **_stores(tmp_path))
+    # Rewritten on load: no plaintext token survives on disk.
+    text = _state_text(tmp_path)
+    for token in (old_access, old_refresh, consumed_refresh):
+        assert token not in text
+    # The connector is still signed in: its access token works for its resource...
+    assert p.access_token_scope(old_access, resource="https://h/claude/mcp") == "mcp"
+    assert p.access_token_identity(old_access) == "family:fam1"
+    # ...and its refresh token still rotates.
+    resp, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": old_refresh, "client_id": "claude"})
+    assert err is None
+    assert resp["access_token"] not in _state_text(tmp_path)
+    # Replay detection survives the migration: the rotated-away token kills its family.
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": old_refresh, "client_id": "claude"})
+    assert "reuse" in err[2]
+    assert p.access_token_scope(resp["access_token"]) is None
+    # A token already consumed before the migration is still recognised as a replay.
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": consumed_refresh})
+    assert "reuse" in err[2]
+
+
+def test_hashed_store_key_is_not_a_credential(tmp_path):
+    from oauth import OAuthProvider
+    p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", **_stores(tmp_path))
+    access, refresh = p.issue_token_pair(client_id="c", scope="write")
+    stored_access = next(iter(json.loads((tmp_path / "oauth_tokens.json").read_text())))
+    stored_refresh = next(iter(json.loads((tmp_path / "oauth_refresh_tokens.json").read_text())))
+    assert p.access_token_scope(stored_access) is None
+    _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": stored_refresh})
+    assert err[1] == "invalid_grant"
+    assert p.revoke_token(stored_refresh) is False
+    assert p.access_token_scope(access) == "write"
+
+
+def test_server_keeps_old_state_dir_connector_signed_in(make_proxy, tmp_path):
+    import time
+    state = tmp_path / "state"
+    state.mkdir()
+    token = "L" * 43
+    (state / "oauth_tokens.json").write_text(json.dumps({token: {
+        "client_id": "claude", "scope": "mcp", "expires_at": time.time() + 3600,
+        "resource": None, "family_id": "fam"}}))
+    p = make_proxy(state_dir=str(state))
+    assert token not in (state / "oauth_tokens.json").read_text()
+    resp = _call(p, "POST", "/claude/mcp", body=_rpc("initialize", {}), headers={"authorization": f"Bearer {token}"})
+    assert resp["status"] == 200
+    assert token not in (state / "mcp_sessions.json").read_text()

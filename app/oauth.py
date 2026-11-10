@@ -18,6 +18,9 @@ REFRESH_TOKEN_TTL = 0  # 0 = non-expiring
 # After it, a replay is indistinguishable from an unknown token and just returns
 # invalid_grant — fine, since any legitimate successor has long since rotated past it.
 REFRESH_REUSE_GRACE = 24 * 3600
+# Token stores are keyed by "sha256:<hex of the token>"; unprefixed keys are
+# plaintext tokens from older state files and are hashed on load.
+TOKEN_KEY_PREFIX = "sha256:"
 
 READ_SCOPES = {"read", "readonly", "read_only", "search"}
 WRITE_SCOPES = {"write"}
@@ -244,6 +247,13 @@ class OAuthProvider:
         # hostname, never netloc: netloc includes userinfo ("claude.ai@evil.example").
         return parsed.hostname or "<unknown>"
 
+    @staticmethod
+    def _token_key(token: str) -> str:
+        """Store key for a token: its SHA-256, so state files (and memory) never
+        hold a usable bearer. Every lookup hashes the presented token; a stored
+        key is not itself accepted as a token."""
+        return TOKEN_KEY_PREFIX + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
     def verify_bearer(self, candidate: str) -> bool:
         # An empty master_token means no RELIQUARY_CLAUDE_MCP_TOKEN was configured, i.e.
         # OAuth is meant to be disabled. Without this guard, compare_digest("", "") on an
@@ -327,7 +337,7 @@ class OAuthProvider:
 
     def issue_access_token(self, *, client_id: str, scope: str, resource: str | None = None, family_id: str | None = None) -> str:
         token = secrets.token_urlsafe(32)
-        self._access_tokens[token] = AccessToken(
+        self._access_tokens[self._token_key(token)] = AccessToken(
             client_id=client_id,
             scope=scope,
             expires_at=time.time() + self.access_token_ttl,
@@ -344,7 +354,7 @@ class OAuthProvider:
         resource (back-compat with clients that don't send `resource`)."""
         if not candidate:
             return False
-        key = candidate.strip()
+        key = self._token_key(candidate.strip())
         self._prune_access_tokens()
         entry = self._access_tokens.get(key)
         if entry is None:
@@ -365,7 +375,7 @@ class OAuthProvider:
         """Return the scope of a valid access token, or None if invalid/expired/unknown."""
         if not candidate:
             return None
-        key = candidate.strip()
+        key = self._token_key(candidate.strip())
         self._prune_access_tokens()
         entry = self._access_tokens.get(key)
         if entry is None:
@@ -384,13 +394,13 @@ class OAuthProvider:
         family (unchanged across refreshes), else its client. None if unknown."""
         if not candidate:
             return None
-        entry = self._access_tokens.get(candidate.strip())
+        entry = self._access_tokens.get(self._token_key(candidate.strip()))
         if entry is None:
             return None
         return f"family:{entry.family_id}" if entry.family_id else f"client:{entry.client_id}"
 
     def revoke_access_token(self, token: str | None) -> bool:
-        removed = self._access_tokens.pop((token or "").strip(), None) is not None
+        removed = self._access_tokens.pop(self._token_key((token or "").strip()), None) is not None
         if removed:
             self._persist_access_tokens()
         return removed
@@ -399,7 +409,7 @@ class OAuthProvider:
         key = (token or "").strip()
         if not key:
             return False
-        rt = self._refresh_tokens.get(key)
+        rt = self._refresh_tokens.get(self._token_key(key))
         if rt is not None:
             self._revoke_family(rt.family_id)  # drops the family's refresh + access tokens
             return True
@@ -428,7 +438,7 @@ class OAuthProvider:
         if self.fixed_client_id is not None and not self.verify_client_id(form.get("client_id") or None):
             return None, (400, "invalid_client", "client_id does not match the configured OAuth client")
         self._prune_refresh_tokens()
-        entry = self._refresh_tokens.get(presented)
+        entry = self._refresh_tokens.get(self._token_key(presented))
         if entry is None or (entry.expires_at is not None and entry.expires_at < time.time()):
             return None, (400, "invalid_grant", "invalid or expired refresh token")
         # Older clients may omit client_id on refresh, but an explicit identity
@@ -472,7 +482,10 @@ class OAuthProvider:
 
     def _load_access_tokens(self) -> None:
         now = time.time()
+        migrated = False
         for token, entry in (self._token_store.load() if self._token_store else {}).items():
+            if not token.startswith(TOKEN_KEY_PREFIX):
+                token, migrated = self._token_key(token), True  # pre-hashing state file
             try:
                 at = AccessToken(
                     client_id=entry["client_id"],
@@ -485,6 +498,8 @@ class OAuthProvider:
                 continue
             if at.expires_at >= now:
                 self._access_tokens[token] = at
+        if migrated:
+            self._persist_access_tokens()  # rewrite without the plaintext tokens
 
     def _persist_access_tokens(self) -> None:
         if self._token_store is not None:
@@ -500,7 +515,7 @@ class OAuthProvider:
         token = secrets.token_urlsafe(32)
         now = time.time()
         expires_at = (now + self.refresh_token_ttl) if self.refresh_token_ttl else None
-        self._refresh_tokens[token] = RefreshToken(
+        self._refresh_tokens[self._token_key(token)] = RefreshToken(
             client_id=client_id,
             scope=scope,
             resource=(resource or "").strip() or None,
@@ -517,7 +532,10 @@ class OAuthProvider:
 
     def _load_refresh_tokens(self) -> None:
         now = time.time()
+        migrated = False
         for token, entry in (self._refresh_token_store.load() if self._refresh_token_store else {}).items():
+            if not token.startswith(TOKEN_KEY_PREFIX):
+                token, migrated = self._token_key(token), True  # pre-hashing state file
             try:
                 rt = RefreshToken(
                     client_id=entry["client_id"],
@@ -533,6 +551,8 @@ class OAuthProvider:
                 continue
             if rt.expires_at is None or rt.expires_at >= now:
                 self._refresh_tokens[token] = rt
+        if migrated:
+            self._persist_refresh_tokens()  # rewrite without the plaintext tokens
 
     @staticmethod
     def _verify_pkce(verifier: str, challenge: str, method: str) -> bool:
