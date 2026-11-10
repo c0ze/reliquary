@@ -251,3 +251,20 @@ def test_malformed_json_bodies_elsewhere_are_400(proxy, path, headers):
     for body in (b'{"a": "\xc3"}', b"[" * 20000 + b"]" * 20000):
         resp = _call(proxy, "POST", path, body=body, headers=headers)
         assert resp["status"] == 400, (path, body[:10])
+
+
+# --- 6. protocol version negotiation -----------------------------------------
+
+
+@pytest.mark.parametrize("requested,expected", [
+    ("2024-11-05", "2024-11-05"), ("2025-03-26", "2025-03-26"), ("2025-06-18", "2025-06-18"),
+    ("2099-01-01", "2025-06-18"), (None, "2025-06-18"), ({"x": 1}, "2025-06-18"),
+])
+def test_initialize_negotiates_protocol_version(proxy, requested, expected):
+    params = {"capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}
+    if requested is not None:
+        params["protocolVersion"] = requested
+    resp = _call(proxy, "POST", "/claude/mcp", body=_rpc("initialize", params), headers=CLAUDE)
+    assert resp["status"] == 200
+    assert json.loads(resp["body"])["result"]["protocolVersion"] == expected
+    assert resp["headers"]["mcp-protocol-version"] == expected

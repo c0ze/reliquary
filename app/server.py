@@ -63,6 +63,9 @@ from retrieval_quality import apply_retrieval_quality, retrieval_candidate_limit
 
 LOG = logging.getLogger("reliquary")
 MCP_PROTOCOL_VERSION = "2025-06-18"
+# Versions an initialize request may negotiate (same JSON-over-POST surface;
+# older clients ignore the newer result fields). Unknown -> MCP_PROTOCOL_VERSION.
+SUPPORTED_MCP_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 MCP_SERVER_NAME = "reliquary"
 MCP_SERVER_VERSION = "0.5.1"
 MCP_MAX_SESSIONS = 512
@@ -929,6 +932,10 @@ class ReliquaryChatProxy:
             return
 
         if request_method == "initialize":
+            requested_version = params.get("protocolVersion")
+            negotiated_version = (
+                requested_version if requested_version in SUPPORTED_MCP_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
+            )
             session_id = secrets.token_urlsafe(24)
             self.mcp_sessions.add(session_id, profile.name)
             await self.send_json(
@@ -937,7 +944,7 @@ class ReliquaryChatProxy:
                 self.mcp_success(
                     request_id,
                     {
-                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "protocolVersion": negotiated_version,
                         "capabilities": {
                             "tools": {"listChanged": False},
                             "resources": {"listChanged": False},
@@ -952,7 +959,7 @@ class ReliquaryChatProxy:
                         },
                     },
                 ),
-                extra_headers={"Mcp-Session-Id": session_id, "MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
+                extra_headers={"Mcp-Session-Id": session_id, "MCP-Protocol-Version": negotiated_version},
             )
             return
 
