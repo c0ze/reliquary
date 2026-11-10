@@ -532,3 +532,43 @@ def test_commit_image_upload_marks_same_topic_page_stale(proxy):
 
     run(scenario())
     assert proxy.pages.get("topicpage").status == "stale"
+
+
+# 10 -- abandoned uploads are reaped on writes; lint reports orphan blobs ----
+
+def test_write_tools_reap_expired_upload_slots(proxy):
+    async def scenario():
+        slot = (await call(proxy, "reliquary_create_image_upload", {}))["structuredContent"]["upload_id"]
+        blob = (await post_bytes(proxy, slot)).json()["blob_id"]
+        proxy.pending_uploads[slot].expires_at = 1  # long past expiry
+        await call(proxy, "reliquary_add_memory", {"text": "ordinary write"})
+        return slot, blob
+
+    slot, blob = run(scenario())
+    assert slot not in proxy.pending_uploads
+    assert proxy.blobs.info(blob) is None
+
+
+def test_lint_reports_orphan_blobs_but_not_referenced_ones(make_proxy, tmp_path):
+    import base64
+
+    import lint
+
+    state = tmp_path / "state"
+    proxy = make_proxy(state_dir=str(state))
+
+    async def scenario():
+        await call(proxy, "reliquary_compile_page", {"slug": "page", "markdown": "a page"})
+        await call(proxy, "reliquary_add_image", {"caption": "owned", "image_base64": base64.b64encode(PNG).decode()})
+        slot = (await call(proxy, "reliquary_create_image_upload", {}))["structuredContent"]["upload_id"]
+        pending = (await post_bytes(proxy, slot, PNG + b"pending")).json()["blob_id"]
+        return pending
+
+    pending = run(scenario())
+    leaked = proxy.blobs.put(PNG + b"leaked").id  # a reference nobody holds
+    report = lint.build_report(compiled_dir=proxy.settings.compiled_dir, blob_dir=proxy.settings.blob_dir,
+                               dataset_path=None, min_count=8, state_dir=str(state))
+    assert [item["id"] for item in report["orphan_blobs"]] == [leaked]
+    without_state = lint.build_report(compiled_dir=proxy.settings.compiled_dir, blob_dir=proxy.settings.blob_dir,
+                                      dataset_path=None, min_count=8)
+    assert {item["id"] for item in without_state["orphan_blobs"]} == {leaked, pending}

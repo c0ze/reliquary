@@ -126,6 +126,21 @@ def hot_topics_without_synthesis(pages: Iterable[Any], stats_by_topic: dict[str,
     return out
 
 
+def orphan_blobs(blob_infos: Iterable[Any], *, page_refs: set[str], pending_refs: set[str],
+                 limit: int = 50) -> list[dict[str, Any]]:
+    """Blobs nothing references: no owning memory, no page revision, no pending
+    upload slot. Leaked references (an abandoned upload, a crash mid-write)."""
+    out: list[dict[str, Any]] = []
+    for info in blob_infos:
+        if info.owners or info.id in page_refs or info.id in pending_refs:
+            continue
+        out.append({"kind": "orphan_blob", "id": info.id, "size": info.size, "ref_count": info.ref_count,
+                    "reason": "blob has no owning memory, page revision or pending upload; candidate to remove"})
+        if len(out) >= limit:
+            break
+    return out
+
+
 def run_all(pages: Iterable[Any], *, raw_counts: dict[str, int], min_count: int,
             records: Iterable[Any] = (), stats: dict[str, Any] | None = None,
             hot_topic_min: int | None = None,

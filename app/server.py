@@ -3939,6 +3939,9 @@ class ReliquaryChatProxy:
         metadata: dict[str, Any] | None = None,
         infer: bool = False,
     ) -> Any:
+        # Reap abandoned upload slots on the write path too, not only on the
+        # next create_image_upload (cheap: a scan of the in-memory slot table).
+        self._cleanup_expired_uploads()
         async with self.memory_lock.write():
             result = await asyncio.to_thread(
                 self.memory.add,
@@ -3951,11 +3954,13 @@ class ReliquaryChatProxy:
         return result
 
     async def delete_memory(self, record_id: str) -> None:
+        self._cleanup_expired_uploads()
         async with self.memory_lock.write():
             await asyncio.to_thread(self.memory.delete, record_id)
         self._count_cache = None
 
     async def update_memory(self, record_id: str, data: str, *, metadata: dict[str, Any] | None = None) -> None:
+        self._cleanup_expired_uploads()
         async with self.memory_lock.write():
             await asyncio.to_thread(self.memory.update, record_id, data, metadata)
         self._count_cache = None

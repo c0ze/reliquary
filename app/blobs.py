@@ -163,6 +163,22 @@ class BlobStore:
             self._write_sidecar(info)
             return info
 
+    def iter_infos(self):
+        """Yield the BlobInfo of every blob with a readable sidecar."""
+        try:
+            shards = sorted(os.listdir(self.blob_dir))
+        except FileNotFoundError:
+            return
+        for shard in shards:
+            shard_path = os.path.join(self.blob_dir, shard)
+            if not os.path.isdir(shard_path):
+                continue
+            for name in sorted(os.listdir(shard_path)):
+                if name.endswith(".json") and _BLOB_ID_RE.match(name[:-5]):
+                    info = self.info(name[:-5])
+                    if info is not None:
+                        yield info
+
     def get(self, blob_id: str) -> tuple[bytes, str] | None:
         _validate_blob_id(blob_id)
         info = self.info(blob_id)

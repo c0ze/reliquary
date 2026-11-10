@@ -634,6 +634,19 @@ env var) into two additional proposal categories, alongside the existing ones:
 Both are proposals only, surfaced the same way as everything else lint reports
 (and via the `reliquary://needs-review` MCP resource) — nothing is auto-applied.
 
+Lint also reports two integrity categories, with or without stats:
+
+- **`unindexed_pages`** — current pages with no vector-index record, so search
+  never returns them; re-file them with `reliquary_compile_page`. Also listed
+  under `unindexed` in `reliquary://needs-review`.
+- **`orphan_blobs`** — blobs with no owning memory, no page revision and no
+  pending upload slot (an abandoned upload, a crash mid-write). Pass
+  `--state-dir` (or set `RELIQUARY_STATE_DIR`) so lint can see the server's
+  pending upload slots; without it, in-flight uploads are listed too.
+
+Expired upload slots are reaped on every memory write as well as on the next
+`create_image_upload`, an expired upload POST and at startup.
+
 ---
 
 ## Project context & governance

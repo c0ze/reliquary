@@ -8,7 +8,7 @@ auto-applies. Reliquary runs no internal scheduler; invoke this from external cr
     python app/lint.py [--json] [--strict]
 
 Reads RELIQUARY_COMPILED_DIR, RELIQUARY_BLOB_DIR, RELIQUARY_DATASET_PATH, RELIQUARY_LINT_COVERAGE_MIN,
-RELIQUARY_RETRIEVAL_STATS_PATH (overridable by the matching flags).
+RELIQUARY_RETRIEVAL_STATS_PATH, RELIQUARY_STATE_DIR (overridable by the matching flags).
 """
 from __future__ import annotations
 
@@ -22,17 +22,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import health  # noqa: E402
 from blobs import BlobStore  # noqa: E402
 from compiled import PageRegistry  # noqa: E402
+from persistence import JsonFileStore  # noqa: E402
 from retrieval_stats import aggregate  # noqa: E402
 
 
 def build_report(*, compiled_dir: str, blob_dir: str, dataset_path: str | None, min_count: int,
                  stats_path: str | None = None, cold_min_events: int | None = None,
-                 hot_topic_min: int | None = None) -> dict:
+                 hot_topic_min: int | None = None, state_dir: str | None = None) -> dict:
     stats = aggregate(stats_path)
+    orphan_blobs: list = []
     try:
         blobs = BlobStore(blob_dir=blob_dir, signing_key=b"lint", max_bytes=0)
         registry = PageRegistry(registry_dir=compiled_dir, blobs=blobs)
         pages = registry.list()
+        page_refs = {blob for page in pages for blob in (page.current_blob, *page.history) if blob}
+        orphan_blobs = health.orphan_blobs(blobs.iter_infos(), page_refs=page_refs,
+                                           pending_refs=_pending_upload_blobs(state_dir))
     except OSError:
         # Compiled dirs are missing or unwritable (layer not set up here) — there is
         # nothing to lint, so degrade gracefully instead of crashing under cron.
@@ -49,8 +54,18 @@ def build_report(*, compiled_dir: str, blob_dir: str, dataset_path: str | None, 
             # Surface the failure: a dropped dataset silently produces an
             # incomplete report (and a misleadingly clean --strict result).
             print(f"[lint] dataset load failed for {dataset_path!r}: {exc}", file=sys.stderr)
-    return health.run_all(pages, raw_counts=raw_counts, min_count=min_count, records=records,
-                          stats=stats, hot_topic_min=hot_topic_min, cold_min_events=cold_min_events)
+    report = health.run_all(pages, raw_counts=raw_counts, min_count=min_count, records=records,
+                            stats=stats, hot_topic_min=hot_topic_min, cold_min_events=cold_min_events)
+    report["orphan_blobs"] = orphan_blobs
+    return report
+
+
+def _pending_upload_blobs(state_dir: str | None) -> set[str]:
+    """Blob ids held by the server's persisted upload slots (not orphans)."""
+    if not state_dir:
+        return set()
+    slots = JsonFileStore(os.path.join(state_dir, "pending_uploads.json")).load()
+    return {str(rec["blob_id"]) for rec in slots.values() if isinstance(rec, dict) and rec.get("blob_id")}
 
 
 def format_report(report: dict) -> str:
@@ -73,6 +88,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--blob-dir", default=os.getenv("RELIQUARY_BLOB_DIR", "/data/blobs"))
     parser.add_argument("--dataset-path", default=os.getenv("RELIQUARY_DATASET_PATH"))
     parser.add_argument("--coverage-min", type=int, default=int(os.getenv("RELIQUARY_LINT_COVERAGE_MIN", "8")))
+    parser.add_argument("--state-dir", default=os.getenv("RELIQUARY_STATE_DIR"),
+                        help="Server state dir (RELIQUARY_STATE_DIR); its pending upload slots are not "
+                             "reported as orphan blobs.")
     parser.add_argument("--stats-path", default=os.getenv("RELIQUARY_RETRIEVAL_STATS_PATH"),
                         help="Retrieval-event JSONL written by the server (RELIQUARY_RETRIEVAL_STATS_PATH); "
                              "enables cold-record/hot-topic proposals. Unset = those checks stay empty.")
@@ -88,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     report = build_report(compiled_dir=args.compiled_dir, blob_dir=args.blob_dir,
                           dataset_path=args.dataset_path, min_count=args.coverage_min,
                           stats_path=args.stats_path, cold_min_events=args.cold_min_events,
-                          hot_topic_min=args.hot_topic_min)
+                          hot_topic_min=args.hot_topic_min, state_dir=args.state_dir)
     print(json.dumps(report, indent=2) if args.json else format_report(report))
     total = sum(len(v) for v in report.values())
     return 1 if (args.strict and total) else 0

@@ -150,7 +150,9 @@ record id or a live memory id (`slug_conflict`) and is at most 120 characters. R
 no-op). Two cron-friendly CLIs support it: `python app/lint.py` proposes refreshes
 (never applies them) — with `RELIQUARY_RETRIEVAL_STATS_PATH` set, it also proposes
 archive candidates (imported records never retrieved) and compile candidates (hot
-topics with no synthesis page) — and `python app/export_vault.py --out vault/`
+topics with no synthesis page); it also lists current pages with no index record
+(`unindexed_pages`) and blobs nothing references (`orphan_blobs`; pass
+`--state-dir` so pending uploads are not counted) — and `python app/export_vault.py --out vault/`
 exports pages to an Obsidian-style vault. See [`docs/GUIDE.md`](docs/GUIDE.md#compilation-layer).
 
 **Project context & governance.** Reliquary is a generic personal-memory tool by

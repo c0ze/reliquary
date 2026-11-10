@@ -31,7 +31,7 @@ def test_build_report_finds_stale_page(tmp_path):
     assert stale_slugs == {"old"}
     # All categories are always present.
     assert set(report.keys()) == {"stale_pages", "unindexed_pages", "coverage_gaps", "supersession", "orphans",
-                                  "cold_records", "hot_topics"}
+                                  "cold_records", "hot_topics", "orphan_blobs"}
 
 
 def test_main_strict_exit_code_nonzero_when_proposals(tmp_path):
@@ -99,7 +99,7 @@ def test_build_report_degrades_when_dirs_unwritable(tmp_path):
     )
     assert report["stale_pages"] == []
     assert set(report.keys()) == {"stale_pages", "unindexed_pages", "coverage_gaps", "supersession", "orphans",
-                                  "cold_records", "hot_topics"}
+                                  "cold_records", "hot_topics", "orphan_blobs"}
 
 
 def _write_stats_jsonl(path, events):
@@ -182,7 +182,7 @@ def test_build_report_no_stats_path_leaves_new_categories_empty(tmp_path):
     assert report["cold_records"] == []
     assert report["hot_topics"] == []
     assert set(report.keys()) == {"stale_pages", "unindexed_pages", "coverage_gaps", "supersession", "orphans",
-                                  "cold_records", "hot_topics"}
+                                  "cold_records", "hot_topics", "orphan_blobs"}
 
 
 def test_format_report_renders_cold_records_and_hot_topics(tmp_path):
