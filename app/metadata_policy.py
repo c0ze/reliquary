@@ -13,6 +13,7 @@ reachable through the advertised ``domain="dev"``.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from catalog import slugify_value
@@ -36,6 +37,20 @@ def normalize_taxonomy_value(value: Any) -> str:
     (e.g. Japanese) are kept, stripped and lowercased, instead of vanishing."""
     text = str(value).strip()
     return slugify_value(text) or text.lower()
+
+
+def taxonomy_match_keys(value: Any) -> frozenset[str]:
+    """Keys under which a stored taxonomy value matches another: its slug form
+    and the ASCII-only slug that versions before Unicode-aware slugs stored.
+    Every historical spelling of one value shares a key ("Work Notes" and
+    "work-notes"; "Günlük", "günlük" and "g-nl-k"), so values match when their
+    key sets intersect. Distinct non-ASCII values can share an ASCII key
+    ("日記 notes", "旅行 notes"); that only errs towards a match."""
+    text = str(value or "").strip()
+    if not text:
+        return frozenset()
+    ascii_slug = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
+    return frozenset(key for key in (normalize_taxonomy_value(text), ascii_slug) if key)
 
 
 def normalize_taxonomy(metadata: dict[str, Any]) -> dict[str, Any]:

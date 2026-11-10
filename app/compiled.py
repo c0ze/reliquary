@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass, field
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
+from metadata_policy import taxonomy_match_keys
 from persistence import atomic_write
 
 try:
@@ -317,13 +318,16 @@ class PageRegistry:
                             topic: str | None = None) -> "list[PageInfo]":
         """Pages whose synthesis derives from any of ``ids``. Pages that declare
         no ``derived_from`` at all fall back to a ``domain`` AND ``topic`` match;
-        a page that declares its sources is judged on them alone (#69)."""
+        a page that declares its sources is judged on them alone (#69). Taxonomy
+        compares on match keys, so pages filed under an older spelling match."""
         idset = set(ids)
+        domain_keys, topic_keys = taxonomy_match_keys(domain), taxonomy_match_keys(topic)
         out = []
         for info in self._iter_pages():
             if idset and idset.intersection(info.derived_from or ()):
                 out.append(info)
-            elif not info.derived_from and domain and topic \
-                    and info.domain == domain and info.topic == topic:
+            elif not info.derived_from and domain_keys and topic_keys \
+                    and domain_keys & taxonomy_match_keys(info.domain) \
+                    and topic_keys & taxonomy_match_keys(info.topic):
                 out.append(info)
         return out

@@ -143,7 +143,10 @@ page with `reliquary_compile_page` (Reliquary never generates prose); it is stor
 revision in the blob store, indexed into a **separate Qdrant collection**, and
 cited back to its source memories via `derived_from`. Search then leads with a
 relevant *current* synthesis and surfaces raw memories as its evidence. New raw
-writes flag dependent pages `stale` (a queued suggestion, never an auto-rewrite).
+writes flag dependent pages `stale` (a queued suggestion, never an auto-rewrite);
+a page without `derived_from` depends on writes with its domain and topic, in
+any spelling an older version stored (`Work Notes` = `work-notes`, `g-nl-k` =
+`günlük`).
 Inspect pages with `reliquary_list_pages` / `reliquary_page_history` (the latter
 reports per-revision timestamp + status), archive a page by re-filing it with
 `status=archived`, or permanently remove one with `reliquary_delete_page`. A re-file

@@ -16,7 +16,7 @@ from typing import Any
 os.environ.setdefault("MEM0_TELEMETRY", "false")
 
 from catalog import slugify_value  # noqa: E402
-from metadata_policy import honours_import_id  # noqa: E402
+from metadata_policy import honours_import_id, taxonomy_match_keys  # noqa: E402
 
 
 IMPORT_BOOKKEEPING_KEYS = {"import_record_id", "import_content_hash", "source_group"}
@@ -135,6 +135,12 @@ def existing_import_index(memory: Any, *, user_id: str) -> dict[str, dict[str, A
     return index
 
 
+def _taxonomy_pairs(domain: Any, topic: Any) -> set[tuple[str, str]]:
+    """(domain, topic) match-key pairs, so a page filed under an older spelling
+    of either value ("Work Notes", "g-nl-k") meets the slugs imports store."""
+    return {(d, t) for d in taxonomy_match_keys(domain) for t in taxonomy_match_keys(topic)}
+
+
 def _fan_out_bulk(page_registry, touched_ids: set[str], touched_tax: set) -> None:
     """One-pass staleness fan-out after a bulk import (avoids O(records*pages))."""
     try:
@@ -143,7 +149,7 @@ def _fan_out_bulk(page_registry, touched_ids: set[str], touched_tax: set) -> Non
             # the domain+topic fallback applies only to provenance-less pages (#69).
             if (touched_ids & set(page.derived_from or [])) or (
                 not page.derived_from
-                and page.domain and page.topic and (page.domain, page.topic) in touched_tax
+                and not touched_tax.isdisjoint(_taxonomy_pairs(page.domain, page.topic))
             ):
                 page_registry.set_status(page.slug, "stale")
     except Exception as exc:
@@ -188,18 +194,12 @@ def ingest_records(
             memory.update(previous["id"], item["text"], metadata)
             summary["updated"] += 1
             touched_ids.add(str(item["id"]))
-            d = str(metadata.get("domain") or "")
-            t = str(metadata.get("topic") or "")
-            if d and t:
-                touched_tax.add((d, t))
+            touched_tax |= _taxonomy_pairs(metadata.get("domain"), metadata.get("topic"))
             continue
         memory.add(item["text"], user_id=user_id, metadata=metadata, infer=infer)
         summary["added"] += 1
         touched_ids.add(str(item["id"]))
-        d = str(metadata.get("domain") or "")
-        t = str(metadata.get("topic") or "")
-        if d and t:
-            touched_tax.add((d, t))
+        touched_tax |= _taxonomy_pairs(metadata.get("domain"), metadata.get("topic"))
 
     if page_registry is not None and (touched_ids or touched_tax):
         _fan_out_bulk(page_registry, touched_ids, touched_tax)

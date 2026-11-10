@@ -211,3 +211,70 @@ def test_list_pages_domain_filter_accepts_either_spelling(proxy):
         assert {page["slug"] for page in pages} == {"new-page", "old-page"}
     pages = _tool(proxy, "reliquary_list_pages", {"domain": "work-notes"})["structuredContent"]["pages"]
     assert {page["slug"] for page in pages} == {"new-page"}
+
+
+# --- 6. staleness matches legacy page taxonomy spellings ----------------------
+
+
+def test_taxonomy_match_keys_join_every_historical_spelling():
+    from metadata_policy import taxonomy_match_keys
+
+    def same(a, b):
+        return bool(taxonomy_match_keys(a) & taxonomy_match_keys(b))
+
+    assert same("Work Notes", "work-notes")
+    for a in ("Günlük", "günlük", "g-nl-k"):
+        for b in ("Günlük", "günlük", "g-nl-k"):
+            assert same(a, b), (a, b)
+    assert same("Straße", "strasse")
+    assert same("日記", "日記")
+    assert not same("日記", "旅行")
+    assert not same("work-notes", "home-lab")
+    assert taxonomy_match_keys(None) == frozenset() == taxonomy_match_keys("  ")
+
+
+def test_registry_matches_legacy_page_spellings(proxy):
+    pages = proxy.pages
+    pages.put_revision("raw", "b", {"domain": "Work Notes", "topic": "Home Lab"})
+    pages.put_revision("old-slug", "b", {"domain": "g-nl-k", "topic": "home-lab"})
+    pages.put_revision("other", "b", {"domain": "work-notes", "topic": "garden"})
+    pages.put_revision("sourced", "b", {"domain": "work-notes", "topic": "home-lab", "derived_from": ["x"]})
+    assert {p.slug for p in pages.pages_deriving_from(domain="work-notes", topic="home-lab")} == {"raw"}
+    assert {p.slug for p in pages.pages_deriving_from(domain="günlük", topic="Home Lab")} == {"old-slug"}
+
+
+def test_new_write_marks_a_legacy_raw_page_stale(proxy):
+    proxy.pages.put_revision("legacy", "b", {"domain": "Work Notes", "topic": "Home Lab"})
+    _tool(proxy, "reliquary_add_memory", {"text": "A new note", "domain": "Work Notes", "topic": "Home Lab"})
+    assert proxy.pages.get("legacy").status == "stale"
+
+
+def test_updating_a_legacy_memory_marks_a_new_page_stale(proxy):
+    legacy_id = proxy.memory.add("Old note", user_id="my_lord", metadata={
+        "domain": "Günlük", "topic": "Home Lab", "source_group": "user-write"})["results"][0]["id"]
+    _tool(proxy, "reliquary_compile_page", {"slug": "fresh", "title": "Fresh", "markdown": "b",
+                                            "domain": "Günlük", "topic": "Home Lab"})
+    assert proxy.pages.get("fresh").domain == "günlük" and proxy.pages.get("fresh").status == "current"
+    result = _tool(proxy, "reliquary_update", {"id": legacy_id, "text": "Old note, edited"})
+    assert not result.get("isError"), result
+    assert proxy.pages.get("fresh").status == "stale"
+
+
+def test_ingest_fan_out_matches_legacy_page_spellings(tmp_path):
+    from blobs import BlobStore
+    from compiled import PageRegistry
+    from ingest import ingest_records
+    from conftest import FakeMemory
+
+    registry = PageRegistry(registry_dir=str(tmp_path / "compiled"),
+                            blobs=BlobStore(blob_dir=str(tmp_path / "blobs"), signing_key=b"k", max_bytes=0))
+    registry.put_revision("old-slug", "b", {"domain": "g-nl-k", "topic": "home-lab"})
+    registry.put_revision("raw", "b", {"domain": "Work Notes", "topic": "Home Lab"})
+    registry.put_revision("unrelated", "b", {"domain": "garden", "topic": "home-lab"})
+    ingest_records(FakeMemory(), [
+        {"id": "r1", "text": "t1", "metadata": {"domain": "Günlük", "topic": "Home Lab"}},
+        {"id": "r2", "text": "t2", "metadata": {"domain": "work notes", "topic": "home lab"}},
+    ], user_id="u", page_registry=registry)
+    assert registry.get("old-slug").status == "stale"
+    assert registry.get("raw").status == "stale"
+    assert registry.get("unrelated").status == "current"
