@@ -362,6 +362,13 @@ taxonomy value that was not already a slug, are rewritten (and re-embedded)
 once; the rest are skipped. Their content hash is unchanged, so compiled pages
 are not marked stale by it.
 
+Earlier versions added every record on every run unless `--incremental` was
+given, so a collection can hold several copies of one record. An incremental
+run brings every copy to the record's current text and metadata (it deletes
+none) and treats a record as unchanged only when all its copies are, so an old
+copy cannot surface an outdated snippet; the summary line counts the duplicate
+copies it found. To get rid of them, re-import into an empty collection.
+
 > ⚠️ **The embedder defines the vector space.** If you change the embedding model
 > (or its dimensions), existing vectors become incomparable — **re-ingest** the
 > whole corpus afterwards.

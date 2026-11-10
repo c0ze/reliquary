@@ -278,3 +278,89 @@ def test_ingest_fan_out_matches_legacy_page_spellings(tmp_path):
     assert registry.get("old-slug").status == "stale"
     assert registry.get("raw").status == "stale"
     assert registry.get("unrelated").status == "current"
+
+
+# --- 7. incremental ingest reconciles every copy of an import -----------------
+
+
+def _seed_copies(memory, record, *, source_groups=("imported", None)):
+    """Copies of one import as repeated --no-incremental runs left them; None is
+    an import from before source_group existed."""
+    from ingest import import_metadata
+
+    ids = []
+    for group in source_groups:
+        metadata = import_metadata(record)
+        if group is None:
+            metadata.pop("source_group")
+        ids.append(memory.add(record["text"], user_id="u", metadata=metadata)["results"][0]["id"])
+    return ids
+
+
+def test_ingest_updates_every_duplicate_copy_of_a_changed_import():
+    from conftest import FakeMemory
+    from ingest import ingest_records
+
+    memory = FakeMemory()
+    ids = _seed_copies(memory, {"id": "r", "text": "Lives in Tokyo", "metadata": {"title": "Home"}})
+    forged = memory.add("Lives in Tokyo", user_id="u", metadata={
+        "import_record_id": "r", "source_group": "user-write"})["results"][0]["id"]
+    changed = {"id": "r", "text": "Lives in Osaka", "metadata": {"title": "Home"}}
+    summary = ingest_records(memory, [changed], user_id="u")
+    assert summary == {"selected": 1, "added": 0, "updated": 1, "skipped": 0, "duplicates": 1}
+    assert [memory.get(i)["memory"] for i in ids] == ["Lives in Osaka", "Lives in Osaka"]
+    assert memory.get(forged)["memory"] == "Lives in Tokyo"  # not a trusted copy
+    again = ingest_records(memory, [changed], user_id="u")
+    assert again == {"selected": 1, "added": 0, "updated": 0, "skipped": 1, "duplicates": 1}
+
+
+def test_ingest_does_not_skip_an_import_whose_copies_disagree():
+    from conftest import FakeMemory
+    from ingest import ingest_records
+
+    memory = FakeMemory()
+    current = {"id": "r", "text": "Lives in Osaka", "metadata": {}}
+    stale_id, = _seed_copies(memory, {"id": "r", "text": "Lives in Tokyo", "metadata": {}}, source_groups=(None,))
+    current_id, = _seed_copies(memory, current, source_groups=("imported",))
+    updates = []
+    original_update = memory.update
+    memory.update = lambda mid, data, metadata=None: updates.append(mid) or original_update(mid, data, metadata)
+    summary = ingest_records(memory, [current], user_id="u")
+    assert summary["updated"] == 1 and summary["skipped"] == 0 and summary["duplicates"] == 1
+    assert updates == [stale_id]
+    assert memory.get(stale_id)["memory"] == memory.get(current_id)["memory"] == "Lives in Osaka"
+
+
+def test_interrupted_duplicate_reconciliation_finishes_on_the_next_run():
+    import pytest
+    from conftest import FakeMemory
+    from ingest import ingest_records
+
+    memory = FakeMemory()
+    first, second = _seed_copies(memory, {"id": "r", "text": "Lives in Tokyo", "metadata": {}})
+    changed = {"id": "r", "text": "Lives in Osaka", "metadata": {}}
+    original_update = memory.update
+
+    def flaky(mid, data, metadata=None):
+        if mid == second:
+            raise RuntimeError("backend went away")
+        return original_update(mid, data, metadata)
+
+    memory.update = flaky
+    with pytest.raises(RuntimeError):
+        ingest_records(memory, [changed], user_id="u")
+    memory.update = original_update
+    summary = ingest_records(memory, [changed], user_id="u")
+    assert summary["updated"] == 1
+    assert memory.get(first)["memory"] == memory.get(second)["memory"] == "Lives in Osaka"
+
+
+def test_import_index_keeps_every_trusted_copy():
+    from conftest import FakeMemory
+    from ingest import existing_import_index
+
+    memory = FakeMemory()
+    ids = _seed_copies(memory, {"id": "r", "text": "t", "metadata": {}})
+    index = existing_import_index(memory, user_id="u")
+    assert index["r"]["id"] == ids[0]
+    assert [copy["id"] for copy in index["r"]["copies"]] == ids
