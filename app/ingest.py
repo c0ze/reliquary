@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from metadata_policy import honours_import_id
+
 
 IMPORT_BOOKKEEPING_KEYS = {"import_record_id", "import_content_hash", "source_group"}
 
@@ -60,7 +62,9 @@ def existing_import_index(memory: Any, *, user_id: str) -> dict[str, dict[str, A
     index: dict[str, dict[str, Any]] = {}
     for hit in _memory_results(result):
         metadata = hit.get("metadata") or {}
-        import_id = metadata.get("import_record_id")
+        # A user-write or compiled page may carry a forged import_record_id;
+        # mapping it would make the import overwrite or skip the wrong vector.
+        import_id = metadata.get("import_record_id") if honours_import_id(metadata) else None
         memory_id = hit.get("id")
         if not import_id or not memory_id:
             continue

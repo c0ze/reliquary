@@ -24,6 +24,7 @@ import health
 from ingest import load_config
 from oauth import OAuthProvider, RegistrationDisabledError, scope_is_write
 from catalog import CorpusCatalog
+from metadata_policy import caller_kind, clean_caller_metadata, honours_import_id, normalize_taxonomy
 from persistence import JsonFileStore
 from runtime import AsyncRWLock, MCPSessionStore, native_hybrid_active, reads_can_be_concurrent
 from blobs import BlobStore, BlobTooLarge
@@ -1055,15 +1056,15 @@ class ReliquaryChatProxy:
                 from context import resolve_context
                 ctx = resolve_context(tool_arguments, headers)
                 result = await self.call_mcp_tool(profile, tool_name, tool_arguments, can_write=can_write, context=ctx)
-                self.metrics.record_tool(tool_name, ok=not result.get("isError"))
+                self.metrics.record_tool(self._metric_tool_name(profile, tool_name), ok=not result.get("isError"))
                 if category == "write" and not result.get("isError"):
                     structured = result.get("structuredContent") or {}
                     try:
                         self.audit.record(
                             action=tool_name,
                             endpoint=profile.name,
-                            user_id=tool_arguments.get("user_id") or self.settings.user_id,
-                            ids={k: structured.get(k) for k in ("ids", "id", "memory_id", "blob_id", "deleted", "updated") if k in structured},
+                            user_id=self._audit_user_id(tool_name, tool_arguments, structured),
+                            ids={k: structured.get(k) for k in ("ids", "id", "memory_id", "blob_id", "deleted", "updated", "slug") if k in structured},
                         )
                     except Exception:
                         # The write already committed; an unwritable audit path
@@ -1084,6 +1085,28 @@ class ReliquaryChatProxy:
             self.mcp_error(request_id, -32601, f"Method not found: {request_method}"),
             extra_headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
         )
+
+    # Claude-endpoint writes whose handlers honour a caller user_id override
+    # (allow_user_id=True in _dispatch_mcp_tool). Every other write runs as the
+    # default user: the lean endpoint ignores caller ids, pages are global.
+    _USER_SCOPED_WRITE_TOOLS = frozenset({
+        "reliquary_add_memory", "reliquary_delete", "reliquary_update", "reliquary_add_image",
+        "reliquary_delete_image", "reliquary_commit_image_upload", "reliquary_propose_update",
+    })
+
+    def _metric_tool_name(self, profile: EndpointProfile, tool_name: str) -> str:
+        """Metric label for a call: names that are not tools of this endpoint
+        collapse to "unknown", so callers cannot mint unbounded series."""
+        known = {tool["name"] for tool in self.mcp_tools_for(profile, can_write=True)}
+        return tool_name if tool_name in known else "unknown"
+
+    def _audit_user_id(self, tool_name: str, arguments: dict[str, Any], structured: dict[str, Any]) -> str:
+        """The user a successful write really ran as, for the audit log."""
+        if structured.get("user_id"):
+            return str(structured["user_id"])
+        if tool_name in self._USER_SCOPED_WRITE_TOOLS and arguments.get("user_id"):
+            return str(arguments["user_id"])
+        return self.settings.user_id
 
     @staticmethod
     def _tool_category(tool_name: str) -> str:
@@ -2354,13 +2377,15 @@ class ReliquaryChatProxy:
                 structured={"error": "invalid_metadata"},
                 is_error=True,
             )
+        metadata = clean_caller_metadata(metadata)
         metadata.setdefault("source", str(arguments.get("source") or "mcp"))
-        metadata.setdefault("kind", str(arguments.get("kind") or "memory_note"))
+        metadata.setdefault("kind", caller_kind(arguments.get("kind")))
         metadata["source_group"] = "user-write"
         for key in ("title", "source_ref", "domain", "hall", "room", "topic"):
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 metadata[key] = str(value).strip()
+        normalize_taxonomy(metadata)
 
         result = await self.add_memory(text, user_id=user_id, metadata=metadata, infer=infer)
         new_ids = added_memory_ids(result)
@@ -2444,6 +2469,7 @@ class ReliquaryChatProxy:
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 frontmatter[key] = str(value).strip()
+        normalize_taxonomy(frontmatter)
         try:
             info = await asyncio.to_thread(self.pages.put_revision, slug, markdown, frontmatter)
         except BlobTooLarge as exc:
@@ -2678,11 +2704,12 @@ class ReliquaryChatProxy:
         )
         self._save_pending_uploads()
         upload_url = self._absolute_url(f"/uploads/{upload_id}")
+        commit_tool = "commit_image_upload" if profile and profile.name == "openai" else "reliquary_commit_image_upload"
         return self.mcp_tool_result(
             text=(
                 f"Created upload slot {upload_id}. POST the raw bytes to {upload_url} with the SAME "
                 "`Authorization: Bearer <token>` header you use for this MCP endpoint (anonymous "
-                "uploads are rejected), then call commit_image_upload with the upload_id and caption."
+                f"uploads are rejected), then call {commit_tool} with the upload_id and caption."
             ),
             structured={
                 "upload_id": upload_id,
@@ -2878,7 +2905,7 @@ class ReliquaryChatProxy:
                 structured={"error": "invalid_metadata"},
                 is_error=True,
             )
-        metadata = dict(raw_metadata)
+        metadata = clean_caller_metadata(raw_metadata)
         metadata.setdefault("source", "mcp")
         metadata["kind"] = "image"
         metadata["source_group"] = "user-write"
@@ -2890,6 +2917,7 @@ class ReliquaryChatProxy:
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 metadata[key] = str(value).strip()
+        normalize_taxonomy(metadata)
 
         self._busy_uploads.add(upload_id)
         try:
@@ -3039,7 +3067,7 @@ class ReliquaryChatProxy:
                 structured={"error": "invalid_metadata"},
                 is_error=True,
             )
-        metadata = dict(raw_metadata)
+        metadata = clean_caller_metadata(raw_metadata)
 
         fetched_mimetype: str | None = None
         if has_url:
@@ -3086,6 +3114,7 @@ class ReliquaryChatProxy:
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 metadata[key] = str(value).strip()
+        normalize_taxonomy(metadata)
 
         try:
             result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)
@@ -3353,12 +3382,14 @@ class ReliquaryChatProxy:
         existing_metadata = existing.get("metadata") or {}
         metadata = dict(existing_metadata)
         if isinstance(provided_metadata, dict):
-            metadata.update(provided_metadata)
+            metadata.update(clean_caller_metadata(provided_metadata))
         for key in ("source_group", "kind", "blob_ref", "blob_mime", "blob_size"):
             if key in existing_metadata:
                 metadata[key] = existing_metadata[key]
             else:
                 metadata.pop(key, None)
+        for key in ("import_record_id", "import_content_hash"):
+            metadata.pop(key, None)  # never valid on a user-write (pre-fix forgeries)
         metadata["source_group"] = "user-write"
         await self.update_memory(record_id, new_text, metadata=metadata)
         self._fan_out_staleness([record_id], existing_metadata)
@@ -3371,7 +3402,12 @@ class ReliquaryChatProxy:
 
     def _enrich_hit(self, hit: dict[str, Any], *, route: str) -> dict[str, Any]:
         metadata = dict(hit.get("metadata") or {})
-        record_id = str(metadata.get("import_record_id") or hit.get("id") or metadata.get("source_ref") or "")
+        import_id = metadata.get("import_record_id") if honours_import_id(metadata) else None
+        if import_id and not (self.catalog and str(import_id) in self.catalog.records_by_id):
+            # fetch resolves import ids only through the catalog; hand out the
+            # memory id instead (still read-only: update/delete refuse imports).
+            import_id = None
+        record_id = str(import_id or hit.get("id") or metadata.get("source_ref") or "")
         record = self.catalog.records_by_id.get(record_id) if self.catalog else None
         title = str(metadata.get("title") or (record.title if record else "<untitled>"))
         text = str(hit.get("memory") or (record.text if record else "")).strip()
@@ -3389,7 +3425,10 @@ class ReliquaryChatProxy:
     def _document_url(self, record_id: str, metadata: dict[str, Any]) -> str:
         blob_ref = metadata.get("blob_ref")
         if isinstance(blob_ref, str) and blob_ref:
-            return self._signed_blob_url(blob_ref)
+            try:
+                return self._signed_blob_url(blob_ref)
+            except ValueError:
+                pass  # malformed blob_ref (forged before caller metadata was cleaned)
         source_url = metadata.get("source_url")
         if isinstance(source_url, str) and source_url.startswith(("http://", "https://")):
             return source_url
@@ -3408,7 +3447,8 @@ class ReliquaryChatProxy:
         if not isinstance(result, dict):
             return None
         metadata = dict(result.get("metadata") or {})
-        title = str(metadata.get("title") or result.get("memory") or "<untitled>").strip() or "<untitled>"
+        # Same fallback as search: the body is never reused as the title.
+        title = str(metadata.get("title") or "").strip() or "<untitled>"
         memory_text = str(result.get("memory") or "").strip()
         return {
             "id": str(result.get("id") or record_id),

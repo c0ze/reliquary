@@ -110,6 +110,13 @@ response echoes the applied `filters`.
 > id. It only deletes memories **written through this server** — imported corpus
 > records are protected, so an agent can't erase your curated corpus. `add_memory`
 > returns the new id so a write can be undone without a search.
+>
+> Write tools drop server-managed keys from caller `metadata` (`blob_ref`,
+> `blob_mime`, `blob_size`, `import_record_id`, `import_content_hash`,
+> `source_group`, `upload_id`) and the reserved kinds `image`, `synthesis`,
+> `correction` and `live_chat_turn`. `domain`/`hall`/`room`/`topic` are stored in
+> the catalog's slug form (`"Dev Tools"` → `dev-tools`), so the advertised filter
+> values reach them.
 
 ### Binary image uploads
 

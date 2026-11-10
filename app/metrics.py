@@ -6,6 +6,11 @@ import threading
 import time
 
 
+def _label(value: str) -> str:
+    """Escape a label value per the Prometheus text format."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 class Metrics:
     def __init__(self, clock=time.time) -> None:
         self._clock = clock
@@ -33,7 +38,7 @@ class Metrics:
             rate_limited = self._rate_limited
             uptime = self._clock() - self._started
         for (tool, status), count in items:
-            lines.append(f'reliquary_tool_calls_total{{tool="{tool}",status="{status}"}} {count}')
+            lines.append(f'reliquary_tool_calls_total{{tool="{_label(tool)}",status="{_label(status)}"}} {count}')
         lines += [
             "# HELP reliquary_rate_limited_total Requests rejected by the rate limiter.",
             "# TYPE reliquary_rate_limited_total counter",
