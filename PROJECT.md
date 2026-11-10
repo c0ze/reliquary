@@ -103,5 +103,6 @@ reference it holds as an `upload:<upload_id>` owner in the blob's sidecar
 commit. A build older than this one misreads that marker: it treats the upload
 as already committed and never reclaims its bytes. Before starting an older
 build, let pending uploads commit or expire (a slot lives at most the upload
-TTL, 10 minutes), or remove the `upload:` entries from the sidecars' `owners`
+TTL, 10 minutes, unless its commit outcome could not be read and it is kept for
+a retry: check that `pending_uploads.json` is empty), or remove the `upload:` entries from the sidecars' `owners`
 by hand without changing `ref_count`.
