@@ -24,7 +24,7 @@ import health
 from ingest import load_config
 from oauth import OAuthProvider, RegistrationDisabledError, scope_is_write
 from catalog import CorpusCatalog
-from metadata_policy import caller_kind, clean_caller_metadata, honours_import_id
+from metadata_policy import caller_kind, clean_caller_metadata, honours_import_id, normalize_taxonomy
 from persistence import JsonFileStore
 from runtime import AsyncRWLock, MCPSessionStore, native_hybrid_active, reads_can_be_concurrent
 from blobs import BlobStore, BlobTooLarge
@@ -2385,6 +2385,7 @@ class ReliquaryChatProxy:
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 metadata[key] = str(value).strip()
+        normalize_taxonomy(metadata)
 
         result = await self.add_memory(text, user_id=user_id, metadata=metadata, infer=infer)
         new_ids = added_memory_ids(result)
@@ -2468,6 +2469,7 @@ class ReliquaryChatProxy:
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 frontmatter[key] = str(value).strip()
+        normalize_taxonomy(frontmatter)
         try:
             info = await asyncio.to_thread(self.pages.put_revision, slug, markdown, frontmatter)
         except BlobTooLarge as exc:
@@ -2915,6 +2917,7 @@ class ReliquaryChatProxy:
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 metadata[key] = str(value).strip()
+        normalize_taxonomy(metadata)
 
         self._busy_uploads.add(upload_id)
         try:
@@ -3111,6 +3114,7 @@ class ReliquaryChatProxy:
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 metadata[key] = str(value).strip()
+        normalize_taxonomy(metadata)
 
         try:
             result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)

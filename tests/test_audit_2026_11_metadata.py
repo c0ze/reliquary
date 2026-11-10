@@ -331,3 +331,57 @@ def test_titled_user_write_keeps_its_title(proxy):
                {"text": "body", "title": "My note"})["structuredContent"]["ids"][0]
     assert call(proxy, "claude", "reliquary_fetch", {"id": mid})["structuredContent"]["title"] == "My note"
     assert "My note" in call(proxy, "claude", "reliquary_delete", {"id": mid})["content"][0]["text"]
+
+
+# --- 7. taxonomy values are normalised on write -------------------------------
+
+def test_add_memory_normalises_taxonomy_like_the_catalog(proxy):
+    proxy.catalog = CorpusCatalog([CorpusRecord("x1", "t", "body", {"domain": "dev"}, "")])
+    result = call(proxy, "claude", "reliquary_add_memory",
+                  {"text": "note filed by an agent", "domain": "Dev", "hall": " Main Hall ",
+                   "metadata": {"room": "Server Room", "topic": "Home_Lab"}})
+    stored = proxy.memory._store[result["structuredContent"]["ids"][0]]["metadata"]
+    assert (stored["domain"], stored["hall"], stored["room"], stored["topic"]) == \
+        ("dev", "main-hall", "server-room", "home-lab")
+    hits = call(proxy, "claude", "reliquary_search", {"query": "note", "domain": "dev"})["structuredContent"]["results"]
+    assert len(hits) == 1
+
+
+def test_lean_add_memory_normalises_topic(proxy):
+    result = call(proxy, "openai", "add_memory", {"text": "note", "topic": "Home Lab"})
+    stored = proxy.memory._store[result["structuredContent"]["ids"][0]]["metadata"]
+    assert stored["topic"] == "home-lab"
+
+
+def test_non_ascii_taxonomy_value_is_kept_lowercased(proxy):
+    result = call(proxy, "claude", "reliquary_add_memory", {"text": "note", "topic": "日本"})
+    stored = proxy.memory._store[result["structuredContent"]["ids"][0]]["metadata"]
+    assert stored["topic"] == "日本"
+
+
+def test_update_and_image_paths_normalise_taxonomy(proxy):
+    mid = call(proxy, "claude", "reliquary_add_memory", {"text": "note"})["structuredContent"]["ids"][0]
+    call(proxy, "claude", "reliquary_update", {"id": mid, "text": "note v2", "metadata": {"domain": "Dev"}})
+    assert proxy.memory._store[mid]["metadata"]["domain"] == "dev"
+    image = call(proxy, "claude", "reliquary_add_image",
+                 {"image_base64": base64.b64encode(PNG).decode(), "caption": "photo", "domain": "Dev",
+                  "metadata": {"topic": "Home Lab"}})["structuredContent"]
+    stored = proxy.memory._store[image["memory_id"]]["metadata"]
+    assert (stored["domain"], stored["topic"]) == ("dev", "home-lab")
+    slot = _uploaded_slot(proxy, "claude")
+    committed = call(proxy, "claude", "reliquary_commit_image_upload",
+                     {"upload_id": slot["upload_id"], "caption": "photo 2", "domain": "Dev",
+                      "metadata": {"topic": "Home Lab"}})["structuredContent"]
+    stored = proxy.memory._store[committed["memory_id"]]["metadata"]
+    assert (stored["domain"], stored["topic"]) == ("dev", "home-lab")
+
+
+def test_compile_page_normalises_taxonomy_so_staleness_matches(proxy):
+    result = call(proxy, "claude", "reliquary_compile_page",
+                  {"slug": "dev-notes", "markdown": "summary", "domain": "Dev", "topic": "Home Lab"})
+    assert not result["isError"]
+    page = proxy.pages.get("dev-notes")
+    assert (page.domain, page.topic) == ("dev", "home-lab")
+    # A provenance-less page goes stale when a source with the same taxonomy changes.
+    call(proxy, "claude", "reliquary_add_memory", {"text": "new fact", "domain": "DEV", "topic": "home lab"})
+    assert proxy.pages.get("dev-notes").status == "stale"

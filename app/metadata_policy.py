@@ -5,11 +5,17 @@ bookkeeping, upload slots, the record's source group) and some ``kind`` values
 mark records the server creates through dedicated paths. Callers must not be
 able to set either: a forged ``blob_ref`` breaks every read of the record, and a
 forged ``import_record_id`` makes a user-write pass for an imported record.
+
+Taxonomy values (domain/hall/room/topic) are normalised the same way the
+catalog normalises them for routing, so a write with ``domain="Dev"`` is
+reachable through the advertised ``domain="dev"``.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+from catalog import slugify_value
 
 # Keys only the server sets. Server-side paths stamp them after the caller's
 # metadata has been cleaned, so their own values still get through.
@@ -21,7 +27,24 @@ SYSTEM_METADATA_KEYS = frozenset({
 })
 # kind values the server assigns through dedicated tools.
 RESERVED_KINDS = frozenset({"image", "synthesis", "correction", "live_chat_turn"})
+TAXONOMY_KEYS = ("domain", "hall", "room", "topic")
 DEFAULT_KIND = "memory_note"
+
+
+def normalize_taxonomy_value(value: Any) -> str:
+    """Slug form used by the catalog; values with no ASCII letters or digits
+    (e.g. Japanese) are kept, stripped and lowercased, instead of vanishing."""
+    text = str(value).strip()
+    return slugify_value(text) or text.lower()
+
+
+def normalize_taxonomy(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Normalise taxonomy string values in place; returns ``metadata``."""
+    for key in TAXONOMY_KEYS:
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            metadata[key] = normalize_taxonomy_value(value)
+    return metadata
 
 
 def is_reserved_kind(value: Any) -> bool:
@@ -36,11 +59,11 @@ def caller_kind(value: Any) -> str:
 
 def clean_caller_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     """A copy of caller-supplied metadata without system-managed keys or a
-    reserved ``kind``."""
+    reserved ``kind``, with taxonomy values normalised."""
     cleaned = {key: value for key, value in metadata.items() if key not in SYSTEM_METADATA_KEYS}
     if "kind" in cleaned and is_reserved_kind(cleaned["kind"]):
         del cleaned["kind"]
-    return cleaned
+    return normalize_taxonomy(cleaned)
 
 
 def honours_import_id(metadata: dict[str, Any]) -> bool:
