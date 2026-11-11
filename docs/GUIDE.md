@@ -733,7 +733,12 @@ Lint also reports two integrity categories, with or without stats:
 
 Expired upload slots are reaped by a background pass that startup, memory
 writes, new upload slots and expired upload POSTs or commits start; no request
-waits for it, and shutdown cancels it. Uploaded bytes are only released or
+waits for it, and shutdown cancels it (a lookup still blocked in the memory
+backend after a short grace period is left running and applies nothing; its
+slots are settled after the next start). Slot creation, the upload POST and
+each commit attempt first persist the slot table; if that write fails they
+change nothing and answer `state_write_failed` (HTTP 503 for the POST), so
+retry once storage recovers. Uploaded bytes are only released or
 handed to a caption when their owner is certain; otherwise they are kept (lint
 reports the leak). A slot whose commit never started is released at expiry. A
 slot whose commit was attempted is first checked for a caption carrying its
