@@ -652,4 +652,3 @@ def test_lifespan_shutdown_cancels_a_hung_settling_pass(make_proxy, tmp_path, mo
     assert elapsed < 2.0
     assert task.done() and task.cancelled()
     assert slot in proxy.pending_uploads  # unresolved: settled after the next start
-
