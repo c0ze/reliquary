@@ -50,14 +50,14 @@ explicitly configured):
 
 | Environment variable | Purpose |
 |---|---|
-| `RELIQUARY_AUDIT_LOG` | Append-only JSONL log of every successful write (add/update/delete). Path to file; unset = disabled. |
-| `RELIQUARY_RATE_LIMIT_WRITES` | Max write tool calls per token per minute (`0` = unlimited). |
-| `RELIQUARY_RATE_LIMIT_SEARCHES` | Max search/fetch calls per token per minute (`0` = unlimited). |
+| `RELIQUARY_AUDIT_LOG` | Append-only JSONL log of every successful write (add/update/delete). Path to file (created `0600`); unset = disabled. |
+| `RELIQUARY_RATE_LIMIT_WRITES` | Max write tool calls per credential per minute (`0` = unlimited). A credential is an OAuth grant (refreshed tokens share its budget), a static token's label, or an endpoint's master token. |
+| `RELIQUARY_RATE_LIMIT_SEARCHES` | Max search/fetch calls per credential per minute (`0` = unlimited). |
 | `RELIQUARY_METRICS_PUBLIC` | Set to `true` to expose `GET /metrics` without auth. Default `false` = requires the Claude bearer token. |
 | `RELIQUARY_RETRIEVAL_STATS_PATH` | Path for an append-only JSONL retrieval-event log (one entry per search hit / fetch). Unset = disabled. Feeds `python app/lint.py` archive/compile proposals. |
 
-`GET /metrics` emits Prometheus text format with per-tool call counters,
-rate-limit rejection counts, process uptime, and (when the vector store supports
+`GET /metrics` emits Prometheus text format with per-tool call counters (names
+that are not tools of the endpoint count as `tool="unknown"`), rate-limit rejection counts, process uptime, and (when the vector store supports
 it) an approximate memory count gauge.
 
 ## Quick start (Docker)
@@ -65,9 +65,15 @@ it) an approximate memory count gauge.
 ```bash
 cp .env.example .env                  # set RELIQUARY_CLAUDE_MCP_TOKEN etc.
 cp config.example.yaml config.yaml    # point at the qdrant + embedder services
+mkdir -p data/blobs data/compiled data/state corpus
+sudo chown -R 100:101 data            # the app runs as uid 100, gid 101
 docker compose up -d
 curl -s http://127.0.0.1:8787/healthz
 ```
+
+The `chown` matters on Linux: Docker creates a missing bind-mount directory as
+root, the app cannot write it, fails its startup write probe and restarts in a
+loop. (Named volumes avoid this; see the guide.)
 
 Three services come up: **qdrant** (vector store), **embedder** (Ollama serving
 the multilingual 768-dim `nomic-embed-text` on CPU; a one-shot `embedder-pull`
@@ -105,7 +111,7 @@ resource URIs (old scheme → `reliquary://`), and env vars (old prefix → `REL
 
 A follow-up pass finished the job on the parts v0.3.0 left behind: the MCP **tool
 descriptions** agents actually read ("the local Mem0 store" → "the local Reliquary store"),
-the `--writeback` / `--user-id` / `--mcp-only` CLI help, the status response text, and the
+the `--writeback` / `--user-id` / `--no-chat-upstream` CLI help, the status response text, and the
 `Mem0ChatProxy` class (now `ReliquaryChatProxy`). Descriptions and help text only — no tool
 names, endpoints, env vars or behaviour changed.
 
@@ -121,7 +127,7 @@ ignored, so removing it would make the rename *less* enforced, not more.
 | Endpoint | For | Auth | Tools |
 |----------|-----|------|-------|
 | `POST /claude/mcp` | Claude.ai Custom Connector | Bearer or OAuth | `reliquary_capabilities`, `reliquary_status`, `reliquary_search`, `reliquary_fetch`, `reliquary_add_memory`, `reliquary_update`, `reliquary_delete`, `reliquary_propose_update`, `reliquary_compile_page`, `reliquary_delete_page`, `reliquary_list_pages`, `reliquary_page_history`, `reliquary_list_domains`, `reliquary_add_image`, `reliquary_fetch_image`, `reliquary_delete_image`, `reliquary_create_image_upload`, `reliquary_commit_image_upload` |
-| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer or OAuth | `capabilities`, `search`, `fetch`, `fetch_image` (lean snippet shape); write tools `add_memory`, `update`, `delete`, `add_image`, `delete_image`, `propose_update`, and the image-upload flow — same write capability as the Claude endpoint, gated by token scope |
+| `POST /openai/mcp` | ChatGPT / OpenAI-compatible | Bearer or OAuth | `capabilities`, `search`, `fetch`, `fetch_image`, `list_domains` (lean snippet shape); write tools `add_memory`, `update`, `delete`, `add_image`, `delete_image`, `propose_update`, and the image-upload flow — same write capability as the Claude endpoint, gated by token scope |
 
 **Binary blobs.** `reliquary_add_image` stores a file (base64) plus a searchable caption;
 it returns a `blob_id`, a `memory_id`, and a signed `url`. Find images later with
@@ -137,18 +143,28 @@ page with `reliquary_compile_page` (Reliquary never generates prose); it is stor
 revision in the blob store, indexed into a **separate Qdrant collection**, and
 cited back to its source memories via `derived_from`. Search then leads with a
 relevant *current* synthesis and surfaces raw memories as its evidence. New raw
-writes flag dependent pages `stale` (a queued suggestion, never an auto-rewrite).
+writes flag dependent pages `stale` (a queued suggestion, never an auto-rewrite);
+a page without `derived_from` depends on writes with its domain and topic, in
+any spelling an older version stored (`Work Notes` = `work-notes`, `g-nl-k` =
+`günlük`).
 Inspect pages with `reliquary_list_pages` / `reliquary_page_history` (the latter
 reports per-revision timestamp + status), archive a page by re-filing it with
-`status=archived`, or permanently remove one with `reliquary_delete_page`. Read the
+`status=archived`, or permanently remove one with `reliquary_delete_page`. A re-file
+that omits `title`, `derived_from` or `supersedes` keeps the page's current values
+(pass an empty list to clear one). A new page's slug may not reuse an imported
+record id or a live memory id (`slug_conflict`) and is at most 120 characters. Read the
 `reliquary://schema`, `reliquary://recent`, `reliquary://needs-review`, and
 `reliquary://domain/<d>/index` resources. It is on by default; set
 `RELIQUARY_COMPILED_COLLECTION=` (empty) to disable (an empty layer is a query-time
 no-op). Two cron-friendly CLIs support it: `python app/lint.py` proposes refreshes
 (never applies them) — with `RELIQUARY_RETRIEVAL_STATS_PATH` set, it also proposes
 archive candidates (imported records never retrieved) and compile candidates (hot
-topics with no synthesis page) — and `python app/export_vault.py --out vault/`
-exports pages to an Obsidian-style vault. See [`docs/GUIDE.md`](docs/GUIDE.md#compilation-layer).
+topics with no synthesis page); it also lists current pages with no index record
+(`unindexed_pages`) and blobs nothing references (`orphan_blobs`; pass
+`--state-dir` so pending uploads are not counted) — and `python app/export_vault.py --out vault/`
+exports pages to an Obsidian-style vault (a re-run removes the files it wrote
+earlier for pages since deleted or moved to another domain, tracked in
+`.reliquary-export.json`; other files in the vault are left alone). See [`docs/GUIDE.md`](docs/GUIDE.md#compilation-layer).
 
 **Project context & governance.** Reliquary is a generic personal-memory tool by
 default, but a coding agent can opt into light, *soft* project-awareness. Pass a
@@ -201,21 +217,46 @@ config file (see [config.example.yaml](config.example.yaml)). Highlights:
 | `RELIQUARY_DATASET_PATH` | curated JSONL enabling taxonomy routing + `fetch` bootstrap docs |
 | `RELIQUARY_BLOB_SIGNING_KEY` | HMAC key for signed blob URLs; unset = random per-process (URLs break on restart) |
 | `RELIQUARY_PUBLIC_BASE_URL` | optional prefix (e.g. `https://r.example.com`) prepended to blob + upload URLs; unset = relative paths |
+| `RELIQUARY_USER_ID` | Mem0 user_id the server reads and writes (default `default`); `app/ingest.py` uses it too |
+| `RELIQUARY_STATIC_TOKENS` | extra named bearers with their own scope: `label:scope:token;...` (scope `read` or `write`) |
+| `RELIQUARY_IMAGE_URL_INGEST` | `add_image` may fetch a `source_url` server-side (default `true`; `false` disables) |
+| `RELIQUARY_MEMORY_CONCURRENT_READS` | force concurrent (`true`) or serialized (`false`) reads; unset = auto |
 
-Run `python app/server.py --help` for the full flag list.
+[`.env.example`](.env.example) lists every variable the code reads. Run
+`python app/server.py --help` for the full flag list.
 
 ## Security notes
 
 - **Default-closed.** Every endpoint requires a valid token; there is no
   anonymous access. Write vs read is decided by the token's scope, identically
-  for the Claude and OpenAI endpoints.
+  for the Claude and OpenAI endpoints. A scope is a space-separated word set.
+  An OAuth grant is read-only when its scope contains a read word (`read`,
+  `readonly`, `read_only`, `search`) and no `write`, so `read offline_access`
+  is read-only; anything else (`write`, no scope, `mcp`, or only unrecognised
+  words such as `openid`) keeps write, and the authorize page shows which one
+  the client gets. Static tokens are stricter: only `write` (or the legacy
+  `mcp` or an empty scope) grants write; an unrecognised scope such as `ro`,
+  `rw` or `reader` is read-only and logged as a warning.
+- **Request size limits.** `/oauth/*` bodies are capped at 64 KiB; MCP, `/v1/*`
+  and `/reliquary/search` bodies at the base64 size of `RELIQUARY_BLOB_MAX_BYTES`
+  plus 1 MiB (about 41 MiB by default, enough for an inline image at the blob
+  limit). Larger bodies, or a larger `Content-Length`, get `413`. `/uploads/*`
+  keeps its own `RELIQUARY_BLOB_MAX_BYTES` limit.
 - **OAuth tokens are derived & revocable.** The connector gets a short-lived,
   resource-scoped access token (default 5 days) plus a **rotating refresh token**
   (non-expiring by default, with reuse detection) so it renews silently. The Docker
   Compose stack persists tokens across restarts by default (see `STATE_HOST_DIR`);
   outside Docker, set `RELIQUARY_STATE_DIR` yourself — without it, a restart signs
   connectors out. Revoking a *refresh* token via `/oauth/revoke` drops the whole
-  rotation family; revoking an access token removes just that token.
+  rotation family; revoking an access token removes just that token. The state
+  files store SHA-256 hashes of the tokens, never the tokens; files written by
+  older versions are converted on first load. The conversion is one-way: a
+  version before 0.5.2 cannot use converted files (it rejects every client's
+  token), so copy `oauth_tokens.json` and `oauth_refresh_tokens.json` aside
+  before upgrading if you might roll back, and restore them with the old image.
+- **Mem0 telemetry is off.** Mem0 reports anonymous usage to PostHog unless
+  `MEM0_TELEMETRY` is false; the image, the compose file and both CLIs default it
+  to `false` (set `MEM0_TELEMETRY=true` to opt in).
 - **Embedded vs server Qdrant.** Reads run concurrently only against a Qdrant
   *server*; an embedded on-disk store is auto-detected and serialized (it is not
   read-thread-safe).
@@ -229,19 +270,30 @@ Run `python app/server.py --help` for the full flag list.
 
 ```bash
 # JSONL: one {"id": "...", "text": "...", "metadata": {...}} per line.
-python app/ingest.py path/to/corpus.jsonl --config config.yaml --user-id default
+python app/ingest.py path/to/corpus.jsonl --config config.yaml
 ```
 
-For re-runs, add `--incremental` to skip unchanged JSONL records by stable `id`
-and update records whose text or metadata changed.
+Imports are incremental by default: re-running the same command skips
+unchanged records and updates changed ones by their stable `id`, so it never
+duplicates the corpus (`--no-incremental` adds blindly; use it only on an empty
+collection). `--user-id` defaults to `RELIQUARY_USER_ID` or `default`, the
+same as the server; records ingested under another id are invisible to it.
 
 `metadata.title` is used as the result title; `domain`/`hall`/`room`/`topic`
-enable routing; any `source_url`/`source_ref` becomes the document URL.
-If records include `updated_at`, `created_at`, `timestamp`, or similar date
-metadata, search uses it as a small recency tiebreaker after vector similarity.
+enable routing (stored as slugs, e.g. `Work Notes` → `work-notes`); a
+`source_url` or `source_ref` that starts with `http://` or `https://` becomes
+the document URL (anything else, such as a file path, stays provenance).
+If records include `updated_at`, `created_at`, `timestamp`, or `date`
+metadata, search uses it as a small recency tiebreaker after vector similarity
+(Mem0 stamps its own dates with the import time, so the importer keeps yours
+as `source_updated_at`/`source_created_at`).
 The server also overfetches raw candidates and removes near-duplicate result
 texts at query time so repeated facts from multiple sources do not crowd out
-the result budget.
+the result budget. Duplicate detection works on any script (Japanese and other
+unspaced text is compared by character pairs), and a proposed correction is
+never collapsed into the record it corrects. Search pages (`cursor` /
+`nextCursor`) are slices of one ranking of up to 100 hits per route, so pages
+neither repeat nor skip records.
 
 Agent write-back is opt-in. `--writeback` stores successful chat turns in Mem0;
 add `--writeback-path /path/to/Agent.md` (or `RELIQUARY_WRITEBACK_PATH`) to also
@@ -255,10 +307,14 @@ folder layout — see [`docs/GUIDE.md`](docs/GUIDE.md) for a full walkthrough.
 ## Development
 
 ```bash
-pip install -r requirements.txt pytest
-python -m pytest            # or: python tests/test_helpers.py
-python -m py_compile app/*.py
+pip install -r requirements.lock pytest   # the pinned set the image ships
+python -m pytest -q
+python -m compileall -q app
 ```
+
+Python 3.12 is what CI and the image run, and the minimum `pyproject.toml`
+declares. `requirements.txt` pins only the direct dependencies; install the lock
+so the transitive ones don't float.
 
 The `helpers` / `catalog` / `runtime` / `oauth` modules are dependency-light and
 unit-tested without the Mem0/Qdrant stack.

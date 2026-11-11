@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import hashlib
 import inspect
 import json
@@ -24,9 +25,12 @@ import health
 from ingest import load_config
 from oauth import OAuthProvider, RegistrationDisabledError, scope_is_write
 from catalog import CorpusCatalog
+from metadata_policy import (
+    caller_kind, clean_caller_metadata, honours_import_id, normalize_taxonomy, normalize_taxonomy_value,
+)
 from persistence import JsonFileStore
-from runtime import AsyncRWLock, MCPSessionStore, native_hybrid_active, reads_can_be_concurrent
-from blobs import BlobStore, BlobTooLarge
+from runtime import AsyncRWLock, MCPSessionStore, drain_on_cancel, native_hybrid_active, reads_can_be_concurrent
+from blobs import UPLOAD_OWNER_PREFIX, BlobStore, BlobTooLarge
 from ratelimit import RateLimiter
 from metrics import Metrics
 from audit import AuditLog
@@ -58,17 +62,25 @@ from helpers import (
     safe_mcp_headers,
     trim_text,
 )
-from retrieval_quality import apply_retrieval_quality, retrieval_candidate_limit
+from retrieval_quality import apply_retrieval_quality, quality_score, retrieval_candidate_limit
 
 
 LOG = logging.getLogger("reliquary")
 MCP_PROTOCOL_VERSION = "2025-06-18"
+# Versions an initialize request may negotiate (same JSON-over-POST surface;
+# older clients ignore the newer result fields). Unknown -> MCP_PROTOCOL_VERSION.
+SUPPORTED_MCP_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 MCP_SERVER_NAME = "reliquary"
-MCP_SERVER_VERSION = "0.5.1"
+MCP_SERVER_VERSION = "0.5.2"
 MCP_MAX_SESSIONS = 512
 MCP_SESSION_TTL = 3600.0  # seconds of idle time before an MCP session may be evicted
 MEMORY_COUNT_CACHE_TTL = 30.0  # seconds to cache the exact memory count for status polling
 LIVE_LEXICAL_SCAN_LIMIT = 5000
+LIVE_LEXICAL_SCAN_MAX = 80_000  # the scan grows 4x per full page up to this
+# Search ranks one pool of up to this many hits per route, whatever the cursor,
+# and every page is a slice of that one ranking (which bounds the depth).
+SEARCH_RANKING_DEPTH = 100
+SEARCH_CURSOR_CAP = 400  # 20 pages at the max limit
 # Soft score bonus that floats project-matching memory up when caller context is
 # supplied (#42). Additive, excludes nothing; a no-op when context is absent.
 CONTEXT_MATCH_BONUS = 0.1
@@ -158,6 +170,13 @@ ICON_PATH_RE = re.compile(r"/icon-(?:%s)\.png" % "|".join(str(s) for s in ICON_S
 BLOB_PATH_RE = re.compile(r"/blobs/([0-9a-f]{64})\Z")
 UPLOAD_PATH_RE = re.compile(r"/uploads/(upl_[A-Za-z0-9_-]+)\Z")
 UPLOAD_SLOT_TTL = 600.0
+# Back-off before retrying expired slots whose commit outcome could not be read.
+UPLOAD_RECONCILE_RETRY = 60.0
+# A settling pass stops starting new lookups after this many seconds; the rest
+# wait for the next pass.
+UPLOAD_SETTLE_BUDGET = 10.0
+# How long lifespan shutdown waits for a cancelled settling pass to drain.
+UPLOAD_SHUTDOWN_GRACE = 5.0
 # Passive raster image types safe to serve inline same-origin. Anything else
 # (SVG, PDF, HTML, unknown) is forced to an octet-stream download by /blobs/{id}.
 _INLINE_SAFE_MIMETYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
@@ -361,6 +380,11 @@ class PendingUpload:
     # Endpoint that minted the slot ("claude"/"openai"). A slot can only be
     # finalized through the same endpoint it was created on.
     profile: str | None = None
+    # Every user a commit attempt wrote (or may have written) a caption under,
+    # recorded before the caption write: [] means no attempt yet. A commit cut
+    # short is resolved by looking only under these users. None: a slot whose
+    # history is unknown (written by an older build); it is never resolved.
+    commit_users: list[str] | None = None
 
 
 class ReliquaryChatProxy:
@@ -417,6 +441,7 @@ class ReliquaryChatProxy:
             if self._native_hybrid else "dense + get_all lexical fallback",
         )
         self._count_cache: tuple[float, int | None] | None = None
+        self._count_probe_failed = False  # last memory-count probe raised
         token_store = None
         refresh_token_store = None
         session_store = None
@@ -493,6 +518,12 @@ class ReliquaryChatProxy:
         # Single event loop: claim a slot before any await. Cleanup must not
         # reclaim bytes while a POST or caption commit is in flight.
         self._busy_uploads: set[str] = set()
+        self._reap_retry_at = 0.0
+        # The one background settling pass (see _schedule_reap), if running.
+        self._reap_task: asyncio.Task | None = None
+        # Set when shutdown gave up waiting for that pass: from then on it
+        # applies and persists nothing, whenever its blocked lookup returns.
+        self._settling_abandoned = False
         self.pending_upload_store = (
             JsonFileStore(os.path.join(settings.state_dir, "pending_uploads.json"))
             if settings.state_dir
@@ -518,6 +549,15 @@ class ReliquaryChatProxy:
                 compiled_config = copy.deepcopy(self.config)
                 compiled_config.setdefault("vector_store", {}).setdefault("config", {})
                 compiled_config["vector_store"]["config"]["collection_name"] = settings.compiled_collection
+                compiled_store = compiled_config["vector_store"]
+                raw_store = getattr(self.memory, "vector_store", None)
+                if (str(compiled_store.get("provider") or "qdrant").lower() == "qdrant"
+                        and (compiled_store["config"].get("path") or getattr(raw_store, "is_local", False))
+                        and getattr(raw_store, "client", None) is not None):
+                    # Embedded Qdrant locks its storage folder to one client; a
+                    # second QdrantClient(path=...) fails at startup. Share the raw
+                    # store's client, as mem0 does for its own entity store.
+                    compiled_store["config"]["client"] = raw_store.client
                 self.compiled_memory = Memory.from_config(compiled_config)
 
         self.metrics = Metrics()
@@ -569,6 +609,11 @@ class ReliquaryChatProxy:
 
             method = scope["method"].upper()
             path = scope["path"]
+
+            body_cap = self._body_cap_for_path(path)
+            declared = decode_headers(scope).get("content-length", "").strip()
+            if body_cap and declared.isdigit() and int(declared) > body_cap:
+                raise RequestBodyTooLarge(body_cap)  # refuse before reading a byte
 
             if method == "OPTIONS":
                 await self.send_empty(send, 204)
@@ -725,6 +770,8 @@ class ReliquaryChatProxy:
                 return
 
             await self.send_json(send, 404, {"error": f"Unknown path: {path}"})
+        except RequestBodyTooLarge as exc:
+            await self.send_json(send, 413, {"error": "request_too_large", "max_bytes": exc.max_bytes})
         except Exception:
             # Only HTTP scopes can receive an http.response.* reply. For lifespan or
             # any other scope, sending one would emit invalid ASGI messages and mask
@@ -750,8 +797,10 @@ class ReliquaryChatProxy:
             message = await receive()
             message_type = message["type"]
             if message_type == "lifespan.startup":
+                self._schedule_reap()  # settle slots left from before the restart
                 await send({"type": "lifespan.startup.complete"})
             elif message_type == "lifespan.shutdown":
+                await self._stop_settling()
                 await self.client.aclose()
                 await self.image_client.aclose()
                 await send({"type": "lifespan.shutdown.complete"})
@@ -763,11 +812,14 @@ class ReliquaryChatProxy:
         await self.send_json(send, 200, {"status": "ok", "name": MCP_SERVER_NAME})
 
     async def handle_status(self, send) -> None:
+        memory_count = await self.get_memory_count()
         await self.send_json(
             send,
             200,
             {
-                "status": "ok",
+                # A failed count probe means the memory backend did not answer.
+                "status": "degraded" if self._count_probe_failed else "ok",
+                "memory_backend": "unavailable" if self._count_probe_failed else "ok",
                 "upstream_base_url": self.settings.upstream_base_url,
                 "embedder_base_url": self.settings.embedder_base_url,
                 "default_user_id": self.settings.user_id,
@@ -786,7 +838,7 @@ class ReliquaryChatProxy:
                 "catalog_records": len(self.catalog.records_by_id) if self.catalog else 0,
                 "catalog_domains": self.catalog.routeable_domains if self.catalog else [],
                 "vector_store_path": ((self.config.get("vector_store") or {}).get("config") or {}).get("path"),
-                "approx_memory_count": await self.get_memory_count(),
+                "approx_memory_count": memory_count,
                 "note": "Embedded local Qdrant allows only one Reliquary process at a time.",
             },
         )
@@ -797,11 +849,11 @@ class ReliquaryChatProxy:
         payload: dict[str, Any] = {}
 
         if scope["method"].upper() == "POST":
-            body = await self.read_body(receive)
+            body = await self.read_body(receive, self.request_body_max_bytes())
             if body:
                 try:
                     payload = json.loads(body)
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):  # bad JSON, bad UTF-8, too deep
                     await self.send_json(send, 400, {"error": "Body must be valid JSON"})
                     return
 
@@ -877,7 +929,9 @@ class ReliquaryChatProxy:
         if method == "DELETE":
             session_id = headers.get("mcp-session-id")
             if session_id:
-                self.mcp_sessions.remove(session_id)
+                # Another credential's (or endpoint's) session is left alone and
+                # answered like an unknown one.
+                self.mcp_sessions.remove_owned(session_id, profile.name, self._credential_key(headers))
             await self.send_empty(send, 204)
             return
 
@@ -885,7 +939,7 @@ class ReliquaryChatProxy:
             await self.send_empty(send, 405, extra_headers={"allow": "POST, DELETE"})
             return
 
-        body = await self.read_body(receive)
+        body = await self.read_body(receive, self.request_body_max_bytes())
         if profile.name == "openai":
             # Request bodies + identifiers are sensitive; only at debug level.
             LOG.debug(
@@ -897,7 +951,7 @@ class ReliquaryChatProxy:
             )
         try:
             message = json.loads(body or b"{}")
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # bad JSON, bad UTF-8, too deep
             await self.send_json(send, 400, self.mcp_error(None, -32700, "Invalid JSON"))
             return
 
@@ -922,15 +976,19 @@ class ReliquaryChatProxy:
             return
 
         if request_method == "initialize":
+            requested_version = params.get("protocolVersion")
+            negotiated_version = (
+                requested_version if requested_version in SUPPORTED_MCP_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
+            )
             session_id = secrets.token_urlsafe(24)
-            self.mcp_sessions.add(session_id, profile.name)
+            self.mcp_sessions.add(session_id, profile.name, owner=self._credential_key(headers))
             await self.send_json(
                 send,
                 200,
                 self.mcp_success(
                     request_id,
                     {
-                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "protocolVersion": negotiated_version,
                         "capabilities": {
                             "tools": {"listChanged": False},
                             "resources": {"listChanged": False},
@@ -945,7 +1003,7 @@ class ReliquaryChatProxy:
                         },
                     },
                 ),
-                extra_headers={"Mcp-Session-Id": session_id, "MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
+                extra_headers={"Mcp-Session-Id": session_id, "MCP-Protocol-Version": negotiated_version},
             )
             return
 
@@ -958,7 +1016,7 @@ class ReliquaryChatProxy:
             return
 
         session_id = headers.get("mcp-session-id")
-        if session_id and session_id not in self.mcp_sessions:
+        if session_id and not self.mcp_sessions.claim(session_id, profile.name, self._credential_key(headers)):
             await self.send_json(send, 404, self.mcp_error(request_id, -32001, "Unknown MCP session"))
             return
 
@@ -991,7 +1049,8 @@ class ReliquaryChatProxy:
 
         if request_method == "resources/read":
             uri = str(params.get("uri") or "")
-            contents = self.read_resource(uri)
+            # needs-review folds the whole retrieval-stats log: keep it off the loop.
+            contents = await asyncio.to_thread(self.read_resource, uri)
             if contents is None:
                 await self.send_json(send, 200, self.mcp_error(request_id, -32602, f"Unknown resource: {uri}"))
                 return
@@ -1050,19 +1109,20 @@ class ReliquaryChatProxy:
                     structured={"error": "rate_limited", "category": category},
                     is_error=True,
                 )
+                result = self._format_retrieval_result(profile, tool_name, result)
             else:
                 from context import resolve_context
                 ctx = resolve_context(tool_arguments, headers)
                 result = await self.call_mcp_tool(profile, tool_name, tool_arguments, can_write=can_write, context=ctx)
-                self.metrics.record_tool(tool_name, ok=not result.get("isError"))
+                self.metrics.record_tool(self._metric_tool_name(profile, tool_name), ok=not result.get("isError"))
                 if category == "write" and not result.get("isError"):
                     structured = result.get("structuredContent") or {}
                     try:
                         self.audit.record(
                             action=tool_name,
                             endpoint=profile.name,
-                            user_id=tool_arguments.get("user_id") or self.settings.user_id,
-                            ids={k: structured.get(k) for k in ("ids", "id", "memory_id", "blob_id", "deleted", "updated") if k in structured},
+                            user_id=self._audit_user_id(tool_name, tool_arguments, structured),
+                            ids={k: structured.get(k) for k in ("ids", "id", "memory_id", "blob_id", "deleted", "updated", "slug") if k in structured},
                         )
                     except Exception:
                         # The write already committed; an unwritable audit path
@@ -1083,6 +1143,28 @@ class ReliquaryChatProxy:
             self.mcp_error(request_id, -32601, f"Method not found: {request_method}"),
             extra_headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
         )
+
+    # Claude-endpoint writes whose handlers honour a caller user_id override
+    # (allow_user_id=True in _dispatch_mcp_tool). Every other write runs as the
+    # default user: the lean endpoint ignores caller ids, pages are global.
+    _USER_SCOPED_WRITE_TOOLS = frozenset({
+        "reliquary_add_memory", "reliquary_delete", "reliquary_update", "reliquary_add_image",
+        "reliquary_delete_image", "reliquary_commit_image_upload", "reliquary_propose_update",
+    })
+
+    def _metric_tool_name(self, profile: EndpointProfile, tool_name: str) -> str:
+        """Metric label for a call: names that are not tools of this endpoint
+        collapse to "unknown", so callers cannot mint unbounded series."""
+        known = {tool["name"] for tool in self.mcp_tools_for(profile, can_write=True)}
+        return tool_name if tool_name in known else "unknown"
+
+    def _audit_user_id(self, tool_name: str, arguments: dict[str, Any], structured: dict[str, Any]) -> str:
+        """The user a successful write really ran as, for the audit log."""
+        if structured.get("user_id"):
+            return str(structured["user_id"])
+        if tool_name in self._USER_SCOPED_WRITE_TOOLS and arguments.get("user_id"):
+            return str(arguments["user_id"])
+        return self.settings.user_id
 
     @staticmethod
     def _tool_category(tool_name: str) -> str:
@@ -1111,14 +1193,10 @@ class ReliquaryChatProxy:
             return "read"
         return "other"
 
-    @staticmethod
-    def _rate_key(headers: dict[str, str]) -> str:
-        auth = headers.get("authorization", "").strip()
-        scheme, _, token = auth.partition(" ")
-        token = token.strip()
-        if scheme.lower() == "bearer" and token:
-            return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
-        return "anon"
+    def _rate_key(self, headers: dict[str, str]) -> str:
+        # Per credential, not per token string: a refreshed OAuth access token
+        # stays in its grant's bucket, static tokens share their label's.
+        return self._credential_key(headers)
 
     def _routing_hint(self) -> str:
         if not self.catalog or not self.catalog.routeable_domains:
@@ -1208,6 +1286,7 @@ class ReliquaryChatProxy:
                                     cold_min_events=self.settings.lint_cold_min_events)
             payload = {
                 "stale": [self._page_summary(p) for p in pages if p.status == "stale"],
+                "unindexed": report["unindexed_pages"],
                 "coverage_gaps": report["coverage_gaps"],
                 "cold_records": report["cold_records"],
                 "hot_topics": report["hot_topics"],
@@ -1216,7 +1295,9 @@ class ReliquaryChatProxy:
         domain_prefix = "reliquary://domain/"
         if uri.startswith(domain_prefix) and uri.endswith("/index") and self.pages is not None:
             domain = uri[len(domain_prefix):-len("/index")]
-            payload = {"domain": domain, "pages": [self._page_summary(p) for p in self.pages.list(domain=domain)]}
+            spellings = {domain, normalize_taxonomy_value(domain)}  # pages filed before normalisation
+            payload = {"domain": domain, "pages": [self._page_summary(p) for p in self.pages.list()
+                                                   if p.domain in spellings]}
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
         if uri == "reliquary://taxonomy":
             payload = {
@@ -1412,6 +1493,30 @@ class ReliquaryChatProxy:
                         "required": ["query"],
                         "additionalProperties": False,
                     },
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "results": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "title": {"type": "string"},
+                                        "url": {"type": "string"},
+                                        # Present only on proposed corrections.
+                                        "kind": {"type": "string"},
+                                        "status": {"type": "string"},
+                                        "target_id": {"type": "string"},
+                                    },
+                                    "required": ["id", "title", "url"],
+                                },
+                            },
+                            "nextCursor": {"type": ["string", "null"]},
+                        },
+                        "required": ["results"],
+                    },
                 },
                 {
                     "name": "list_domains",
@@ -1430,6 +1535,17 @@ class ReliquaryChatProxy:
                         "properties": {"id": {"type": "string", "description": "Document id returned by search."}},
                         "required": ["id"],
                         "additionalProperties": False,
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "title": {"type": "string"},
+                            "text": {"type": "string"},
+                            "url": {"type": "string"},
+                            "metadata": {"type": "object"},
+                        },
+                        "required": ["id", "title", "text", "url"],
                     },
                 },
                 {
@@ -1816,8 +1932,8 @@ class ReliquaryChatProxy:
                             "markdown": {"type": "string", "description": "The synthesis body (markdown)."},
                             "slug": {"type": "string", "description": "Stable page id; derived from title/topic if omitted."},
                             "title": {"type": "string"},
-                            "derived_from": {"type": "array", "items": {"type": "string"}, "description": "Raw memory ids this synthesis is based on."},
-                            "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Slugs this page supersedes."},
+                            "derived_from": {"type": "array", "items": {"type": "string"}, "description": "Raw memory ids this synthesis is based on. Omit on a re-file to keep the page's list; [] clears it."},
+                            "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Slugs this page supersedes. Omit on a re-file to keep the page's list; [] clears it."},
                             "domain": {"type": "string"}, "hall": {"type": "string"}, "room": {"type": "string"}, "topic": {"type": "string"},
                             "status": {"type": "string", "description": "current | stale | draft | archived (default current)."},
                         },
@@ -1850,7 +1966,32 @@ class ReliquaryChatProxy:
             ])
         return claude_tools
 
+    @staticmethod
+    def _format_retrieval_result(profile: EndpointProfile, tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
+        # OpenAI's search/fetch contract mirrors structuredContent as JSON text
+        # for clients that parse content instead. Keep Claude's readable text
+        # and every other tool's existing presentation unchanged.
+        if profile.name != "openai" or tool_name not in {"search", "fetch"}:
+            return result
+        if result.get("isError"):
+            # structuredContent must conform to the advertised outputSchema, and
+            # error payloads do not (no results / id,title,text,url). Clients
+            # that validate (the TypeScript SDK) would throw instead of showing
+            # the error, so errors carry the JSON as text only.
+            return {
+                "content": [{"type": "text", "text": json.dumps(result["structuredContent"], ensure_ascii=False)}],
+                "isError": True,
+            }
+        return {
+            **result,
+            "content": [{"type": "text", "text": json.dumps(result["structuredContent"], ensure_ascii=False)}],
+        }
+
     async def call_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any], *, can_write: bool = False, context=None) -> dict[str, Any]:
+        result = await self._dispatch_mcp_tool(profile, tool_name, arguments, can_write=can_write, context=context)
+        return self._format_retrieval_result(profile, tool_name, result)
+
+    async def _dispatch_mcp_tool(self, profile: EndpointProfile, tool_name: str, arguments: dict[str, Any], *, can_write: bool = False, context=None) -> dict[str, Any]:
         try:
             if profile.name == "openai":
                 if tool_name == "capabilities":
@@ -1919,9 +2060,13 @@ class ReliquaryChatProxy:
             if tool_name == "reliquary_capabilities":
                 return self.handle_capabilities_tool(profile, context=context, can_write=can_write)
             if tool_name == "reliquary_status":
+                memory_count = await self.get_memory_count()
+                degraded = self._count_probe_failed
                 status = {
+                    "status": "degraded" if degraded else "ok",
+                    "memory_backend": "unavailable" if degraded else "ok",
                     "user_id": self.settings.user_id,
-                    "approx_memory_count": await self.get_memory_count(),
+                    "approx_memory_count": memory_count,
                     "claude_mcp_path": self.settings.claude_mcp_path,
                     "openai_mcp_path": self.settings.openai_mcp_path,
                     "catalog_loaded": self.catalog is not None,
@@ -1930,7 +2075,11 @@ class ReliquaryChatProxy:
                     "search_mode": "hybrid" if self._native_hybrid else "dense+lexical-fallback",
                 }
                 return self.mcp_tool_result(
-                    text=f"Reliquary is available. Approximate memory count: {status['approx_memory_count']}.",
+                    text=(
+                        "Reliquary is degraded: the memory backend did not answer the count probe."
+                        if degraded
+                        else f"Reliquary is available. Approximate memory count: {status['approx_memory_count']}."
+                    ),
                     structured=status,
                 )
             if tool_name == "reliquary_list_domains":
@@ -1991,11 +2140,20 @@ class ReliquaryChatProxy:
                 if not can_write:
                     return self._scope_error(tool_name)
                 return await self.handle_propose_update_tool(arguments, allow_user_id=True)
-        except Exception as exc:
-            LOG.exception("MCP tool failed: %s", tool_name)
+        except MemoryBackendUnavailable:
             return self.mcp_tool_result(
-                text=f"{tool_name} failed: {exc}",
-                structured={"error": str(exc)},
+                text=f"{tool_name} could not reach the memory backend; retry shortly.",
+                structured={"error": "backend_unavailable"},
+                is_error=True,
+            )
+        except Exception:
+            # The exception text can carry backend hosts or credentials in URLs;
+            # log it under an id and give the client only the id.
+            error_id = secrets.token_hex(6)
+            LOG.exception("MCP tool failed [%s]: %s", error_id, tool_name)
+            return self.mcp_tool_result(
+                text=f"{tool_name} failed with an internal error (error_id={error_id}); see the server log.",
+                structured={"error": "internal_error", "error_id": error_id},
                 is_error=True,
             )
 
@@ -2031,14 +2189,12 @@ class ReliquaryChatProxy:
             offset = max(0, int(arguments.get("cursor") or 0))
         except (TypeError, ValueError):
             offset = 0
-        # Reject (not clamp) offsets past the cap: result_cap below feeds search
-        # top_k and the O(n²) dedup pass, so an unbounded cursor is a resource-
-        # exhaustion vector — and silently clamping would return the same page
-        # with the same nextCursor forever. 400 = 20 pages at the max limit.
-        if offset > 400:
+        # Reject (not clamp) offsets past the cap: silently clamping would return
+        # the same page with the same nextCursor forever.
+        if offset > SEARCH_CURSOR_CAP:
             return self.mcp_tool_result(
                 text="Cursor is past the pagination cap (400); restart the search or narrow it with filters.",
-                structured={"error": "invalid_cursor", "max_cursor": 400},
+                structured={"error": "invalid_cursor", "max_cursor": SEARCH_CURSOR_CAP},
                 is_error=True,
             )
         threshold = (
@@ -2054,7 +2210,14 @@ class ReliquaryChatProxy:
                 minimum=100, maximum=SEARCH_PREVIEW_CHAR_CAP_MAX,
             )
 
-        result_cap = offset + limit + 1
+        # The candidate pool must not depend on the cursor: a pool that grew with
+        # the offset was re-ranked on every page, so pages repeated and skipped
+        # records. Every page ranks the same pool and slices it.
+        result_cap = max(SEARCH_RANKING_DEPTH, limit + 1)
+        # Order by the key apply_retrieval_quality selected by (vector score plus
+        # lexical and recency bonuses), computed on the raw hit before enrichment.
+        rank_now = time.time()
+        rank_scores: dict[str, float] = {}
 
         # Build explicit metadata filters from caller-supplied taxonomy params.
         # When any are present, bypass catalog routing and run a single hard-filtered
@@ -2065,15 +2228,28 @@ class ReliquaryChatProxy:
                                     if (v := arguments.get(k)) is not None and str(v).strip()}
 
         if explicit:
-            # Hard-filter path: one search with the explicit filters; no catalog routing.
-            hits = await self.search_memories(
-                query, user_id=user_id, limit=result_cap, threshold=threshold, filters=explicit
-            )
+            # Hard-filter path: no catalog routing. Writes store the slug form
+            # ("Work Notes" -> "work-notes"); records and pages stored by older
+            # versions keep the raw spelling, so a filter whose two spellings
+            # differ searches both and merges by id. Each search is hard-filtered.
+            filter_sets = [{k: normalize_taxonomy_value(v) for k, v in explicit.items()}]
+            if filter_sets[0] != explicit:
+                filter_sets.append(explicit)
+            raw_routes, failed_routes = len(filter_sets), 0
             by_key: dict[str, dict[str, Any]] = {}
-            for hit in hits:
-                enriched = self._enrich_hit(hit, route="explicit-filter")
-                key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
-                by_key[key] = enriched
+            for filter_set in filter_sets:
+                hits = await self.search_memories(
+                    query, user_id=user_id, limit=result_cap, threshold=threshold, filters=filter_set,
+                    lexical_min_hits=limit,
+                )
+                failed_routes += isinstance(hits, _BackendFailure)
+                for hit in hits:
+                    enriched = self._enrich_hit(hit, route="explicit-filter")
+                    key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
+                    existing = by_key.get(key)
+                    if existing is None or self._numeric_score(enriched.get("score")) > self._numeric_score(existing.get("score")):
+                        by_key[key] = enriched
+                        rank_scores[key] = quality_score(query, hit, now=rank_now)
             raw_results = sorted(
                 by_key.values(),
                 key=lambda item: (-(self._numeric_score(item.get("score")) + self._context_bonus(item, context)
@@ -2082,11 +2258,14 @@ class ReliquaryChatProxy:
             )
             # Synthesis-first: apply ALL explicit filters so every taxonomy dimension
             # (domain, hall, room, topic) enforces the same hard-restrict guarantee (Fix 1).
-            synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
-            synthesis_results = [
-                s for s in synthesis_results
-                if all((s.get("metadata") or {}).get(k) == v for k, v in explicit.items())
-            ]
+            # Filtered inside, before the limit cut, so out-of-scope pages that
+            # score higher cannot crowd the matching page out.
+            synthesis_results = []
+            for filter_set in filter_sets:
+                for page_hit in await self._synthesis_first_hits(
+                        query, user_id=user_id, limit=result_cap, threshold=threshold, filters=filter_set):
+                    if all(page_hit.get("id") != seen.get("id") for seen in synthesis_results):
+                        synthesis_results.append(page_hit)
             routes_used = [f"explicit-filter({', '.join(f'{k}={v}' for k, v in explicit.items())})"]
         else:
             routes = self.catalog.build_routes(query) if self.catalog else [_GlobalRoute()]
@@ -2096,16 +2275,20 @@ class ReliquaryChatProxy:
             # while the global route matches the same record strongly (e.g. an exact
             # lexical hit at score ~2.0). Route priority must not shadow the better copy.
             by_key = {}
+            raw_routes, failed_routes = len(routes), 0
             for route in routes:
                 hits = await self.search_memories(
-                    query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters
+                    query, user_id=user_id, limit=result_cap, threshold=threshold, filters=route.filters,
+                    lexical_min_hits=limit,
                 )
+                failed_routes += isinstance(hits, _BackendFailure)
                 for hit in hits:
                     enriched = self._enrich_hit(hit, route=route.description)
                     key = str(enriched.get("id") or enriched.get("url") or enriched.get("title"))
                     existing = by_key.get(key)
                     if existing is None or self._numeric_score(enriched.get("score")) > self._numeric_score(existing.get("score")):
                         by_key[key] = enriched
+                        rank_scores[key] = quality_score(query, hit, now=rank_now)
 
             # Order by relevance score across ALL routes, not by route priority, so the
             # best hit (e.g. an exact lexical match) ranks first wherever it came from.
@@ -2118,24 +2301,43 @@ class ReliquaryChatProxy:
                                   str(item.get("id") or "")),
             )
             # Synthesis-first (#50): a current synthesis leads; raw hits follow as evidence.
-            synthesis_results = await self._synthesis_first_hits(query, user_id=user_id, limit=result_cap)
+            synthesis_results = await self._synthesis_first_hits(
+                query, user_id=user_id, limit=result_cap, threshold=threshold)
             routes_used = [route.description for route in routes]
 
+        if raw_routes and failed_routes == raw_routes and not synthesis_results:
+            # Every memory route raised and no synthesis answered: report the
+            # outage rather than a successful search with no results. (One
+            # route down while others answer is still a result.)
+            return self.mcp_tool_result(
+                text="The memory backend is unavailable, so the search could not run; retry shortly.",
+                structured={"error": "backend_unavailable"},
+                is_error=True,
+            )
         # Use result_cap (not limit) so paginated pages past the first still see syntheses.
         # synthesis ids are slugs, raw ids are mem0 uuids — disjoint namespaces, so this
         # dedupe is a safety guard, not a real overlap risk.
         synthesis_ids = {str(s.get("id")) for s in synthesis_results}
         combined = synthesis_results + [r for r in raw_results if str(r.get("id")) not in synthesis_ids]
+        for synthesis in synthesis_results:
+            rank_scores[str(synthesis.get("id"))] = quality_score(query, synthesis, now=rank_now)
         # A synthesis wins close relevance comparisons, not every comparison.
         # Unconditional concatenation buried exact raw matches beneath unrelated
         # pages, even when their vector scores were much lower.
         combined.sort(key=lambda item: (
-            -(self._numeric_score(item.get("score")) + self._context_bonus(item, context)
+            -(rank_scores.get(str(item.get("id") or item.get("url") or item.get("title")),
+                              self._numeric_score(item.get("score")))
+              + self._context_bonus(item, context)
               + self._exact_match_bonus(item, query)
               + (COMPILED_RANK_BONUS if item.get("route") == "synthesis" else 0.0)),
             str(item.get("id") or ""),
         ))
-        next_cursor = str(offset + limit) if len(combined) > offset + limit else None
+        # Never hand out a cursor that the next call would reject.
+        next_cursor = (
+            str(offset + limit)
+            if len(combined) > offset + limit and offset + limit <= SEARCH_CURSOR_CAP
+            else None
+        )
         results = combined[offset:offset + limit]
         filter_header = (f" [filters: {', '.join(f'{k}={v}' for k, v in explicit.items())}]" if explicit else "")
         lines = [f"Search for {query!r} returned {len(results)} result(s).{filter_header}"]
@@ -2172,6 +2374,13 @@ class ReliquaryChatProxy:
                     "truncated": truncated,
                     "char_count": len(full_text),
                 }
+                if metadata.get("kind") == "correction":
+                    # Without these a proposed correction reads like any
+                    # other record on the lean endpoint.
+                    structured_item["kind"] = "correction"
+                    structured_item["status"] = str(metadata.get("status") or "proposed")
+                    if metadata.get("target_id"):
+                        structured_item["target_id"] = str(metadata["target_id"])
             else:
                 # Mirror the preview cap in structuredContent so the full corpus
                 # text cannot blow out context here; full text stays behind fetch.
@@ -2272,20 +2481,20 @@ class ReliquaryChatProxy:
             is_error=True,
         )
 
-    def _fan_out_staleness(self, source_ids: list[str], metadata: dict[str, Any]) -> None:
+    async def _fan_out_staleness(self, source_ids: list[str], *metadatas: dict[str, Any]) -> None:
         """Flag current synthesis pages deriving from a changed raw memory
-        (pages with no declared provenance fall back to a domain+topic match).
-        Flips the status flag only — never rewrites page content or mints a
-        revision; the page surfaces in needs-review for a human-driven recompile.
-        Wrapped so it can never break the write."""
+        (pages with no declared provenance fall back to a domain+topic match,
+        for each taxonomy in ``metadatas``). Flips the status flag only — never
+        rewrites page content or mints a revision; the page surfaces in
+        needs-review for a human-driven recompile. Wrapped so it can never break
+        the write. Matching and marking run as one registry operation in a worker
+        thread: it waits for a cross-process file lock (ingest), and a revision
+        filed between a match and its mark must not be marked."""
         if self.pages is None:
             return
         try:
-            domain = (metadata or {}).get("domain")
-            topic = (metadata or {}).get("topic")
-            for page in self.pages.pages_deriving_from(ids=source_ids, domain=domain, topic=topic):
-                if page.status == "current":
-                    self.pages.set_status(page.slug, "stale")
+            taxonomies = [((m or {}).get("domain"), (m or {}).get("topic")) for m in metadatas] or [(None, None)]
+            await asyncio.to_thread(self.pages.mark_stale_deriving_from, ids=source_ids, taxonomies=taxonomies)
         except Exception:
             LOG.exception("Staleness fan-out failed (non-fatal)")
 
@@ -2306,17 +2515,19 @@ class ReliquaryChatProxy:
                 structured={"error": "invalid_metadata"},
                 is_error=True,
             )
+        metadata = clean_caller_metadata(metadata)
         metadata.setdefault("source", str(arguments.get("source") or "mcp"))
-        metadata.setdefault("kind", str(arguments.get("kind") or "memory_note"))
+        metadata.setdefault("kind", caller_kind(arguments.get("kind")))
         metadata["source_group"] = "user-write"
         for key in ("title", "source_ref", "domain", "hall", "room", "topic"):
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 metadata[key] = str(value).strip()
+        normalize_taxonomy(metadata)
 
         result = await self.add_memory(text, user_id=user_id, metadata=metadata, infer=infer)
         new_ids = added_memory_ids(result)
-        self._fan_out_staleness(new_ids, metadata)
+        await self._fan_out_staleness(new_ids, metadata)
         if len(new_ids) == 1:
             id_note = f" (id={new_ids[0]})"
         elif new_ids:
@@ -2336,29 +2547,33 @@ class ReliquaryChatProxy:
                     await asyncio.to_thread(self.compiled_memory.update, info.memory_id, text, metadata=metadata)
                     return info.memory_id
                 except Exception:
-                    LOG.exception("Compiled re-index failed for slug=%s; adding fresh", info.slug)
+                    LOG.exception("Compiled re-index failed for slug=%s", info.slug)
+                    # Mem0 writes the vector before its history row, so a failed
+                    # update may have landed. Add a replacement only once the record
+                    # is confirmed absent: a second vector would keep the old text
+                    # ranking for this page, and delete_page drops only one.
+                    existing = await asyncio.to_thread(self.compiled_memory.get, info.memory_id)
+                    if existing is not None:
+                        landed = isinstance(existing, dict) and \
+                            (existing.get("metadata") or {}).get("blob_ref") == metadata.get("blob_ref")
+                        if landed:
+                            return info.memory_id
+                        raise
             result = await asyncio.to_thread(self.compiled_memory.add, text, user_id=user_id, metadata=metadata, infer=False)
-            if info.memory_id:
-                # The failed update left the old vector behind; best-effort drop
-                # it so stale synthesis text can't outrank (and outlive) the
-                # fresh index — delete_page only removes the latest memory_id.
-                try:
-                    await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
-                except Exception:
-                    LOG.warning("Could not remove superseded compiled vector %s for slug=%s",
-                                info.memory_id, info.slug)
         ids = added_memory_ids(result)
         return ids[0] if ids else None
 
     async def handle_compile_page_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
         async with self.page_write_lock:
-            return await self._compile_page(arguments, allow_user_id=allow_user_id)
+            # The page transaction spans registry and index writes in worker
+            # threads; a cancelled caller must not release the lock mid-way.
+            return await drain_on_cancel(self._compile_page(arguments, allow_user_id=allow_user_id))
 
     async def _compile_page(self, arguments: dict[str, Any], *, allow_user_id: bool = False) -> dict[str, Any]:
         if self.pages is None or self.compiled_memory is None:
             return self.mcp_tool_result(text="The compiled layer is not configured.",
                                         structured={"error": "compiled_disabled"}, is_error=True)
-        from compiled import slugify, VALID_STATUSES
+        from compiled import slugify, MAX_SLUG_LENGTH, VALID_STATUSES
         markdown = str(arguments.get("markdown") or "").strip()
         if not markdown:
             return self.mcp_tool_result(text="A non-empty `markdown` is required.",
@@ -2380,7 +2595,7 @@ class ReliquaryChatProxy:
         for key in ("derived_from", "supersedes"):
             value = arguments.get(key)
             if value is None:
-                value = []
+                continue  # omitted: a re-file inherits the page's provenance
             elif isinstance(value, (str, bytes)):
                 value = [value]
             elif not isinstance(value, (list, tuple)):
@@ -2388,32 +2603,139 @@ class ReliquaryChatProxy:
                     text=f"`{key}` must be an array of memory ids.",
                     structured={"error": "invalid_argument", "key": key}, is_error=True)
             id_lists[key] = [str(x).strip() for x in value if str(x).strip()]
-        derived_from = id_lists["derived_from"]
-        supersedes = id_lists["supersedes"]
-        frontmatter: dict[str, Any] = {"title": title or slug, "status": status,
-                                       "derived_from": derived_from, "supersedes": supersedes}
+        previous = self.pages.get(slug)
+        if previous is None and len(slug) > MAX_SLUG_LENGTH:
+            return self.mcp_tool_result(
+                text=f"The page slug is {len(slug)} characters; pass a `slug` of at most {MAX_SLUG_LENGTH}.",
+                structured={"error": "slug_too_long", "max_length": MAX_SLUG_LENGTH}, is_error=True)
+        if previous is None:
+            # fetch resolves pages before catalog records and live memories, so a
+            # new slug must not take over an existing record id.
+            shadowed = bool(self.catalog and slug in self.catalog.records_by_id)
+            if not shadowed:
+                try:
+                    async with self._read_lock():
+                        shadowed = await asyncio.to_thread(self.memory.get, slug) is not None
+                except Exception:
+                    LOG.debug("Slug collision probe failed for %s", slug, exc_info=True)
+            if shadowed:
+                return self.mcp_tool_result(
+                    text=f"The slug {slug!r} is already a record id; pass a different `slug`.",
+                    structured={"error": "slug_conflict", "slug": slug}, is_error=True)
+        frontmatter: dict[str, Any] = {"status": status, **id_lists}
+        if title or previous is None:
+            frontmatter["title"] = title or slug
         for key in ("domain", "hall", "room", "topic"):
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 frontmatter[key] = str(value).strip()
+        normalize_taxonomy(frontmatter)
         try:
             info = await asyncio.to_thread(self.pages.put_revision, slug, markdown, frontmatter)
         except BlobTooLarge as exc:
             return self.mcp_tool_result(text=str(exc), structured={"error": "too_large", "size": exc.size, "max_bytes": exc.max_bytes}, is_error=True)
         user_id = str(arguments.get("user_id") or self.settings.user_id) if allow_user_id else self.settings.user_id
-        metadata = {"kind": "synthesis", "source_group": "compiled", "slug": slug,
-                    "blob_ref": info.current_blob, "derived_from": derived_from}
-        for key in ("domain", "hall", "room", "topic"):
-            if getattr(info, key):
-                metadata[key] = getattr(info, key)
-        memory_id = await self._index_compiled_page(info, markdown, user_id=user_id, metadata=metadata)
-        if memory_id:
-            self.pages.set_memory_id(slug, memory_id)
+        metadata = self._compiled_metadata(info)
+        try:
+            memory_id = await self._index_compiled_page(info, markdown, user_id=user_id, metadata=metadata)
+        except Exception:
+            LOG.exception("Compiled indexing failed for slug=%s; restoring the previous page state", slug)
+            memory_id = None
+        if not memory_id:
+            # The registry commits before the index write; without this, a
+            # failure left a current revision that search never sees (or, for
+            # an existing page, registry text that diverges from the index).
+            rolled_back = await asyncio.to_thread(self.pages.rollback_revision, slug, previous, info)
+            if not rolled_back:
+                confirmed = False
+                text = (f"Could not index page slug={slug}; another writer changed the page meanwhile, "
+                        "so it was left as that writer filed it.")
+            elif previous is None or not previous.memory_id:
+                # Mem0 inserts the vector before it can fail, so a failed add may
+                # still have left one behind; remove it.
+                confirmed = await self._purge_untracked_vectors(slug, user_id=user_id, keep=None)
+                if previous is None:
+                    text = (f"Could not index page slug={slug}; the page was not filed. Retry later."
+                            if confirmed else
+                            f"Could not index page slug={slug}; the page was not filed, but an index entry "
+                            "for it may remain (search ignores it while no page has this slug).")
+                else:
+                    text = f"Could not index page slug={slug}; the page was left as it was."
+            else:
+                # The failed write may still have changed the index entry.
+                confirmed = await self._reindex_restored_page(slug, user_id=user_id)
+                restored = self.pages.get(slug)
+                purged = await self._purge_untracked_vectors(
+                    slug, user_id=user_id, keep=restored.memory_id if restored else None)
+                confirmed = confirmed and purged
+                text = (f"Could not index page slug={slug}; the page and its index entry are back at the "
+                        "previous revision. Retry later." if confirmed else
+                        f"Could not index page slug={slug}. Its previous revision was restored, but its index "
+                        "entry could not be confirmed to match it.")
+            if not confirmed and previous is not None:
+                await asyncio.to_thread(self.pages.set_index_unconfirmed, slug)
+                text += " The page is listed under `unindexed` in reliquary://needs-review until it is re-filed."
+            return self.mcp_tool_result(
+                text=text, structured={"error": "index_failed", "slug": slug, "index_confirmed": confirmed},
+                is_error=True)
+        await asyncio.to_thread(self.pages.set_memory_id, slug, memory_id)
         url = self._signed_blob_url(info.current_blob)
         return self.mcp_tool_result(
             text=f"Filed synthesis page slug={slug} (revision {info.current_blob[:12]}, status={status}).",
             structured={"slug": slug, "revision": info.current_blob, "memory_id": memory_id,
-                        "url": url, "derived_from": derived_from, "status": status})
+                        "url": url, "derived_from": info.derived_from, "status": status})
+
+    @staticmethod
+    def _compiled_metadata(info) -> dict[str, Any]:
+        metadata = {"kind": "synthesis", "source_group": "compiled", "slug": info.slug,
+                    "blob_ref": info.current_blob, "derived_from": info.derived_from}
+        for key in ("domain", "hall", "room", "topic"):
+            if getattr(info, key):
+                metadata[key] = getattr(info, key)
+        return metadata
+
+    async def _purge_untracked_vectors(self, slug: str, *, user_id: str, keep: str | None) -> bool:
+        """Delete compiled vectors that carry ``slug`` in their metadata but are
+        not the page's tracked record ``keep`` (a failed add can land its vector
+        before Mem0 raises). True once none is left; False when the index could
+        not be listed or a stray could not be removed."""
+        try:
+            async with self.memory_lock.write():
+                get_all = self.compiled_memory.get_all
+                result = await asyncio.to_thread(get_all, **self._get_all_kwargs(
+                    get_all, user_id=user_id, top_k=100, metadata_filters={"slug": slug}))
+                strays = [str(record["id"]) for record in self._memory_results(result)
+                          if isinstance(record, dict) and record.get("id") and str(record["id"]) != keep
+                          and (record.get("metadata") or {}).get("slug") == slug]
+                for memory_id in strays:
+                    try:
+                        await asyncio.to_thread(self.compiled_memory.delete, memory_id)
+                    except Exception:
+                        if await asyncio.to_thread(self.compiled_memory.get, memory_id) is not None:
+                            raise
+        except Exception:
+            LOG.exception("Could not check the compiled index for stray vectors of slug=%s", slug)
+            return False
+        return True
+
+    async def _reindex_restored_page(self, slug: str, *, user_id: str) -> bool:
+        """After a failed compile was rolled back, make the page's index entry
+        describe the restored revision again. True once that is confirmed."""
+        from compiled import markdown_body
+        restored = self.pages.get(slug)
+        body = self.pages.read_body(slug)
+        if restored is None or body is None or not restored.memory_id:
+            return False
+        try:
+            memory_id = await self._index_compiled_page(restored, markdown_body(body[0]), user_id=user_id,
+                                                        metadata=self._compiled_metadata(restored))
+        except Exception:
+            LOG.exception("Could not restore the index entry of slug=%s after a failed compile", slug)
+            return False
+        if not memory_id:
+            return False
+        await asyncio.to_thread(self.pages.set_memory_id, slug, memory_id)
+        return True
 
     async def handle_list_pages_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.pages is None:
@@ -2421,7 +2743,11 @@ class ReliquaryChatProxy:
                                         structured={"error": "compiled_disabled"}, is_error=True)
         domain = str(arguments.get("domain") or "").strip() or None
         status = str(arguments.get("status") or "").strip() or None
-        pages = self.pages.list(domain=domain, status=status)
+        pages = self.pages.list(status=status)
+        if domain is not None:
+            # The slug form new pages store, or the raw spelling of older pages.
+            spellings = {domain, normalize_taxonomy_value(domain)}
+            pages = [p for p in pages if p.domain in spellings]
         summaries = [{"slug": p.slug, "title": p.title, "domain": p.domain, "status": p.status,
                       "updated_at": p.updated_at, "revision": p.current_blob} for p in pages]
         return self.mcp_tool_result(text=f"{len(summaries)} page(s).", structured={"pages": summaries})
@@ -2448,7 +2774,7 @@ class ReliquaryChatProxy:
 
     async def handle_delete_page_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         async with self.page_write_lock:
-            return await self._delete_page(arguments)
+            return await drain_on_cancel(self._delete_page(arguments))
 
     async def _delete_page(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.pages is None:
@@ -2471,7 +2797,14 @@ class ReliquaryChatProxy:
                 # Same lock every other compiled-store op takes: embedded local
                 # Qdrant is not safe under concurrent read/write.
                 async with self.memory_lock.write():
-                    await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
+                    try:
+                        await asyncio.to_thread(self.compiled_memory.delete, info.memory_id)
+                    except Exception:
+                        # mem0 raises for an id it does not hold. A vector that is
+                        # already gone (collection rebuilt/restored, or a crash after
+                        # an earlier vector delete) must not wedge the page forever.
+                        if await asyncio.to_thread(self.compiled_memory.get, info.memory_id) is not None:
+                            raise
                 deleted_memory = info.memory_id
             except Exception as exc:
                 LOG.warning("delete_page: aborting; could not delete indexed memory %s for %s: %s",
@@ -2527,28 +2860,128 @@ class ReliquaryChatProxy:
                         "target_id": target_id, "status": "proposed"})
 
     def _load_pending_uploads(self) -> None:
-        """Restore persisted upload slots (if a state_dir is configured) and reap
-        any that already expired while the process was down — otherwise bytes that
-        were uploaded but never committed would orphan their blob across restarts."""
+        """Restore persisted upload slots (if a state_dir is configured). A
+        slot's blob reference is only ever released or handed over through its
+        own "upload:<id>" marker, and only when its owner is certain; anything
+        else is kept as bytes (a leak lint reports) rather than guessed. So a
+        record is restored only when it holds its marker and its commit history
+        is known. Forgotten, with no reference touched: malformed records,
+        records of the deployed build (no marker; their clients get
+        unknown_upload and upload again), records whose reference already went
+        to their caption, and marked records of unknown commit history."""
         if not self.pending_upload_store:
             return
         restored: dict[str, PendingUpload] = {}
-        for upload_id, rec in self.pending_upload_store.load().items():
-            if not isinstance(rec, dict):
+        loaded = self.pending_upload_store.load()
+        for upload_id, rec in loaded.items():
+            upload = self._pending_upload_from_record(upload_id, rec)
+            if upload is None:
                 continue
-            try:
-                restored[upload_id] = PendingUpload(**rec)
-            except TypeError:
+            if not upload.blob_id:
+                upload.commit_users = upload.commit_users or []
+            elif upload.commit_users is None or not self._holds_marker(upload):
                 continue
+            restored[upload_id] = upload
         self.pending_uploads = restored
+        if len(restored) != len(loaded):
+            self._save_pending_uploads()
         self._cleanup_expired_uploads()
 
-    def _save_pending_uploads(self) -> None:
+    @staticmethod
+    def _slot_marker(upload_id: str) -> str:
+        return f"{UPLOAD_OWNER_PREFIX}{upload_id}"
+
+    def _holds_marker(self, upload: PendingUpload) -> bool:
+        """Whether the slot still holds its blob reference (its marker)."""
+        return bool(upload.blob_id) and self.blobs.is_owner(upload.blob_id, self._slot_marker(upload.id))
+
+    def _find_slot_caption(self, upload: PendingUpload, users: list[str]) -> tuple[str | None, str | None]:
+        """Read-only lookup (worker thread) for a caption carrying this slot's
+        server-set upload_id and blob_ref under any of ``users``:
+        ("committed", caption_id), ("pending", None) when there is none,
+        (None, None) when the memory backend could not be read."""
+        get_all = getattr(self.memory, "get_all", None)
+        for user in users:
+            try:
+                result = get_all(**self._get_all_kwargs(get_all, user_id=user, top_k=20,
+                                                        metadata_filters={"upload_id": upload.id}))
+            except Exception:
+                LOG.warning("Could not look up a caption for upload slot %s", upload.id, exc_info=True)
+                return None, None
+            for record in self._memory_results(result):
+                metadata = (record.get("metadata") or {}) if isinstance(record, dict) else {}
+                if record.get("id") and metadata.get("upload_id") == upload.id \
+                        and metadata.get("blob_ref") == upload.blob_id:
+                    return "committed", str(record["id"])
+        return "pending", None
+
+    def _settling_lock(self):
+        """Lock for caption lookups, which only read: none with a server-backed
+        store (concurrent reads are safe, and a slow backend must not hold
+        writers back), the exclusive lock with an embedded store (not
+        thread-safe)."""
+        return contextlib.nullcontext() if self._concurrent_reads else self.memory_lock.write()
+
+    async def _look_up_slot(self, upload: PendingUpload, users: tuple[str, ...] = ()) -> tuple[str | None, str | None]:
+        """Whether a commit attempt of this slot wrote a caption, looking under
+        every user an attempt recorded plus ``users``; changes nothing. No
+        recorded attempt means no caption can exist: ("pending", None) without
+        asking the backend. The lookup runs in a worker thread and is drained,
+        so a cancelled caller keeps its claim on the slot until it finishes."""
+        everyone = list(dict.fromkeys([*(upload.commit_users or []), *users]))
+        if not everyone:
+            return "pending", None
+
+        async def lookup():
+            async with self._settling_lock():
+                return await asyncio.to_thread(self._find_slot_caption, upload, everyone)
+        return await drain_on_cancel(lookup())
+
+    @staticmethod
+    def _pending_upload_from_record(upload_id: str, rec: Any) -> PendingUpload | None:
+        """Type-check one persisted slot; None when it is unusable. Unknown keys
+        are ignored so a slot written by a newer version still loads."""
+        if not isinstance(rec, dict) or rec.get("id") != upload_id:
+            return None
+        fields: dict[str, Any] = {}
+        for name, kinds in (("id", str), ("created_at", (int, float)), ("expires_at", (int, float)),
+                            ("expected_mimetype", str), ("expected_size", int), ("filename", str),
+                            ("blob_id", str), ("mimetype", str), ("size", int), ("profile", str)):
+            value = rec.get(name)
+            if value is None:
+                if name in ("id", "created_at", "expires_at"):
+                    return None
+                continue
+            if isinstance(value, bool) or not isinstance(value, kinds):
+                return None
+            fields[name] = value
+        blob_id = fields.get("blob_id")
+        if blob_id is not None and not re.fullmatch(r"[0-9a-f]{64}", blob_id):
+            return None
+        users = rec.get("commit_users")
+        if isinstance(users, list) and all(isinstance(user, str) for user in users):
+            fields["commit_users"] = list(users)
+        elif isinstance(rec.get("commit_user_id"), str):  # a 0.5.2 pre-release spelling
+            fields["commit_users"] = [rec["commit_user_id"]]
+        return PendingUpload(**fields)
+
+    def _save_pending_uploads(self) -> bool:
+        """Persist the slot table; False (logged) when the write failed. Most
+        saves only forget records, and a stale record on disk is forgotten at
+        the next start because its marker is gone. The three saves later steps
+        rely on (a new slot, its uploaded blob, a commit attempt's user) check
+        the result and undo their in-memory change when it is False, so memory
+        never runs ahead of disk."""
         if not self.pending_upload_store:
-            return
-        self.pending_upload_store.save(
-            {upload_id: asdict(upload) for upload_id, upload in self.pending_uploads.items()}
-        )
+            return True
+        try:
+            self.pending_upload_store.save(
+                {upload_id: asdict(upload) for upload_id, upload in self.pending_uploads.items()}
+            )
+        except Exception:
+            LOG.exception("Could not persist the upload slot table")
+            return False
+        return True
 
     def _drop_upload(self, upload_id: str) -> None:
         """Forget a slot and persist the change."""
@@ -2556,26 +2989,109 @@ class ReliquaryChatProxy:
         self._save_pending_uploads()
 
     def _cleanup_expired_uploads(self) -> None:
+        """Forget expired slots that hold no blob reference. Slots that may still
+        hold one need a memory lookup first (_reap_expired_uploads)."""
         now = time.time()
         expired = [
             upload_id
             for upload_id, upload in self.pending_uploads.items()
             if upload.expires_at <= now and upload_id not in self._busy_uploads
+            and not self._holds_marker(upload)
         ]
         for upload_id in expired:
-            upload = self.pending_uploads.pop(upload_id, None)
-            if upload and upload.blob_id:
-                # Reclaim the slot's ref only when one is actually unaccounted
-                # for: each owner holds one ref, so ref_count > len(owners) means
-                # the extra ref is this uncommitted upload's (covers bytes that
-                # deduped onto an already-owned blob). ref_count <= owners means
-                # the slot outlived a successful commit (crash before drop) and
-                # its ref now backs a committed memory — never delete those.
-                info = self.blobs.info(upload.blob_id)
-                if info is not None and info.ref_count > len(info.owners):
-                    self.blobs.delete(upload.blob_id)
+            self.pending_uploads.pop(upload_id, None)
         if expired:
             self._save_pending_uploads()
+
+    def _schedule_reap(self) -> None:
+        """Forget empty expired slots, and start the single background pass that
+        settles expired slots still holding a blob reference, unless one is
+        running or the back-off after an unanswered lookup is in force. Callers
+        never wait for it, so a slow or hung memory backend holds up no request."""
+        self._cleanup_expired_uploads()
+        if self._reap_task is not None and not self._reap_task.done():
+            return
+        if time.monotonic() < self._reap_retry_at:
+            return
+        now = time.time()
+        if not any(upload.expires_at <= now and upload_id not in self._busy_uploads
+                   for upload_id, upload in self.pending_uploads.items()):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._reap_task = loop.create_task(self._settle_expired_uploads())
+
+    async def _settle_expired_uploads(self) -> None:
+        """The settling pass for expired slots still holding their marker. Each
+        slot is claimed for the whole pass, so no commit or caption delete can
+        touch it meanwhile; its lookup is drained, so the claim outlives a
+        cancelled pass until the worker is done. A caption written by one of
+        the slot's recorded attempts gets the reference; with none it is
+        released; if the backend cannot answer, the record and its reference
+        stay and the back-off starts. The blob store re-checks the marker when
+        it applies the result. Stops starting lookups after
+        UPLOAD_SETTLE_BUDGET seconds."""
+        now = time.time()
+        due = [upload for upload_id, upload in self.pending_uploads.items()
+               if upload.expires_at <= now and upload_id not in self._busy_uploads]
+        self._busy_uploads.update(upload.id for upload in due)
+        deadline = time.monotonic() + UPLOAD_SETTLE_BUDGET
+        settled: list[str] = []
+        try:
+            for upload in due:
+                if time.monotonic() >= deadline:
+                    self._reap_retry_at = time.monotonic() + UPLOAD_RECONCILE_RETRY
+                    break
+                if not self._holds_marker(upload):
+                    settled.append(upload.id)  # holds nothing
+                    continue
+                try:
+                    state, caption = await self._look_up_slot(upload)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOG.exception("Settling upload slot %s failed", upload.id)
+                    state, caption = None, None
+                if self._settling_abandoned:
+                    return  # shutdown already completed without this pass
+                if state is None:
+                    self._reap_retry_at = time.monotonic() + UPLOAD_RECONCILE_RETRY
+                    continue
+                self.blobs.settle_owner(upload.blob_id, self._slot_marker(upload.id),
+                                        to=caption if state == "committed" else None)
+                settled.append(upload.id)
+        finally:
+            if not self._settling_abandoned:
+                self._busy_uploads.difference_update(upload.id for upload in due)
+                for upload_id in settled:
+                    self.pending_uploads.pop(upload_id, None)
+                self._save_pending_uploads()
+
+    async def _stop_settling(self) -> None:
+        """At shutdown: cancel the settling pass and wait (bounded) for it to
+        drain. A worker thread cannot be stopped: if its lookup is still
+        blocked after the grace period, the pass is abandoned. Its slots stay
+        claimed, and when the lookup returns the pass applies and persists
+        nothing; the slots are settled after the next start."""
+        task = self._reap_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        done, _pending = await asyncio.wait({task}, timeout=UPLOAD_SHUTDOWN_GRACE)
+        if not done:
+            self._settling_abandoned = True
+            LOG.warning("Upload settling left a memory-backend lookup running at shutdown; it will "
+                        "apply nothing, and its slots are settled after the next start")
+
+    async def _reap_expired_uploads(self) -> None:
+        """Schedule a settling pass and wait for the running one to finish (for
+        tests and maintenance; request paths only schedule). Never raises."""
+        self._schedule_reap()
+        task = self._reap_task
+        if task is not None and not task.done():
+            await asyncio.wait({task})
 
     def _new_upload_id(self) -> str:
         while True:
@@ -2586,7 +3102,7 @@ class ReliquaryChatProxy:
     def handle_create_image_upload_tool(
         self, arguments: dict[str, Any], *, profile: EndpointProfile | None = None
     ) -> dict[str, Any]:
-        self._cleanup_expired_uploads()
+        self._schedule_reap()
         mimetype = str(arguments.get("mimetype") or "application/octet-stream").strip()
         filename_raw = arguments.get("filename")
         filename = str(filename_raw).strip() if filename_raw is not None else None
@@ -2627,14 +3143,20 @@ class ReliquaryChatProxy:
             expected_size=expected_size,
             filename=filename,
             profile=profile.name if profile else None,
+            commit_users=[],
         )
-        self._save_pending_uploads()
+        if not self._save_pending_uploads():
+            self.pending_uploads.pop(upload_id, None)
+            return self.mcp_tool_result(
+                text="Could not record the upload slot (server storage); retry shortly.",
+                structured={"error": "state_write_failed"}, is_error=True)
         upload_url = self._absolute_url(f"/uploads/{upload_id}")
+        commit_tool = "commit_image_upload" if profile and profile.name == "openai" else "reliquary_commit_image_upload"
         return self.mcp_tool_result(
             text=(
                 f"Created upload slot {upload_id}. POST the raw bytes to {upload_url} with the SAME "
                 "`Authorization: Bearer <token>` header you use for this MCP endpoint (anonymous "
-                "uploads are rejected), then call commit_image_upload with the upload_id and caption."
+                f"uploads are rejected), then call {commit_tool} with the upload_id and caption."
             ),
             structured={
                 "upload_id": upload_id,
@@ -2694,7 +3216,7 @@ class ReliquaryChatProxy:
             await self.send_json(send, 409, {"error": "upload_in_progress", "upload_id": upload_id})
             return
         if upload.expires_at <= time.time():
-            self._cleanup_expired_uploads()
+            self._schedule_reap()
             await self.send_json(send, 410, {"error": "upload_expired", "upload_id": upload_id})
             return
         if upload.blob_id:
@@ -2738,7 +3260,7 @@ class ReliquaryChatProxy:
             return
         content_type = headers.get("content-type") or upload.expected_mimetype
         try:
-            info = self.blobs.put(data, mimetype=content_type)
+            info = self.blobs.put(data, mimetype=content_type, owner=f"{UPLOAD_OWNER_PREFIX}{upload_id}")
         except BlobTooLarge as exc:
             await self.send_json(
                 send,
@@ -2749,7 +3271,13 @@ class ReliquaryChatProxy:
         upload.blob_id = info.id
         upload.mimetype = info.mimetype
         upload.size = info.size
-        self._save_pending_uploads()
+        if not self._save_pending_uploads():
+            # Undo, so memory matches disk: no commit can have started (the slot
+            # is claimed), so the marked reference is certainly this slot's.
+            upload.blob_id = upload.mimetype = upload.size = None
+            self.blobs.settle_owner(info.id, self._slot_marker(upload_id))
+            await self.send_json(send, 503, {"error": "state_write_failed", "upload_id": upload_id})
+            return
         await self.send_json(
             send,
             201,
@@ -2800,14 +3328,9 @@ class ReliquaryChatProxy:
                 text="This upload is already being processed; retry shortly.",
                 structured={"error": "upload_in_progress", "upload_id": upload_id}, is_error=True)
         if upload.expires_at <= time.time():
-            self._drop_upload(upload_id)
-            if upload.blob_id:
-                # Same guard as _cleanup_expired_uploads: release the slot's ref
-                # only when one is unaccounted for (ref_count > owners); a slot
-                # that outlived a successful commit backs a committed memory.
-                blob_info = self.blobs.info(upload.blob_id)
-                if blob_info is not None and blob_info.ref_count > len(blob_info.owners):
-                    self.blobs.delete(upload.blob_id)
+            # Settled (reference released or handed to its caption) by the
+            # background settling pass, which looks the caption up first.
+            self._schedule_reap()
             return self.mcp_tool_result(
                 text=f"Upload slot {upload_id} has expired.",
                 structured={"error": "upload_expired", "upload_id": upload_id},
@@ -2817,6 +3340,15 @@ class ReliquaryChatProxy:
             return self.mcp_tool_result(
                 text=f"Upload slot {upload_id} has no uploaded bytes yet.",
                 structured={"error": "upload_not_ready", "upload_id": upload_id},
+                is_error=True,
+            )
+        if not self._holds_marker(upload):
+            # Its reference is gone (handed to a caption or released): there is
+            # nothing this slot can commit.
+            self._drop_upload(upload_id)
+            return self.mcp_tool_result(
+                text=f"Upload slot {upload_id} no longer holds its bytes; upload the image again.",
+                structured={"error": "unknown_upload", "upload_id": upload_id},
                 is_error=True,
             )
 
@@ -2830,7 +3362,7 @@ class ReliquaryChatProxy:
                 structured={"error": "invalid_metadata"},
                 is_error=True,
             )
-        metadata = dict(raw_metadata)
+        metadata = clean_caller_metadata(raw_metadata)
         metadata.setdefault("source", "mcp")
         metadata["kind"] = "image"
         metadata["source_group"] = "user-write"
@@ -2842,47 +3374,99 @@ class ReliquaryChatProxy:
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 metadata[key] = str(value).strip()
+        normalize_taxonomy(metadata)
 
+        # Claimed for the whole commit: no settling pass or caption delete can
+        # act on the slot meanwhile, and expiry cannot release its reference.
+        # Drained: a cancelled caller must not leave a half-done commit.
         self._busy_uploads.add(upload_id)
         try:
-            return await self._commit_upload(upload, caption, user_id, metadata)
+            return await drain_on_cancel(self._commit_upload(upload, caption, user_id, metadata))
         finally:
             self._busy_uploads.discard(upload_id)
 
     async def _commit_upload(self, upload: PendingUpload, caption: str, user_id: str, metadata: dict) -> dict[str, Any]:
+        """Commit under the slot's claim. The slot's marked reference is only
+        handed to a caption that exists, or released when it is certain that
+        no recorded attempt wrote one; when that cannot be established, the
+        record and its reference stay for the settling pass."""
         upload_id = upload.id
+        marker = self._slot_marker(upload_id)
+        if upload.commit_users:
+            # An earlier attempt may have written its caption (under its own
+            # user, or this one) and stopped before handing the reference over.
+            state, found = await self._look_up_slot(upload, (user_id,))
+            if state is None:
+                return self.mcp_tool_result(
+                    text=f"Could not check whether upload slot {upload_id} was already committed; retry shortly.",
+                    structured={"error": "upload_in_progress", "upload_id": upload_id}, is_error=True)
+            if state == "committed":
+                self._drop_upload(upload_id)
+                self.blobs.settle_owner(upload.blob_id, marker, to=found)
+                return self.mcp_tool_result(
+                    text=f"Upload slot {upload_id} was already committed.",
+                    structured={"error": "already_committed", "upload_id": upload_id, "blob_id": upload.blob_id},
+                    is_error=True,
+                )
+        # Write-ahead: every attempt persists its user before a caption can
+        # exist, also when the user is already listed in memory (an earlier
+        # save may have failed). If this save fails, nothing is written and
+        # memory goes back to what is on disk.
+        recorded = upload.commit_users
+        if recorded is None or user_id not in recorded:
+            upload.commit_users = [*(recorded or []), user_id]
+        if not self._save_pending_uploads():
+            upload.commit_users = recorded
+            return self.mcp_tool_result(
+                text="Could not record the commit attempt (server storage); nothing was written. Retry shortly.",
+                structured={"error": "state_write_failed", "upload_id": upload_id}, is_error=True)
+        failure: Exception | None = None
         try:
             result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)
-        except Exception:
-            self.blobs.delete(upload.blob_id)
-            self._drop_upload(upload_id)
-            raise
-        new_ids = added_memory_ids(result)
-        memory_id = new_ids[0] if new_ids else None
+            new_ids = added_memory_ids(result)
+            memory_id = new_ids[0] if new_ids else None
+        except Exception as exc:
+            failure, memory_id = exc, None
         if memory_id is None:
-            self.blobs.delete(upload.blob_id)
-            self._drop_upload(upload_id)
-            return self.mcp_tool_result(
-                text="Uploaded the blob but failed to create its caption memory; rolled back.",
-                structured={"error": "memory_write_failed", "blob_id": upload.blob_id, "upload_id": upload_id},
-                is_error=True,
-            )
+            # Mem0 inserts the vector before its history write, so the caption
+            # may exist although add() failed: ask before releasing anything.
+            state, memory_id = await self._look_up_slot(upload)
+            if state != "committed":
+                if state == "pending":  # certain: no recorded attempt wrote a caption
+                    self._drop_upload(upload_id)
+                    self.blobs.settle_owner(upload.blob_id, marker)
+                else:
+                    self._save_pending_uploads()  # unknown: keep the record and its reference
+                if failure is not None:
+                    raise failure
+                return self.mcp_tool_result(
+                    text="Uploaded the blob but failed to create its caption memory.",
+                    structured={"error": "memory_write_failed", "blob_id": upload.blob_id, "upload_id": upload_id},
+                    is_error=True,
+                )
+            LOG.warning("Caption for upload %s landed although Mem0 failed; committing it", upload_id)
         try:
-            self.blobs.register_owner(upload.blob_id, memory_id)
-        except Exception:
-            LOG.exception(
-                "Failed to register uploaded blob owner blob_id=%s memory_id=%s; rolling back",
-                upload.blob_id,
-                memory_id,
-            )
+            handed_over = self.blobs.settle_owner(upload.blob_id, marker, to=memory_id)
+            error = None if handed_over else "the upload slot no longer holds a blob reference"
+        except Exception as exc:
+            error = str(exc)
+        if error is not None:
+            LOG.error("Failed to hand blob %s to caption %s: %s; rolling back", upload.blob_id, memory_id, error)
             try:
                 await self.delete_memory(memory_id)
+                deleted = True
             except Exception:
                 LOG.exception("Rollback delete_memory failed for memory_id=%s", memory_id)
-            self.blobs.delete(upload.blob_id)
-            self._drop_upload(upload_id)
+                deleted = False
+            if deleted:
+                # Every recorded attempt was checked: no other caption holds a
+                # claim on these bytes.
+                self._drop_upload(upload_id)
+                self.blobs.settle_owner(upload.blob_id, marker)
+            else:
+                self._save_pending_uploads()  # the caption exists: keep its bytes for settling
             return self.mcp_tool_result(
-                text="Failed to finalize upload ownership; rolled back.",
+                text="Failed to finalize upload ownership.",
                 structured={
                     "error": "ownership_registration_failed",
                     "blob_id": upload.blob_id,
@@ -2895,7 +3479,11 @@ class ReliquaryChatProxy:
         blob_id = upload.blob_id
         mimetype = upload.mimetype
         size = upload.size
-        self._drop_upload(upload_id)
+        self._drop_upload(upload_id)  # before the awaited fan-out, which can be cancelled        blob_id = upload.blob_id
+        mimetype = upload.mimetype
+        size = upload.size
+        self._drop_upload(upload_id)  # before the awaited fan-out, which can be cancelled
+        await self._fan_out_staleness([memory_id], metadata)
         return self.mcp_tool_result(
             text=f"Committed uploaded image (blob_id={blob_id}, memory_id={memory_id}): {trim_text(caption, 160)}",
             structured={
@@ -2991,7 +3579,7 @@ class ReliquaryChatProxy:
                 structured={"error": "invalid_metadata"},
                 is_error=True,
             )
-        metadata = dict(raw_metadata)
+        metadata = clean_caller_metadata(raw_metadata)
 
         fetched_mimetype: str | None = None
         if has_url:
@@ -3038,6 +3626,7 @@ class ReliquaryChatProxy:
             value = arguments.get(key)
             if value is not None and str(value).strip():
                 metadata[key] = str(value).strip()
+        normalize_taxonomy(metadata)
 
         try:
             result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)
@@ -3074,6 +3663,7 @@ class ReliquaryChatProxy:
                 structured={"error": "ownership_registration_failed", "blob_id": info.id, "memory_id": memory_id},
                 is_error=True,
             )
+        await self._fan_out_staleness([memory_id], metadata)
         url = self._signed_blob_url(info.id)
         return self.mcp_tool_result(
             text=f"Stored image (blob_id={info.id}, memory_id={memory_id}): {trim_text(caption, 160)}",
@@ -3159,15 +3749,21 @@ class ReliquaryChatProxy:
                 is_error=True,
             )
         blob_ref = metadata.get("blob_ref")
-        if metadata.get("kind") != "image" or not blob_ref or not self.blobs.is_owner(str(blob_ref), memory_id):
+        owns = bool(blob_ref) and self.blobs.is_owner(str(blob_ref), memory_id)
+        slot = self._caption_slot(metadata)
+        # A caption whose commit stopped before the hand-over owns nothing yet;
+        # its bytes are still held by its upload slot's marker.
+        if metadata.get("kind") != "image" or not blob_ref or not (owns or (slot and self._holds_marker(slot))):
             return self.mcp_tool_result(
                 text=f"memory_id={memory_id} is not a deletable image (no owned blob).",
                 structured={"error": "not_an_image", "id": memory_id},
                 is_error=True,
             )
-        await self.delete_memory(memory_id)
-        self._fan_out_staleness([memory_id], metadata)
-        unlinked = self.blobs.delete(str(blob_ref), owner=memory_id)
+        busy = await self._delete_caption(memory_id, metadata, owned_blob=str(blob_ref) if owns else None)
+        if busy is not None:
+            return busy
+        unlinked = self.blobs.info(str(blob_ref)) is None
+        await self._fan_out_staleness([memory_id], metadata)
         return self.mcp_tool_result(
             text=f"Deleted image memory_id={memory_id} (blob_id={blob_ref}, blob_unlinked={bool(unlinked)}).",
             structured={
@@ -3177,6 +3773,46 @@ class ReliquaryChatProxy:
                 "blob_unlinked": bool(unlinked),
             },
         )
+
+    def _caption_slot(self, metadata: dict[str, Any]) -> PendingUpload | None:
+        """The pending upload slot an image caption came from (its server-set
+        upload_id and blob_ref), if that slot is still recorded."""
+        upload_id = metadata.get("upload_id")
+        slot = self.pending_uploads.get(upload_id) if isinstance(upload_id, str) else None
+        if slot is None or not slot.blob_id or slot.blob_id != metadata.get("blob_ref"):
+            return None
+        return slot
+
+    async def _delete_caption(self, memory_id: str, metadata: dict[str, Any], *,
+                              owned_blob: str | None) -> dict[str, Any] | None:
+        """Delete a memory and, in one transaction drained against caller
+        cancellation, release the blob reference it owns (``owned_blob``) and
+        retire the pending slot it came from: that slot's marked reference was
+        held for this caption, so it goes with it. Claims the slot first; if a
+        commit or settling pass holds it, nothing is deleted and the caller is
+        asked to retry. Returns that error result, or None when done."""
+        slot = self._caption_slot(metadata)
+        if slot is not None:
+            if slot.id in self._busy_uploads:
+                return self.mcp_tool_result(
+                    text="This image's upload is being processed; retry shortly.",
+                    structured={"error": "upload_in_progress", "upload_id": slot.id}, is_error=True)
+            self._busy_uploads.add(slot.id)
+
+        async def transaction():
+            await self.delete_memory(memory_id)
+            if owned_blob:
+                self.blobs.delete(owned_blob, owner=memory_id)
+            if slot is not None:
+                self._drop_upload(slot.id)
+                self.blobs.settle_owner(slot.blob_id, self._slot_marker(slot.id))
+
+        try:
+            await drain_on_cancel(transaction())
+        finally:
+            if slot is not None:
+                self._busy_uploads.discard(slot.id)
+        return None
 
     async def handle_delete_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False, tool_prefix: str = "") -> dict[str, Any]:
         record_id = str(arguments.get("id") or "").strip()
@@ -3242,8 +3878,10 @@ class ReliquaryChatProxy:
                                 "suggested_action": f"Call {tool_prefix}delete_image with memory_id={record_id}."},
                     is_error=True,
                 )
-        await self.delete_memory(record_id)
-        self._fan_out_staleness([record_id], existing_meta)
+        busy = await self._delete_caption(record_id, existing_meta, owned_blob=None)
+        if busy is not None:
+            return busy
+        await self._fan_out_staleness([record_id], existing_meta)
         return self.mcp_tool_result(
             text=f"Deleted memory {existing.get('title', record_id)} (id={record_id}).",
             structured={"deleted": True, "id": record_id, "title": existing.get("title")},
@@ -3305,17 +3943,17 @@ class ReliquaryChatProxy:
         existing_metadata = existing.get("metadata") or {}
         metadata = dict(existing_metadata)
         if isinstance(provided_metadata, dict):
-            metadata.update(provided_metadata)
+            metadata.update(clean_caller_metadata(provided_metadata))
         for key in ("source_group", "kind", "blob_ref", "blob_mime", "blob_size"):
             if key in existing_metadata:
                 metadata[key] = existing_metadata[key]
             else:
                 metadata.pop(key, None)
+        for key in ("import_record_id", "import_content_hash"):
+            metadata.pop(key, None)  # never valid on a user-write (pre-fix forgeries)
         metadata["source_group"] = "user-write"
         await self.update_memory(record_id, new_text, metadata=metadata)
-        self._fan_out_staleness([record_id], existing_metadata)
-        if metadata != existing_metadata:
-            self._fan_out_staleness([record_id], metadata)
+        await self._fan_out_staleness([record_id], existing_metadata, metadata)
         return self.mcp_tool_result(
             text=f"Updated memory id={record_id}: {trim_text(new_text, 160)}",
             structured={"updated": True, "id": record_id, "metadata": metadata},
@@ -3323,7 +3961,12 @@ class ReliquaryChatProxy:
 
     def _enrich_hit(self, hit: dict[str, Any], *, route: str) -> dict[str, Any]:
         metadata = dict(hit.get("metadata") or {})
-        record_id = str(metadata.get("import_record_id") or hit.get("id") or metadata.get("source_ref") or "")
+        import_id = metadata.get("import_record_id") if honours_import_id(metadata) else None
+        if import_id and not (self.catalog and str(import_id) in self.catalog.records_by_id):
+            # fetch resolves import ids only through the catalog; hand out the
+            # memory id instead (still read-only: update/delete refuse imports).
+            import_id = None
+        record_id = str(import_id or hit.get("id") or metadata.get("source_ref") or "")
         record = self.catalog.records_by_id.get(record_id) if self.catalog else None
         title = str(metadata.get("title") or (record.title if record else "<untitled>"))
         text = str(hit.get("memory") or (record.text if record else "")).strip()
@@ -3341,7 +3984,10 @@ class ReliquaryChatProxy:
     def _document_url(self, record_id: str, metadata: dict[str, Any]) -> str:
         blob_ref = metadata.get("blob_ref")
         if isinstance(blob_ref, str) and blob_ref:
-            return self._signed_blob_url(blob_ref)
+            try:
+                return self._signed_blob_url(blob_ref)
+            except ValueError:
+                pass  # malformed blob_ref (forged before caller metadata was cleaned)
         source_url = metadata.get("source_url")
         if isinstance(source_url, str) and source_url.startswith(("http://", "https://")):
             return source_url
@@ -3354,13 +4000,23 @@ class ReliquaryChatProxy:
         try:
             async with self._read_lock():
                 result = await asyncio.to_thread(self.memory.get, record_id)
-        except Exception:
+        except Exception as exc:
             LOG.exception("Could not fetch live memory id=%s", record_id)
-            return None
+            # Vector ids are UUIDs (or integers); the store rejects any other
+            # id, so that is a plain miss. A well-formed id that raised means
+            # the backend is down: say so rather than "not found".
+            import uuid
+            try:
+                uuid.UUID(record_id)
+            except ValueError:
+                if not record_id.isdigit():
+                    return None
+            raise MemoryBackendUnavailable(str(exc)) from exc
         if not isinstance(result, dict):
             return None
         metadata = dict(result.get("metadata") or {})
-        title = str(metadata.get("title") or result.get("memory") or "<untitled>").strip() or "<untitled>"
+        # Same fallback as search: the body is never reused as the title.
+        title = str(metadata.get("title") or "").strip() or "<untitled>"
         memory_text = str(result.get("memory") or "").strip()
         return {
             "id": str(result.get("id") or record_id),
@@ -3375,10 +4031,10 @@ class ReliquaryChatProxy:
 
     async def handle_chat_completions(self, scope: dict[str, Any], receive, send) -> None:
         request_headers = decode_headers(scope)
-        body = await self.read_body(receive)
+        body = await self.read_body(receive, self.request_body_max_bytes())
         try:
             payload = json.loads(body or b"{}")
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # bad JSON, bad UTF-8, too deep
             await self.send_json(send, 400, {"error": "Request body must be valid JSON"})
             return
 
@@ -3389,6 +4045,11 @@ class ReliquaryChatProxy:
 
         original_messages = [message for message in messages if isinstance(message, dict)]
         user_id = payload.pop("reliquary_user_id", None) or request_headers.get("x-reliquary-user-id") or self.settings.user_id
+        if isinstance(user_id, int) and not isinstance(user_id, bool):
+            user_id = str(user_id)
+        if not isinstance(user_id, str):
+            await self.send_json(send, 400, {"error": "`reliquary_user_id` must be a string"})
+            return
         reliquary_limit = self._coerce_int(
             payload.pop("reliquary_limit", self.settings.memory_limit),
             default=self.settings.memory_limit,
@@ -3397,6 +4058,9 @@ class ReliquaryChatProxy:
         )
         reliquary_threshold = coerce_threshold(payload.pop("reliquary_threshold", self.settings.memory_threshold))
         reliquary_query = payload.pop("reliquary_query", None) or latest_user_text(original_messages)
+        if not isinstance(reliquary_query, str):
+            await self.send_json(send, 400, {"error": "`reliquary_query` must be a string"})
+            return
         reliquary_disabled = bool(payload.pop("reliquary_disable", False))
         stream = bool(payload.get("stream"))
 
@@ -3417,12 +4081,13 @@ class ReliquaryChatProxy:
 
         upstream_url = self.url_for(scope, self.settings.upstream_base_url)
         forward_headers = self.forward_headers(request_headers)
+        from helpers import header_safe  # user text: percent-encode so latin-1 headers can't fail
         extra_headers = {
             "x-reliquary-hit-count": str(len(memory_hits)),
-            "x-reliquary-user-id": user_id,
+            "x-reliquary-user-id": header_safe(user_id),
         }
         if reliquary_query:
-            extra_headers["x-reliquary-query"] = trim_text(reliquary_query, 140)
+            extra_headers["x-reliquary-query"] = header_safe(trim_text(reliquary_query, 140))
 
         if stream:
             assistant_text = await self.stream_upstream_request(
@@ -3484,8 +4149,11 @@ class ReliquaryChatProxy:
             await self.send_json(send, 501, {"error": "This proxy has no base URL configured for that endpoint"})
             return
 
+        if self._unsafe_relay_path(scope["path"]):
+            await self.send_json(send, 400, {"error": "invalid_path"})
+            return
         headers = decode_headers(scope)
-        body = await self.read_body(receive)
+        body = await self.read_body(receive, self.request_body_max_bytes())
         url = self.url_for(scope, base_url)
         response = await self.client.request(scope["method"], url, headers=self.forward_headers(headers), content=body)
         await send(
@@ -3505,6 +4173,7 @@ class ReliquaryChatProxy:
         limit: int,
         threshold: float | None,
         filters: dict[str, Any] | None,
+        lexical_min_hits: int | None = None,
     ) -> list[dict[str, Any]]:
         candidate_limit = retrieval_candidate_limit(limit)
         kwargs: dict[str, Any] = {self._search_limit_param: candidate_limit}
@@ -3526,7 +4195,7 @@ class ReliquaryChatProxy:
                 result = await asyncio.to_thread(self.memory.search, query, **kwargs)
         except Exception:
             LOG.exception("Mem0 search failed for user_id=%s", user_id)
-            return []
+            return _BackendFailure()
 
         if not isinstance(result, dict):
             return []
@@ -3534,7 +4203,9 @@ class ReliquaryChatProxy:
         if not isinstance(hits, list):
             return []
         live_hits: list[dict[str, Any]] = []
-        if self._should_run_lexical(query, hits, limit):
+        # The "thin results" gate compares with the page size, not the ranking
+        # pool, so a deep pool does not turn the fallback on for every query.
+        if self._should_run_lexical(query, hits, limit if lexical_min_hits is None else lexical_min_hits):
             live_hits = await self.live_lexical_matches(
                 query,
                 user_id=user_id,
@@ -3591,15 +4262,27 @@ class ReliquaryChatProxy:
         get_all = getattr(self.memory, "get_all", None)
         if get_all is None:
             return []
+        # Ask the store for user-writes only (every server write stamps
+        # source_group="user-write"; imports carry "imported"), so the scan cap
+        # is not spent on the imported corpus. get_all has no offset, so a page
+        # that comes back exactly full is fetched again with a larger cap.
+        scan_limit = LIVE_LEXICAL_SCAN_LIMIT
         try:
-            kwargs = self._get_all_kwargs(get_all, user_id=user_id, top_k=LIVE_LEXICAL_SCAN_LIMIT)
-            async with self._read_lock():
-                result = await asyncio.to_thread(get_all, **kwargs)
+            while True:
+                kwargs = self._get_all_kwargs(get_all, user_id=user_id, top_k=scan_limit,
+                                              metadata_filters={"source_group": "user-write"})
+                async with self._read_lock():
+                    result = await asyncio.to_thread(get_all, **kwargs)
+                records = self._memory_results(result)
+                if len(records) != scan_limit or scan_limit >= LIVE_LEXICAL_SCAN_MAX:
+                    break
+                scan_limit = min(scan_limit * 4, LIVE_LEXICAL_SCAN_MAX)
         except Exception:
             LOG.debug("Live lexical fallback failed for user_id=%s", user_id, exc_info=True)
             return []
+        if len(records) >= LIVE_LEXICAL_SCAN_MAX:
+            LOG.warning("Live lexical fallback scanned only the first %d user-written memories", len(records))
 
-        records = self._memory_results(result)
         matches: list[dict[str, Any]] = []
         for record in records:
             if not isinstance(record, dict):
@@ -3620,7 +4303,10 @@ class ReliquaryChatProxy:
         matches.sort(key=lambda hit: (-self._numeric_score(hit.get("score")), str(hit.get("id") or "")))
         return matches[:limit]
 
-    async def _synthesis_first_hits(self, query: str, *, user_id: str, limit: int) -> list[dict[str, Any]]:
+    async def _synthesis_first_hits(
+        self, query: str, *, user_id: str, limit: int,
+        threshold: float | None = None, filters: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Compiled-layer pre-pass for synthesis-first retrieval (#50).
 
         Returns current (non-stale) synthesis pages matching the query, shaped like
@@ -3630,16 +4316,25 @@ class ReliquaryChatProxy:
         if self.compiled_memory is None or self.pages is None or limit <= 0:
             return []
         kwargs: dict[str, Any] = {self._search_limit_param: retrieval_candidate_limit(limit)}
+        if threshold is not None:
+            kwargs["threshold"] = threshold
+        # Taxonomy filters go into the vector search too (the compiled index
+        # carries domain/hall/room/topic), so the candidate pool is in scope;
+        # the registry check below stays authoritative.
+        search_filters: dict[str, Any] = dict(filters or {})
         if self._search_user_id_param:
             kwargs["user_id"] = user_id
+            if search_filters and self._search_supports_filters:
+                kwargs["filters"] = search_filters
         else:
-            kwargs["filters"] = {"user_id": user_id}
+            search_filters["user_id"] = user_id
+            kwargs["filters"] = search_filters
         try:
             async with self._read_lock():
                 result = await asyncio.to_thread(self.compiled_memory.search, query, **kwargs)
         except Exception:
             LOG.exception("Compiled search failed for user_id=%s", user_id)
-            return []
+            return _BackendFailure()
         hits = result.get("results") if isinstance(result, dict) else None
         if not isinstance(hits, list):
             return []
@@ -3655,6 +4350,11 @@ class ReliquaryChatProxy:
             if page is None or page.status != "current":
                 continue
             if self._numeric_score(hit.get("score")) < COMPILED_LEAD_MIN_SCORE:
+                continue
+            score = hit.get("score")
+            if threshold is not None and isinstance(score, (int, float)) and score < threshold:
+                continue
+            if filters and any(getattr(page, key, None) != value for key, value in filters.items()):
                 continue
             body_result = self.pages.read_body(slug)
             text = body_result[0] if body_result else str(hit.get("memory") or "")
@@ -3687,8 +4387,14 @@ class ReliquaryChatProxy:
         return []
 
     @staticmethod
-    def _get_all_kwargs(get_all: Any, *, user_id: str, top_k: int) -> dict[str, Any]:
-        """Build kwargs that work across Mem0 1.x and 2.x get_all signatures."""
+    def _get_all_kwargs(
+        get_all: Any, *, user_id: str, top_k: int, metadata_filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build kwargs that work across Mem0 1.x and 2.x get_all signatures.
+
+        Both versions pass metadata keys in ``filters`` through to the vector
+        store's payload filter; where ``filters`` is not accepted they are
+        dropped and the caller must filter the records itself."""
         kwargs: dict[str, Any] = {}
         try:
             parameters = inspect.signature(get_all).parameters
@@ -3696,7 +4402,7 @@ class ReliquaryChatProxy:
             parameters = {}
         has_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
         if "filters" in parameters or has_var_kwargs:
-            kwargs["filters"] = {"user_id": user_id}
+            kwargs["filters"] = {"user_id": user_id, **(metadata_filters or {})}
         if "user_id" in parameters:
             kwargs["user_id"] = user_id
         elif not kwargs:
@@ -3799,25 +4505,32 @@ class ReliquaryChatProxy:
         metadata: dict[str, Any] | None = None,
         infer: bool = False,
     ) -> Any:
+        # Reap abandoned upload slots on the write path too; settling the ones
+        # that hold bytes runs in the background and is never waited for.
+        self._schedule_reap()
         async with self.memory_lock.write():
-            result = await asyncio.to_thread(
+            # Drained so a cancelled caller keeps the writer lock until the
+            # worker thread is done (cancelling to_thread does not stop it).
+            result = await drain_on_cancel(asyncio.to_thread(
                 self.memory.add,
                 text,
                 user_id=user_id,
                 metadata=metadata,
                 infer=infer,
-            )
+            ))
         self._count_cache = None
         return result
 
     async def delete_memory(self, record_id: str) -> None:
+        self._schedule_reap()
         async with self.memory_lock.write():
-            await asyncio.to_thread(self.memory.delete, record_id)
+            await drain_on_cancel(asyncio.to_thread(self.memory.delete, record_id))
         self._count_cache = None
 
     async def update_memory(self, record_id: str, data: str, *, metadata: dict[str, Any] | None = None) -> None:
+        self._schedule_reap()
         async with self.memory_lock.write():
-            await asyncio.to_thread(self.memory.update, record_id, data, metadata)
+            await drain_on_cancel(asyncio.to_thread(self.memory.update, record_id, data, metadata))
         self._count_cache = None
 
     def is_allowed_mcp_origin(self, headers: dict[str, str]) -> bool:
@@ -3872,16 +4585,37 @@ class ReliquaryChatProxy:
         token = token.strip()
         if scheme.lower() != "bearer" or not token:
             return None
-        if profile.token and secrets.compare_digest(token, profile.token):
+        if profile.token and secrets.compare_digest(token.encode("utf-8"), profile.token.encode("utf-8")):
             return "write"
         for static_token, scope in self._static_tokens.items():
-            if secrets.compare_digest(token, static_token):
+            if secrets.compare_digest(token.encode("utf-8"), static_token.encode("utf-8")):
                 return scope
         resource = f"{self.oauth.base_url(headers)}{profile.path}"
         oauth_scope = self.oauth.access_token_scope(token, resource=resource)
         if oauth_scope is not None:
             return "write" if scope_is_write(oauth_scope) else "read"
         return None
+
+    def _credential_key(self, headers: dict[str, str]) -> str:
+        """Stable identity of the credential behind a request, for per-credential
+        bounds (MCP sessions, rate limits): an endpoint's master token, a static
+        token's label, or an OAuth grant's rotation family. Never the raw token,
+        which changes on every refresh, and never a secret."""
+        scheme, _, token = headers.get("authorization", "").strip().partition(" ")
+        token = token.strip()
+        if scheme.lower() != "bearer" or not token:
+            return "anon"
+        candidate = token.encode("utf-8")
+        for endpoint in self.endpoint_profiles.values():
+            if endpoint.token and secrets.compare_digest(candidate, endpoint.token.encode("utf-8")):
+                return f"master:{endpoint.name}"
+        for label, _scope, static_token in self.settings.static_tokens:
+            if secrets.compare_digest(candidate, static_token.encode("utf-8")):
+                return f"static:{label}"
+        identity = self.oauth.access_token_identity(token)
+        if identity:
+            return f"oauth:{identity}"
+        return "token:" + hashlib.sha256(candidate).hexdigest()[:16]
 
     def is_allowed_token(self, profile: EndpointProfile, headers: dict[str, str]) -> bool:
         return self.resolve_scope(profile, headers) is not None
@@ -3986,12 +4720,12 @@ class ReliquaryChatProxy:
             metadata["model"] = model
 
         async with self.memory_lock.write():
-            await asyncio.to_thread(
+            await drain_on_cancel(asyncio.to_thread(
                 self.memory.add,
                 [{"role": "user", "content": user_text}, {"role": "assistant", "content": assistant_text}],
                 user_id=user_id,
                 metadata=metadata,
-            )
+            ))
         if self.settings.writeback_path:
             try:
                 await asyncio.to_thread(
@@ -4095,7 +4829,9 @@ class ReliquaryChatProxy:
             count = int(getattr(result, "count", 0))
         except Exception:
             LOG.debug("Could not read memory count for collection=%s; returning None", collection_name)
+            self._count_probe_failed = True
             return None
+        self._count_probe_failed = False
         self._count_cache = (time.monotonic(), count)
         return count
 
@@ -4103,7 +4839,7 @@ class ReliquaryChatProxy:
         body = await self.read_body(receive)
         try:
             payload = json.loads(body or b"{}")
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # bad JSON, bad UTF-8, too deep
             await self.send_json(send, 400, {"error": "invalid_client_metadata", "error_description": "Invalid JSON"})
             return
         if not isinstance(payload, dict):
@@ -4216,31 +4952,55 @@ class ReliquaryChatProxy:
         return f"{base_url}{path}{'?' + query if query else ''}"
 
     @staticmethod
-    def forward_headers(headers: dict[str, str]) -> dict[str, str]:
-        excluded = {
-            "host",
-            "content-length",
-            "connection",
-            "accept-encoding",
-            "transfer-encoding",
-        }
-        return {key: value for key, value in headers.items() if key not in excluded}
+    def _unsafe_relay_path(path: str) -> bool:
+        """True when a /v1 path could leave the upstream's /v1 prefix: a '..'
+        segment (also percent-encoded, at any depth), '//' or a backslash."""
+        from urllib.parse import unquote
+        decoded = path
+        for _ in range(5):
+            step = unquote(decoded)
+            if step == decoded:
+                break
+            decoded = step
+        return "//" in decoded or "\\" in decoded or ".." in decoded.split("/")
+
+    # Only what an OpenAI-compatible upstream needs; never cookies, client IPs
+    # (X-Forwarded-*, CF-*) or other ingress metadata.
+    FORWARDED_UPSTREAM_HEADERS = frozenset({
+        "authorization", "api-key", "x-api-key", "content-type", "accept", "user-agent",
+        "openai-organization", "openai-project", "openai-beta", "x-request-id",
+    })
 
     @staticmethod
-    async def read_body(receive) -> bytes:
-        chunks: list[bytes] = []
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                break  # client went away; stop instead of waiting forever
-            if message["type"] != "http.request":
-                continue
-            chunk = message.get("body", b"")
-            if chunk:
-                chunks.append(chunk)
-            if not message.get("more_body", False):
-                break
-        return b"".join(chunks)
+    def forward_headers(headers: dict[str, str]) -> dict[str, str]:
+        allowed = ReliquaryChatProxy.FORWARDED_UPSTREAM_HEADERS
+        return {key: value for key, value in headers.items() if key in allowed}
+
+    # /oauth/* forms and DCR metadata are tiny; they are read before any auth.
+    OAUTH_BODY_MAX_BYTES = 64 * 1024
+
+    def request_body_max_bytes(self) -> int:
+        """Cap for the authenticated JSON routes (MCP, /v1, debug search): an
+        inline base64 image at the blob limit plus 1 MiB for the JSON envelope.
+        0 (unlimited) only when the operator disabled the blob limit too."""
+        blob_max = self.settings.blob_max_bytes
+        if not blob_max:
+            return 0
+        return 4 * -(-blob_max // 3) + 1024 * 1024
+
+    def _body_cap_for_path(self, path: str) -> int:
+        if path.startswith("/oauth/"):
+            return self.OAUTH_BODY_MAX_BYTES
+        if UPLOAD_PATH_RE.fullmatch(path):
+            return 0  # the raw upload route enforces blob_max_bytes itself
+        return self.request_body_max_bytes()
+
+    @staticmethod
+    async def read_body(receive, max_bytes: int = OAUTH_BODY_MAX_BYTES) -> bytes:
+        data = await ReliquaryChatProxy._read_body_limited(receive, max_bytes)
+        if data is None:
+            raise RequestBodyTooLarge(max_bytes)
+        return data
 
     @staticmethod
     async def send_empty(send, status: int, extra_headers: dict[str, str] | None = None) -> None:
@@ -4337,7 +5097,27 @@ class ReliquaryChatProxy:
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
+class RequestBodyTooLarge(Exception):
+    """Raised by read_body once a request body passes its cap; answered with 413."""
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(f"request body exceeds {max_bytes} bytes")
+        self.max_bytes = max_bytes
+
+
 @dataclass
+class _BackendFailure(list):
+    """An empty search result recording that the memory backend raised.
+
+    Callers that must never fail on memory (the chat proxy) use it as the
+    empty list it is; the MCP search tool checks for it to report an outage
+    instead of a successful empty search."""
+
+
+class MemoryBackendUnavailable(RuntimeError):
+    """The memory store could not be reached for a record lookup."""
+
+
 class _GlobalRoute:
     filters: dict[str, Any] | None = None
     description: str = "global"
@@ -4346,9 +5126,11 @@ class _GlobalRoute:
 def parse_static_tokens(raw: str | None) -> tuple[tuple[str, str, str], ...]:
     """Parse 'label:scope:token;...' into a tuple of (label, scope, token) triples.
 
-    Scope is normalised: anything that isn't an explicit read scope becomes 'write'
-    so the legacy 'mcp' value and unknown strings all grant write (backward-compat).
+    Scope is normalised fail-closed with static_token_scope_is_write: 'write'
+    (and the legacy 'mcp' or an empty scope) grants write; read words and
+    unrecognised words grant read, with a warning for the unrecognised ones.
     """
+    from oauth import KNOWN_SCOPES, static_token_scope_is_write
     entries: list[tuple[str, str, str]] = []
     for chunk in (raw or "").split(";"):
         chunk = chunk.strip()
@@ -4359,7 +5141,10 @@ def parse_static_tokens(raw: str | None) -> tuple[tuple[str, str, str], ...]:
             LOG.warning("Ignoring malformed RELIQUARY_STATIC_TOKENS entry (need label:scope:token).")
             continue
         label, scope, token = (p.strip() for p in parts)
-        scope = "write" if scope_is_write(scope) else "read"
+        unknown = set(scope.lower().split()) - KNOWN_SCOPES
+        raw_scope, scope = scope, ("write" if static_token_scope_is_write(scope) else "read")
+        if unknown:
+            LOG.warning("Static token %r has unrecognised scope %r; granting %s.", label, raw_scope, scope)
         if not label or not token:
             LOG.warning("Ignoring static token entry with empty label/token.")
             continue
@@ -4432,12 +5217,24 @@ def build_settings(args: argparse.Namespace) -> ProxySettings:
     )
 
 
+def _env_int(name: str, default: int) -> int:
+    """Integer env var; blank means the default, a bad value names the variable."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        raise SystemExit(f"{name} must be an integer, got {raw!r}") from None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the local Reliquary chat + MCP proxy with an OAuth shim.")
     parser.add_argument("--config", default="~/.mem0/config.yaml", help="Path to the Mem0 config file.")
     parser.add_argument("--host", default="127.0.0.1", help="Listen host for the proxy.")
     parser.add_argument("--port", default=8787, type=int, help="Listen port for the proxy.")
-    parser.add_argument("--user-id", default="default", help="Default Reliquary user_id for retrieval.")
+    parser.add_argument("--user-id", default=os.getenv("RELIQUARY_USER_ID") or "default",
+                        help="Default Reliquary user_id for retrieval (env RELIQUARY_USER_ID).")
     parser.add_argument("--memory-limit", default=5, type=int, help="Maximum number of memories to inject.")
     parser.add_argument("--memory-threshold", default=None, type=float, help="Optional minimum similarity score for memory hits.")
     parser.add_argument("--memory-max-chars", default=500, type=int, help="Maximum characters per injected memory snippet.")
@@ -4488,11 +5285,11 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=os.getenv("RELIQUARY_OAUTH_VERBATIM_TOKEN", "false").lower() in {"1", "true", "yes"},
         help="Return the master bearer itself as the OAuth access_token (old behavior) instead of a "
-        "derived, revocable token. Default false.",
+        "derived, revocable token. Read-only grants still get a derived read token. Default false.",
     )
-    parser.add_argument("--oauth-access-token-ttl", type=int, default=int(os.getenv("RELIQUARY_OAUTH_ACCESS_TOKEN_TTL", "432000")),
+    parser.add_argument("--oauth-access-token-ttl", type=int, default=_env_int("RELIQUARY_OAUTH_ACCESS_TOKEN_TTL", 432000),
                         help="Access-token lifetime in seconds (default 5 days). Refresh rotation renews it.")
-    parser.add_argument("--oauth-refresh-token-ttl", type=int, default=int(os.getenv("RELIQUARY_OAUTH_REFRESH_TOKEN_TTL", "0")),
+    parser.add_argument("--oauth-refresh-token-ttl", type=int, default=_env_int("RELIQUARY_OAUTH_REFRESH_TOKEN_TTL", 0),
                         help="Refresh-token lifetime in seconds (0 = non-expiring).")
     parser.add_argument(
         "--dataset",
@@ -4518,13 +5315,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--blob-max-bytes",
         type=int,
-        default=int(os.getenv("RELIQUARY_BLOB_MAX_BYTES", str(30 * 1024 * 1024))),
+        default=_env_int("RELIQUARY_BLOB_MAX_BYTES", 30 * 1024 * 1024),
         help="Max blob size in bytes (0 disables the cap). Default 30 MB.",
     )
     parser.add_argument(
         "--blob-url-ttl",
         type=int,
-        default=int(os.getenv("RELIQUARY_BLOB_URL_TTL", "3600")),
+        default=_env_int("RELIQUARY_BLOB_URL_TTL", 3600),
         help="Lifetime in seconds of signed blob URLs. Default 3600.",
     )
     parser.add_argument(
@@ -4545,9 +5342,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrieval-stats-path", default=os.getenv("RELIQUARY_RETRIEVAL_STATS_PATH"),
         help="Append a JSONL retrieval-event line per search hit / fetch to this path, so app/lint.py can propose "
         "archive/compile actions from usage. Unset = disabled.")
-    parser.add_argument("--rate-limit-writes", type=int, default=int(os.getenv("RELIQUARY_RATE_LIMIT_WRITES", "0")),
+    parser.add_argument("--rate-limit-writes", type=int, default=_env_int("RELIQUARY_RATE_LIMIT_WRITES", 0),
         help="Max write tool calls per token per minute (0 = unlimited).")
-    parser.add_argument("--rate-limit-searches", type=int, default=int(os.getenv("RELIQUARY_RATE_LIMIT_SEARCHES", "0")),
+    parser.add_argument("--rate-limit-searches", type=int, default=_env_int("RELIQUARY_RATE_LIMIT_SEARCHES", 0),
         help="Max search/fetch tool calls per token per minute (0 = unlimited).")
     parser.add_argument("--metrics-public", action=argparse.BooleanOptionalAction,
         default=os.getenv("RELIQUARY_METRICS_PUBLIC", "false").lower() in {"1", "true", "yes"},
@@ -4568,9 +5365,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--schema-path", default=os.getenv("RELIQUARY_SCHEMA_PATH"),
                         help="Path to the editable memory constitution (reliquary://schema). Unset uses a built-in default.")
-    parser.add_argument("--lint-coverage-min", type=int, default=int(os.getenv("RELIQUARY_LINT_COVERAGE_MIN", "8")),
+    parser.add_argument("--lint-coverage-min", type=int, default=_env_int("RELIQUARY_LINT_COVERAGE_MIN", 8),
                         help="Min raw records in a domain/topic with no synthesis before lint flags a coverage gap.")
-    parser.add_argument("--lint-cold-min-events", type=int, default=int(os.getenv("RELIQUARY_LINT_COLD_MIN_EVENTS", "200")),
+    parser.add_argument("--lint-cold-min-events", type=int, default=_env_int("RELIQUARY_LINT_COLD_MIN_EVENTS", 200),
                         help="Minimum total retrieval events before the needs-review resource proposes never-retrieved records for archive (guards against sparse-data false positives).")
     return parser.parse_args()
 

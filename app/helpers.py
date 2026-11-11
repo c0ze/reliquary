@@ -13,7 +13,7 @@ import binascii
 import json
 import math
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 
 def decode_image_payload(value: str) -> bytes:
@@ -271,6 +271,17 @@ def preview_body(text: str, limit: int = SEARCH_PREVIEW_CHAR_CAP) -> tuple[str, 
     if len(text) <= limit:
         return text, False
     return text[: max(0, limit - 1)].rstrip() + "…", True
+
+
+# Printable ASCII except '%' (so the encoding stays reversible).
+_HEADER_SAFE_CHARS = "".join(chr(c) for c in range(0x20, 0x7F) if chr(c) != "%")
+
+
+def header_safe(value: str) -> str:
+    """Percent-encode (as UTF-8) everything outside printable ASCII, plus '%',
+    so arbitrary user text fits a latin-1 HTTP header and cannot inject CR/LF.
+    Plain ASCII text is returned unchanged."""
+    return quote(value, safe=_HEADER_SAFE_CHARS)
 
 
 def response_headers_from_httpx(

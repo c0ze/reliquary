@@ -18,13 +18,33 @@ REFRESH_TOKEN_TTL = 0  # 0 = non-expiring
 # After it, a replay is indistinguishable from an unknown token and just returns
 # invalid_grant — fine, since any legitimate successor has long since rotated past it.
 REFRESH_REUSE_GRACE = 24 * 3600
+# Token stores are keyed by "sha256:<hex of the token>"; unprefixed keys are
+# plaintext tokens from older state files and are hashed on load.
+TOKEN_KEY_PREFIX = "sha256:"
 
 READ_SCOPES = {"read", "readonly", "read_only", "search"}
+WRITE_SCOPES = {"write"}
+LEGACY_WRITE_SCOPE = "mcp"  # what exchange_code stores when no scope was requested
+KNOWN_SCOPES = READ_SCOPES | WRITE_SCOPES | {LEGACY_WRITE_SCOPE}
 
 
 def scope_is_write(scope: str | None) -> bool:
-    """Everything except an explicit read scope grants write (legacy 'mcp' = write)."""
-    return str(scope or "").strip().lower() not in READ_SCOPES
+    """OAuth grants: a space-separated scope set is read only when it holds a
+    read word and no 'write'. Everything else stays write as before ('write',
+    no scope, legacy 'mcp', and unknown-only sets such as 'openid' or a
+    client-specific word), so existing grants keep their access."""
+    words = set(str(scope or "").lower().split())
+    return bool(words & WRITE_SCOPES) or not (words & READ_SCOPES)
+
+
+def static_token_scope_is_write(scope: str | None) -> bool:
+    """Static tokens (operator config), fail-closed: write only for 'write', an
+    empty scope, or legacy 'mcp' without a read word. Unrecognised words
+    ('ro', 'rw', 'reader') are read."""
+    words = set(str(scope or "").lower().split())
+    if not words or words & WRITE_SCOPES:
+        return True
+    return LEGACY_WRITE_SCOPE in words and not (words & READ_SCOPES)
 
 
 @dataclass
@@ -66,7 +86,8 @@ class OAuthProvider:
     keeps it in an in-memory store, so individual clients can be expired or
     revoked without touching the master bearer. Set ``issue_verbatim_token`` to
     fall back to the old behavior (return the master bearer as the access token)
-    for the simple single-user case.
+    for the simple single-user case; a read-only grant still gets a derived,
+    read-scoped token, because the master bearer always grants write.
 
     Optional hardening:
     - ``fixed_client_id``: if set, only this client_id is ever valid. DCR returns
@@ -164,12 +185,21 @@ class OAuthProvider:
 
     @staticmethod
     def valid_redirect_uri(uri: str) -> bool:
+        # Browsers treat '\' as '/' and strip tabs/newlines, while urlparse does
+        # not (or silently drops them), so the host we check would not be the
+        # host the browser visits. Controls (CR/LF) also reach the Location header.
+        if "\\" in uri or any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in uri):
+            return False
         try:
             parsed = urlparse(uri)
+            parsed.port  # raises ValueError on a malformed port
         except ValueError:
             return False
         # No fragments in a redirect URI (RFC 6749 §3.1.2).
         if parsed.fragment:
+            return False
+        # Userinfo makes "https://claude.ai@evil.example" read as claude.ai.
+        if "@" in parsed.netloc:
             return False
         if parsed.scheme == "https":
             return bool(parsed.hostname)
@@ -183,6 +213,10 @@ class OAuthProvider:
         )
         error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
         redirect_host = html.escape(self._host_from_uri(params.get("redirect_uri", "")))
+        client_id = html.escape(params.get("client_id") or "<unknown>")
+        access = "read and write" if scope_is_write(params.get("scope")) else "read-only"
+        requested_scope = params.get("scope")
+        scope_note = f' (scope <span class="host">{html.escape(requested_scope)}</span>)' if requested_scope else ""
         return (
             "<!doctype html>\n"
             '<html lang="en"><head><meta charset="utf-8">'
@@ -197,6 +231,8 @@ class OAuthProvider:
             "</style></head><body>"
             "<h1>Reliquary</h1>"
             f'<p>Authorize <span class="host">{redirect_host}</span> to access your memories.</p>'
+            f'<p>Client <span class="host">{client_id}</span> requests '
+            f"<strong>{access}</strong> access{scope_note}.</p>"
             f"{error_html}"
             '<form method="post" action="/oauth/authorize">'
             f"{hidden}"
@@ -215,7 +251,15 @@ class OAuthProvider:
             parsed = urlparse(uri)
         except ValueError:
             return "<unknown>"
-        return parsed.netloc or "<unknown>"
+        # hostname, never netloc: netloc includes userinfo ("claude.ai@evil.example").
+        return parsed.hostname or "<unknown>"
+
+    @staticmethod
+    def _token_key(token: str) -> str:
+        """Store key for a token: its SHA-256, so state files (and memory) never
+        hold a usable bearer. Every lookup hashes the presented token; a stored
+        key is not itself accepted as a token."""
+        return TOKEN_KEY_PREFIX + hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     def verify_bearer(self, candidate: str) -> bool:
         # An empty master_token means no RELIQUARY_CLAUDE_MCP_TOKEN was configured, i.e.
@@ -223,14 +267,15 @@ class OAuthProvider:
         # empty-vs-empty candidate would return True and let anyone mint a write-scoped token.
         if not self.master_token:
             return False
-        return secrets.compare_digest(candidate.strip(), self.master_token)
+        # Bytes, not str: compare_digest raises TypeError on non-ASCII str input.
+        return secrets.compare_digest(candidate.strip().encode("utf-8"), self.master_token.encode("utf-8"))
 
     def verify_client_id(self, candidate: str | None) -> bool:
         if self.fixed_client_id is None:
             return bool(candidate)
         if not candidate:
             return False
-        return secrets.compare_digest(candidate, self.fixed_client_id)
+        return secrets.compare_digest(candidate.encode("utf-8"), self.fixed_client_id.encode("utf-8"))
 
     def issue_code(self, params: dict[str, str]) -> str:
         code = secrets.token_urlsafe(32)
@@ -278,7 +323,9 @@ class OAuthProvider:
             return None, (400, "invalid_grant", "PKCE verification failed")
 
         scope = entry.scope or "mcp"
-        if self.issue_verbatim_token:
+        # The master bearer always resolves to write, so a read-only grant
+        # gets a derived, read-scoped token even in verbatim mode.
+        if self.issue_verbatim_token and scope_is_write(scope):
             return (
                 {"access_token": self.master_token, "token_type": "Bearer", "scope": scope},
                 None,
@@ -299,7 +346,7 @@ class OAuthProvider:
 
     def issue_access_token(self, *, client_id: str, scope: str, resource: str | None = None, family_id: str | None = None) -> str:
         token = secrets.token_urlsafe(32)
-        self._access_tokens[token] = AccessToken(
+        self._access_tokens[self._token_key(token)] = AccessToken(
             client_id=client_id,
             scope=scope,
             expires_at=time.time() + self.access_token_ttl,
@@ -316,7 +363,7 @@ class OAuthProvider:
         resource (back-compat with clients that don't send `resource`)."""
         if not candidate:
             return False
-        key = candidate.strip()
+        key = self._token_key(candidate.strip())
         self._prune_access_tokens()
         entry = self._access_tokens.get(key)
         if entry is None:
@@ -337,7 +384,7 @@ class OAuthProvider:
         """Return the scope of a valid access token, or None if invalid/expired/unknown."""
         if not candidate:
             return None
-        key = candidate.strip()
+        key = self._token_key(candidate.strip())
         self._prune_access_tokens()
         entry = self._access_tokens.get(key)
         if entry is None:
@@ -351,8 +398,18 @@ class OAuthProvider:
                 return None
         return entry.scope or "mcp"
 
+    def access_token_identity(self, candidate: str | None) -> str | None:
+        """A stable, non-secret id for a known access token's grant: its rotation
+        family (unchanged across refreshes), else its client. None if unknown."""
+        if not candidate:
+            return None
+        entry = self._access_tokens.get(self._token_key(candidate.strip()))
+        if entry is None:
+            return None
+        return f"family:{entry.family_id}" if entry.family_id else f"client:{entry.client_id}"
+
     def revoke_access_token(self, token: str | None) -> bool:
-        removed = self._access_tokens.pop((token or "").strip(), None) is not None
+        removed = self._access_tokens.pop(self._token_key((token or "").strip()), None) is not None
         if removed:
             self._persist_access_tokens()
         return removed
@@ -361,7 +418,7 @@ class OAuthProvider:
         key = (token or "").strip()
         if not key:
             return False
-        rt = self._refresh_tokens.get(key)
+        rt = self._refresh_tokens.get(self._token_key(key))
         if rt is not None:
             self._revoke_family(rt.family_id)  # drops the family's refresh + access tokens
             return True
@@ -390,7 +447,7 @@ class OAuthProvider:
         if self.fixed_client_id is not None and not self.verify_client_id(form.get("client_id") or None):
             return None, (400, "invalid_client", "client_id does not match the configured OAuth client")
         self._prune_refresh_tokens()
-        entry = self._refresh_tokens.get(presented)
+        entry = self._refresh_tokens.get(self._token_key(presented))
         if entry is None or (entry.expires_at is not None and entry.expires_at < time.time()):
             return None, (400, "invalid_grant", "invalid or expired refresh token")
         # Older clients may omit client_id on refresh, but an explicit identity
@@ -434,7 +491,10 @@ class OAuthProvider:
 
     def _load_access_tokens(self) -> None:
         now = time.time()
+        migrated = False
         for token, entry in (self._token_store.load() if self._token_store else {}).items():
+            if not token.startswith(TOKEN_KEY_PREFIX):
+                token, migrated = self._token_key(token), True  # pre-hashing state file
             try:
                 at = AccessToken(
                     client_id=entry["client_id"],
@@ -447,6 +507,8 @@ class OAuthProvider:
                 continue
             if at.expires_at >= now:
                 self._access_tokens[token] = at
+        if migrated:
+            self._persist_access_tokens()  # rewrite without the plaintext tokens
 
     def _persist_access_tokens(self) -> None:
         if self._token_store is not None:
@@ -462,7 +524,7 @@ class OAuthProvider:
         token = secrets.token_urlsafe(32)
         now = time.time()
         expires_at = (now + self.refresh_token_ttl) if self.refresh_token_ttl else None
-        self._refresh_tokens[token] = RefreshToken(
+        self._refresh_tokens[self._token_key(token)] = RefreshToken(
             client_id=client_id,
             scope=scope,
             resource=(resource or "").strip() or None,
@@ -479,7 +541,10 @@ class OAuthProvider:
 
     def _load_refresh_tokens(self) -> None:
         now = time.time()
+        migrated = False
         for token, entry in (self._refresh_token_store.load() if self._refresh_token_store else {}).items():
+            if not token.startswith(TOKEN_KEY_PREFIX):
+                token, migrated = self._token_key(token), True  # pre-hashing state file
             try:
                 rt = RefreshToken(
                     client_id=entry["client_id"],
@@ -495,6 +560,8 @@ class OAuthProvider:
                 continue
             if rt.expires_at is None or rt.expires_at >= now:
                 self._refresh_tokens[token] = rt
+        if migrated:
+            self._persist_refresh_tokens()  # rewrite without the plaintext tokens
 
     @staticmethod
     def _verify_pkce(verifier: str, challenge: str, method: str) -> bool:
@@ -508,9 +575,9 @@ class OAuthProvider:
                 return False  # untrusted input; treat as PKCE failure, not a 500
             digest = hashlib.sha256(encoded).digest()
             computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-            return secrets.compare_digest(computed, challenge)
+            return secrets.compare_digest(computed.encode("utf-8"), challenge.encode("utf-8"))
         if method == "PLAIN":
-            return secrets.compare_digest(verifier, challenge)
+            return secrets.compare_digest(verifier.encode("utf-8"), challenge.encode("utf-8"))
         return False
 
 

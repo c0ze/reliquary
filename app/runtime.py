@@ -47,6 +47,35 @@ def native_hybrid_active(mode: str | None, *, has_bm25_slot: bool, bm25_usable: 
     return bool(has_bm25_slot and bm25_usable)  # auto
 
 
+async def drain_on_cancel(awaitable):
+    """Await ``awaitable`` to completion even when the caller is cancelled.
+
+    Cancelling an awaited ``asyncio.to_thread`` call does not stop its worker
+    thread, so a lock held around that call would be released while the thread
+    still mutates storage. This runs the work as a shielded task and, if the
+    caller is cancelled, keeps waiting for the task before re-raising the
+    CancelledError, so the caller's locks are released only once the work is
+    done.
+    """
+    task = asyncio.ensure_future(awaitable)
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if task.done():
+                raise  # the work itself was cancelled
+            cancelled = cancelled or exc
+            continue
+        except BaseException:
+            if cancelled is not None:
+                raise cancelled
+            raise
+        if cancelled is not None:
+            raise cancelled
+        return result
+
+
 class AsyncRWLock:
     """A writer-preferring readers-writer lock for asyncio.
 
@@ -85,11 +114,17 @@ class AsyncRWLock:
     async def write(self) -> AsyncIterator[None]:
         async with self._cond:
             self._writers_waiting += 1
+            acquired = False
             try:
                 while self._writer_active or self._readers > 0:
                     await self._cond.wait()
+                acquired = True
             finally:
                 self._writers_waiting -= 1
+                if not acquired:
+                    # A cancelled waiting writer was holding new readers back;
+                    # wake them, or they sleep until some unrelated release.
+                    self._cond.notify_all()
             self._writer_active = True
         try:
             yield
@@ -107,31 +142,57 @@ class MCPSessionStore:
     refreshes its recency, so only genuinely idle sessions are dropped once the
     table is full.
 
+    Sessions may carry an ``owner`` (the credential that created them). One
+    owner holds at most ``max_per_owner`` sessions, and when the table is full
+    a new session evicts the owner's own least-recently-used session before
+    anyone else's, so one token cannot push every other client out.
+
     Single-event-loop access only; no internal locking needed.
     """
 
-    def __init__(self, *, max_size: int, ttl: float, clock=time.monotonic, session_store=None) -> None:
+    def __init__(self, *, max_size: int, ttl: float, clock=time.monotonic, session_store=None,
+                 max_per_owner: int | None = None) -> None:
         if max_size < 1:
             raise ValueError("max_size must be >= 1")
         self.max_size = max_size
+        self.max_per_owner = max(1, max_per_owner if max_per_owner is not None else max_size // 4)
         self.ttl = ttl
         self._clock = clock
-        # session_id -> [profile_name, last_seen]; insertion/access order == LRU order
+        # session_id -> [profile_name, last_seen, owner]; insertion/access order == LRU order
         self._sessions: "dict[str, list]" = {}
         self._session_store = session_store
         if self._session_store is not None:
-            for sid, profile_name in self._session_store.load().items():
-                if isinstance(sid, str) and isinstance(profile_name, str):
-                    self._sessions[sid] = [profile_name, self._clock()]
+            loaded = self._session_store.load()
+            for sid, value in loaded.items():
+                # Owned sessions are stored as ["profile", "owner"]. Sessions saved
+                # before owners were recorded ("profile") are dropped: no
+                # credential can prove it created them, so their clients get the
+                # usual 404 and initialise again, as after an idle timeout.
+                if not (isinstance(value, list) and len(value) == 2):
+                    continue
+                profile_name, owner = value
+                if isinstance(sid, str) and isinstance(profile_name, str) and isinstance(owner, str):
+                    self._sessions[sid] = [profile_name, self._clock(), owner]
+            if len(self._sessions) != len(loaded):
+                self._persist()
 
-    def add(self, session_id: str, profile_name: str) -> None:
+    def add(self, session_id: str, profile_name: str, owner: str | None = None) -> None:
         self._evict_expired()
         self._sessions.pop(session_id, None)
-        self._sessions[session_id] = [profile_name, self._clock()]
+        if owner is not None:
+            mine = [sid for sid, entry in self._sessions.items() if entry[2] == owner]
+            while len(mine) >= self.max_per_owner:
+                self._sessions.pop(mine.pop(0), None)  # owner's least-recently-used
+        self._sessions[session_id] = [profile_name, self._clock(), owner]
         while len(self._sessions) > self.max_size:
-            # drop least-recently-used (first inserted/touched)
-            oldest = next(iter(self._sessions))
-            self._sessions.pop(oldest, None)
+            victim = None
+            if owner is not None:
+                victim = next((sid for sid, entry in self._sessions.items()
+                               if entry[2] == owner and sid != session_id), None)
+            if victim is None:
+                # drop least-recently-used (first inserted/touched)
+                victim = next(iter(self._sessions))
+            self._sessions.pop(victim, None)
         self._persist()
 
     def touch(self, session_id: str) -> str | None:
@@ -150,9 +211,28 @@ class MCPSessionStore:
         self._sessions[session_id] = entry
         return entry[0]
 
+    def claim(self, session_id: str, profile_name: str, owner: str | None) -> bool:
+        """Whether ``owner`` may use the live session ``session_id`` on
+        ``profile_name`` (refreshing its recency if so): only the credential
+        that created it, on its own endpoint. A session without an owner is
+        usable by nobody."""
+        entry = self._sessions.get(session_id)
+        if entry is None or entry[0] != profile_name:
+            return False
+        if entry[2] is None or entry[2] != owner:
+            return False
+        return self.touch(session_id) is not None
+
     def remove(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
         self._persist()
+
+    def remove_owned(self, session_id: str, profile_name: str, owner: str | None) -> bool:
+        """Remove the session only for a caller that :meth:`claim` admits."""
+        if not self.claim(session_id, profile_name, owner):
+            return False
+        self.remove(session_id)
+        return True
 
     def __len__(self) -> int:
         self._evict_expired()
@@ -173,4 +253,6 @@ class MCPSessionStore:
 
     def _persist(self) -> None:
         if self._session_store is not None:
-            self._session_store.save({sid: entry[0] for sid, entry in self._sessions.items()})
+            self._session_store.save({
+                sid: [entry[0], entry[2]] for sid, entry in self._sessions.items() if entry[2] is not None
+            })

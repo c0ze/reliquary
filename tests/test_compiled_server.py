@@ -547,6 +547,7 @@ def test_domain_index_listed_with_catalog(proxy):
     # domains AND the compiled layer is enabled.
     class _Cat:
         routeable_domains = ["pagan"]
+        records_by_id = {}
 
     proxy.catalog = _Cat()
     _file_page(proxy, "p-pagan", domain="pagan")

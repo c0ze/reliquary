@@ -22,7 +22,16 @@ import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
+
+from metadata_policy import taxonomy_match_keys
+from persistence import atomic_write
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
 
 if TYPE_CHECKING:
     from blobs import BlobStore
@@ -30,6 +39,14 @@ if TYPE_CHECKING:
 _REGISTRY_LOCK = threading.Lock()
 
 VALID_STATUSES = ("current", "stale", "draft", "archived")
+
+# Slugs become file names (<slug>.json); keep them well under NAME_MAX (255).
+MAX_SLUG_LENGTH = 120
+
+
+def taxonomy_pairs(domain, topic) -> "set[tuple[str, str]]":
+    """(domain, topic) match-key pairs: two taxonomies match when these meet."""
+    return {(d, t) for d in taxonomy_match_keys(domain) for t in taxonomy_match_keys(topic)}
 
 
 def slugify(value: str) -> str:
@@ -58,6 +75,12 @@ class PageInfo:
     # Older registries predate this field, so it can be shorter than `history`.
     revisions_meta: list[dict] = field(default_factory=list)
     memory_id: str | None = None
+    # Set when a failed compile could not confirm that the index entry matches
+    # the restored revision; cleared by the next successful index write.
+    index_unconfirmed: bool = False
+    # Bumped by every stale mark, so a rollback can tell that the page was
+    # invalidated after its snapshot even when its status already read "stale".
+    invalidations: int = 0
 
 
 def _emit_frontmatter(info: "PageInfo") -> str:
@@ -80,6 +103,15 @@ def _emit_frontmatter(info: "PageInfo") -> str:
 
 def assemble_markdown(info: "PageInfo", body: str) -> str:
     return f"{_emit_frontmatter(info)}\n\n{body.strip()}\n"
+
+
+def markdown_body(text: str) -> str:
+    """The body assemble_markdown() wrapped: ``text`` without its frontmatter."""
+    if text.startswith("---\n"):
+        parts = text[4:].split("\n---\n", 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+    return text.strip()
 
 
 class PageRegistry:
@@ -108,7 +140,9 @@ class PageRegistry:
                 data = json.load(fh)
             fields = {k: v for k, v in data.items() if k in PageInfo.__dataclass_fields__}
             return PageInfo(**fields)
-        except (FileNotFoundError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError):
+            # OSError covers missing files and names the filesystem rejects
+            # (ENAMETOOLONG for an over-long id passed in by fetch).
             return None
 
     def read_body(self, slug: str) -> "tuple[str, str] | None":
@@ -124,19 +158,33 @@ class PageRegistry:
     # --- write ---
     def _save(self, info: "PageInfo") -> None:
         os.makedirs(self._shard_dir(info.slug), exist_ok=True)
-        path = self._path(info.slug)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(asdict(info), fh)
-        os.replace(tmp, path)
+        atomic_write(self._path(info.slug), json.dumps(asdict(info)).encode("utf-8"))
+
+    @contextmanager
+    def _locked(self):
+        """Serialize registry read-modify-write cycles across threads and, via
+        an advisory lock file, across processes (the ingest CLI marks pages
+        stale while the server may be filing them)."""
+        with _REGISTRY_LOCK:
+            if fcntl is None:
+                yield
+                return
+            fd = os.open(os.path.join(self.registry_dir, ".lock"), os.O_RDWR | os.O_CREAT, 0o666)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                os.close(fd)
 
     def put_revision(self, slug: str, body: str, frontmatter: dict) -> "PageInfo":
         slug = slugify(slug)
         if not slug:
             raise ValueError("empty slug")
         now = time.time()
-        with _REGISTRY_LOCK:
+        with self._locked():
             existing = self.get(slug)
+            if existing is None and len(slug) > MAX_SLUG_LENGTH:
+                raise ValueError(f"slug longer than {MAX_SLUG_LENGTH} characters")
             # Keep the superseded revision intact while constructing its successor.
             info = PageInfo(**asdict(existing)) if existing else PageInfo(slug=slug, current_blob="", created_at=now)
             for key in ("title", "domain", "hall", "room", "topic", "status", "kind"):
@@ -158,10 +206,13 @@ class PageRegistry:
                 info.created_at = now
             blob_info = self.blobs.put(assemble_markdown(info, body).encode("utf-8"),
                                        mimetype="text/markdown")
-            if existing and existing.current_blob == blob_info.id:
+            if existing and existing.current_blob == blob_info.id and blob_info.ref_count > 1:
                 # Identical re-file: put() bumped the ref for a blob this page
                 # already counts once; release the extra ref so delete() stays
-                # balanced and the blob can actually be reclaimed later.
+                # balanced and the blob can actually be reclaimed later. At
+                # ref_count 1, put() recreated a blob whose sidecar was lost:
+                # that single ref is this page's, and releasing it would unlink
+                # the bytes the re-file just restored.
                 self.blobs.delete(blob_info.id)
             if existing and existing.current_blob and existing.current_blob != blob_info.id:
                 info.history.append(existing.current_blob)
@@ -173,8 +224,47 @@ class PageRegistry:
                     "status": existing.status,
                 })
             info.current_blob = blob_info.id
-            self._save(info)
+            try:
+                self._save(info)
+            except BaseException:
+                # Don't leak the reference put() took for a revision that was
+                # never recorded (an identical re-file already released it).
+                if not (existing and existing.current_blob == blob_info.id):
+                    self.blobs.delete(blob_info.id)
+                raise
             return info
+
+    def rollback_revision(self, slug: str, previous: "PageInfo | None", written: "PageInfo") -> bool:
+        """Undo the put_revision that returned ``written`` after its index write
+        failed: restore the previous registry entry (or remove a page that did
+        not exist before) and release the reference put_revision took on the new
+        revision's blob. Does nothing, and returns False, if the page no longer
+        carries that revision (another writer replaced or removed it)."""
+        with self._locked():
+            current = self.get(slug)
+            if current is None or current.current_blob != written.current_blob:
+                return False
+            if previous is None:
+                try:
+                    os.remove(self._path(slug))
+                except FileNotFoundError:
+                    pass
+            else:
+                restored = PageInfo(**asdict(previous))
+                # A source changed while the index write was in flight: keep the
+                # stale mark instead of resurrecting the snapshot's "current". The
+                # counter tells even when the attempted revision was filed stale.
+                invalidated = current.invalidations > written.invalidations or \
+                    current.status == "stale" != written.status
+                if invalidated and restored.status == "current":
+                    restored.status = "stale"
+                restored.invalidations = max(restored.invalidations, current.invalidations)
+                self._save(restored)
+            # An identical re-file already balanced its own reference.
+            new_blob = written.current_blob
+            if new_blob and (previous is None or previous.current_blob != new_blob):
+                self.blobs.delete(new_blob)
+            return True
 
     def _iter_pages(self):
         for shard in os.listdir(self.registry_dir):
@@ -224,7 +314,7 @@ class PageRegistry:
         """Hard-delete a page: unlink its current + historical revision blobs
         (ref-counted) and remove the registry entry. Returns the deleted PageInfo
         (so the caller can clean up the indexed memory) or None if absent."""
-        with _REGISTRY_LOCK:
+        with self._locked():
             info = self.get(slug)
             if info is None:
                 return None
@@ -241,36 +331,72 @@ class PageRegistry:
             return info
 
     def set_status(self, slug: str, status: str) -> "PageInfo | None":
-        with _REGISTRY_LOCK:
+        with self._locked():
             if status not in VALID_STATUSES:
                 raise ValueError(f"invalid status: {status!r}")
             info = self.get(slug)
             if info is None:
                 return None
             info.status = status
+            if status == "stale":
+                info.invalidations += 1
             info.updated_at = time.time()
             self._save(info)
             return info
 
     def set_memory_id(self, slug: str, memory_id: str) -> None:
-        with _REGISTRY_LOCK:
+        with self._locked():
             info = self.get(slug)
             if info is None:
                 return
             info.memory_id = memory_id
+            info.index_unconfirmed = False
             self._save(info)
 
+    def set_index_unconfirmed(self, slug: str) -> None:
+        with self._locked():
+            info = self.get(slug)
+            if info is None:
+                return
+            info.index_unconfirmed = True
+            self._save(info)
+
+    def mark_stale_deriving_from(self, *, ids=(), taxonomies=(), pairs=()) -> "list[str]":
+        """Invalidate every page that pages_deriving_from() matches for ``ids``,
+        any (domain, topic) in ``taxonomies`` and any match-key pair in
+        ``pairs``: its invalidation counter advances (also when it is already
+        stale, so a compile rollback can see it) and a current page becomes
+        stale. Returns the slugs marked stale. Matching and marking happen under
+        one registry lock, so a revision filed in between is judged on its own
+        provenance."""
+        keys = set(pairs)
+        for domain, topic in taxonomies:
+            keys |= taxonomy_pairs(domain, topic)
+        with self._locked():
+            flagged = []
+            for info in self.pages_deriving_from(ids=ids, pairs=keys):
+                info.invalidations += 1
+                if info.status == "current":
+                    info.status = "stale"
+                    info.updated_at = time.time()
+                    flagged.append(info.slug)
+                self._save(info)
+            return flagged
+
     def pages_deriving_from(self, *, ids=(), domain: str | None = None,
-                            topic: str | None = None) -> "list[PageInfo]":
+                            topic: str | None = None, pairs=()) -> "list[PageInfo]":
         """Pages whose synthesis derives from any of ``ids``. Pages that declare
-        no ``derived_from`` at all fall back to a ``domain`` AND ``topic`` match;
-        a page that declares its sources is judged on them alone (#69)."""
+        no ``derived_from`` at all fall back to a ``domain`` AND ``topic`` match
+        (or a match on any (domain, topic) key pair in ``pairs``); a page that
+        declares its sources is judged on them alone (#69). Taxonomy compares on
+        match keys, so pages filed under an older spelling match."""
         idset = set(ids)
+        keys = set(pairs) | taxonomy_pairs(domain, topic)
         out = []
         for info in self._iter_pages():
             if idset and idset.intersection(info.derived_from or ()):
                 out.append(info)
-            elif not info.derived_from and domain and topic \
-                    and info.domain == domain and info.topic == topic:
+            elif not info.derived_from and keys \
+                    and not keys.isdisjoint(taxonomy_pairs(info.domain, info.topic)):
                 out.append(info)
         return out

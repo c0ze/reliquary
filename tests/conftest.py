@@ -56,7 +56,10 @@ class FakeMemory:
         return {"results": [{"id": mid, "event": "ADD"}]}
 
     def delete(self, memory_id):
-        self._store.pop(memory_id, None)
+        # mem0 2.0.4 Memory.delete raises for an id it does not hold.
+        if memory_id not in self._store:
+            raise ValueError(f"Memory with id {memory_id} not found")
+        del self._store[memory_id]
 
     def update(self, memory_id, data, metadata=None):
         rec = self._store.get(memory_id)

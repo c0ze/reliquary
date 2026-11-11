@@ -1,0 +1,356 @@
+"""Regression cases from the second review round of the November 2026 audit."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import httpx
+import pytest
+
+# Captured at import, before the fixtures swap in their inline stand-in.
+REAL_TO_THREAD = asyncio.to_thread
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"review-round2"
+
+
+class Crash(BaseException):
+    """Stands in for the process dying at a given point."""
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+def run_threaded(monkeypatch, scenario, *, timeout=10.0):
+    """Run ``scenario()`` with real worker threads on an executor that is shut
+    down explicitly before the loop closes."""
+    monkeypatch.setattr(asyncio, "to_thread", REAL_TO_THREAD)
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="review-round2")
+
+    async def main():
+        asyncio.get_running_loop().set_default_executor(executor)
+        try:
+            return await asyncio.wait_for(scenario(), timeout)
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    return asyncio.run(main())
+
+
+def claude(proxy):
+    return proxy.endpoint_profiles[proxy.settings.claude_mcp_path]
+
+
+async def call(proxy, tool, args):
+    return await proxy.call_mcp_tool(claude(proxy), tool, args, can_write=True)
+
+
+async def post_bytes(proxy, upload_id, data=PNG):
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=proxy), base_url="http://t") as client:
+        return await client.post(f"/uploads/{upload_id}", content=data,
+                                 headers={"content-type": "image/png", "authorization": "Bearer claude-secret"})
+
+
+async def new_upload(proxy, data=PNG):
+    slot = (await call(proxy, "reliquary_create_image_upload", {}))["structuredContent"]["upload_id"]
+    assert (await post_bytes(proxy, slot, data)).status_code == 201
+    return slot
+
+
+def _legacy_slot(upload_id, blob_id, *, expires_at=1e12):
+    return {"id": upload_id, "created_at": 1.0, "expires_at": expires_at, "expected_mimetype": "image/png",
+            "expected_size": None, "filename": None, "blob_id": blob_id, "mimetype": "image/png",
+            "size": len(PNG), "profile": "claude"}
+
+
+# a -- marked slots are reconciled before their reference is released -------
+
+def _crash_between_caption_and_transfer(make_proxy, state, memory, monkeypatch):
+    first = make_proxy(memory=memory, state_dir=state)
+
+    def crash(*args, **kwargs):
+        raise Crash()
+
+    async def scenario():
+        slot = await new_upload(first)
+        monkeypatch.setattr(first.blobs, "transfer_owner", crash)
+        with pytest.raises(Crash):
+            await call(first, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "cat"})
+        return slot
+
+    slot = run(scenario())
+    monkeypatch.undo()
+    [caption] = [mid for mid, rec in memory._store.items() if rec["metadata"].get("upload_id") == slot]
+    return slot, caption
+
+
+def test_restart_hands_a_marked_slot_reference_to_its_existing_caption(make_proxy, tmp_path, monkeypatch):
+    from conftest import FakeMemory
+
+    memory = FakeMemory()
+    state = str(tmp_path / "state")
+    slot, caption = _crash_between_caption_and_transfer(make_proxy, state, memory, monkeypatch)
+    restarted = make_proxy(memory=memory, state_dir=state)
+    blob = restarted.pending_uploads[slot].blob_id
+    restarted.pending_uploads[slot].expires_at = 1
+    run(restarted._reap_expired_uploads())
+    info = restarted.blobs.info(blob)
+    assert info is not None and info.owners == [caption] and info.ref_count == 1
+    fetched = run(call(restarted, "reliquary_fetch_image", {"id": blob}))
+    assert "error" not in fetched["structuredContent"]
+
+
+def test_retried_commit_after_that_crash_reports_already_committed(make_proxy, tmp_path, monkeypatch):
+    from conftest import FakeMemory
+
+    memory = FakeMemory()
+    state = str(tmp_path / "state")
+    slot, caption = _crash_between_caption_and_transfer(make_proxy, state, memory, monkeypatch)
+    restarted = make_proxy(memory=memory, state_dir=state)
+    retry = run(call(restarted, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "again"}))
+    assert retry["structuredContent"]["error"] == "already_committed"
+    assert len(memory._store) == 1
+
+
+def test_crash_before_the_caption_landed_leaves_an_ordinary_pending_slot(make_proxy, tmp_path, monkeypatch):
+    from conftest import FakeMemory
+
+    memory = FakeMemory()
+    state = str(tmp_path / "state")
+    first = make_proxy(memory=memory, state_dir=state)
+
+    def crash(*args, **kwargs):
+        raise Crash()
+
+    async def scenario():
+        slot = await new_upload(first)
+        monkeypatch.setattr(memory, "add", crash)
+        with pytest.raises(Crash):
+            await call(first, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "cat"})
+        return slot
+
+    slot = run(scenario())
+    monkeypatch.undo()
+    restarted = make_proxy(memory=memory, state_dir=state)
+    blob = restarted.pending_uploads[slot].blob_id
+    committed = run(call(restarted, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "cat"}))
+    assert "error" not in committed["structuredContent"], committed
+    info = restarted.blobs.info(blob)
+    assert info.owners == [committed["structuredContent"]["memory_id"]] and info.ref_count == 1
+
+
+def test_malformed_marked_slot_releases_no_reference(make_proxy, tmp_path):
+    from blobs import BlobStore
+
+    store = BlobStore(str(tmp_path / "blobs"), b"test-signing-key")
+    blob = store.put(PNG, owner="upload:upl_bad").id  # the malformed slot's marked reference
+    store.put(PNG)                                     # a valid legacy slot's unmarked reference
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "pending_uploads.json").write_text(json.dumps({
+        "upl_bad": {**_legacy_slot("upl_bad", blob), "expires_at": None},
+        "upl_good": _legacy_slot("upl_good", blob)}))
+    proxy = make_proxy(state_dir=str(state))
+    run(proxy._reap_expired_uploads())
+    # Round 5: a malformed record and a deployed-format record are forgotten and
+    # no reference is touched (a leak lint reports, never a guessed release).
+    info = proxy.blobs.info(blob)
+    assert info is not None and info.ref_count == 2 and info.owners == ["upload:upl_bad"]
+    assert proxy.pending_uploads == {}
+
+
+# b -- must-do steps run before the awaited staleness fan-out ---------------
+
+def _cancel_fan_out(proxy, monkeypatch):
+    async def cancelled(*args, **kwargs):
+        raise asyncio.CancelledError()  # the request is cancelled while fan-out waits
+
+    monkeypatch.setattr(proxy, "_fan_out_staleness", cancelled)
+
+
+def test_delete_image_releases_the_blob_before_fan_out(proxy, monkeypatch):
+    added = run(call(proxy, "reliquary_add_image",
+                     {"caption": "cat", "image_base64": base64.b64encode(PNG).decode()}))["structuredContent"]
+    _cancel_fan_out(proxy, monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        run(call(proxy, "reliquary_delete_image", {"memory_id": added["memory_id"]}))
+    assert proxy.memory.get(added["memory_id"]) is None
+    assert proxy.blobs.info(added["blob_id"]) is None  # no blob owned by a deleted memory
+
+
+def test_commit_drops_its_slot_before_fan_out(proxy, monkeypatch):
+    slot = run(new_upload(proxy))
+    _cancel_fan_out(proxy, monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        run(call(proxy, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "cat"}))
+    assert slot not in proxy.pending_uploads
+
+
+# c -- dependency match and stale mark happen together ----------------------
+
+def test_fan_out_does_not_stale_a_revision_filed_after_the_match(proxy, monkeypatch):
+    run(call(proxy, "reliquary_compile_page", {"slug": "p", "markdown": "v1", "derived_from": ["x"]}))
+    real_match = proxy.pages.pages_deriving_from
+    refiler = []
+
+    def match_then_compile_lands(**kwargs):
+        matches = real_match(**kwargs)
+        if not refiler:
+            # A compile replaces p (now deriving only from y) right after the match.
+            thread = threading.Thread(target=proxy.pages.put_revision,
+                                      args=("p", "v2", {"derived_from": ["y"], "status": "current"}))
+            refiler.append(thread)
+            thread.start()
+            thread.join(0.3)
+        return matches
+
+    monkeypatch.setattr(proxy.pages, "pages_deriving_from", match_then_compile_lands)
+    run(proxy._fan_out_staleness(["x"], {}))
+    refiler[0].join(5)
+    page = proxy.pages.get("p")
+    assert page.derived_from == ["y"]
+    assert page.status == "current"
+
+
+# d -- rollback keeps an invalidation even when the attempt was filed stale --
+
+def test_rollback_of_a_stale_filed_revision_keeps_a_concurrent_invalidation(proxy, monkeypatch):
+    run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "v1"}))
+
+    marked = []
+
+    def fails_after_a_source_change(*args, **kwargs):
+        if not marked:
+            marked.append(True)
+            proxy.pages.set_status("pg", "stale")  # a live write invalidates the page meanwhile
+        raise RuntimeError("embedder unavailable")
+
+    monkeypatch.setattr(proxy.compiled_memory, "update", fails_after_a_source_change)
+    monkeypatch.setattr(proxy.compiled_memory, "add", fails_after_a_source_change)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "v2", "status": "stale"}))
+    assert result["isError"] is True
+    assert "v1" in proxy.pages.read_body("pg")[0]
+    assert proxy.pages.get("pg").status == "stale"
+
+
+def test_page_json_without_the_invalidation_counter_loads(tmp_path):
+    from blobs import BlobStore
+    from compiled import PageRegistry
+
+    registry = PageRegistry(str(tmp_path / "compiled"), BlobStore(str(tmp_path / "blobs"), b"k"))
+    registry.put_revision("pg", "v1", {})
+    path = Path(registry._path("pg"))
+    data = json.loads(path.read_text())
+    data.pop("invalidations")
+    path.write_text(json.dumps(data))
+    assert registry.get("pg").invalidations == 0
+    assert registry.set_status("pg", "stale").invalidations == 1
+
+
+# e -- a failed add whose vector landed leaves no untracked vector -----------
+
+def _add_lands_then_fails(proxy, monkeypatch):
+    real_add = proxy.compiled_memory.add
+
+    def add(*args, **kwargs):
+        real_add(*args, **kwargs)  # Mem0 inserts the vector, then its history write fails
+        raise RuntimeError("history database is locked")
+
+    monkeypatch.setattr(proxy.compiled_memory, "add", add)
+
+
+def test_failed_first_compile_removes_the_vector_that_landed(proxy, monkeypatch):
+    _add_lands_then_fails(proxy, monkeypatch)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "newpage", "markdown": "body"}))
+    assert result["structuredContent"]["error"] == "index_failed"
+    assert proxy.pages.get("newpage") is None
+    assert proxy.compiled_memory._store == {}
+    assert result["structuredContent"]["index_confirmed"] is True
+
+
+def test_failed_first_compile_is_unconfirmed_when_the_index_cannot_be_listed(proxy, monkeypatch):
+    _add_lands_then_fails(proxy, monkeypatch)
+
+    def unavailable(*args, **kwargs):
+        raise ConnectionError("qdrant down")
+
+    monkeypatch.setattr(proxy.compiled_memory, "get_all", unavailable)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "newpage", "markdown": "body"}))
+    assert result["structuredContent"]["index_confirmed"] is False
+    assert "may remain" in result["content"][0]["text"]
+
+
+def test_failed_replacement_add_for_an_existing_page_is_cleaned_up(proxy, monkeypatch):
+    first = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "old"}))["structuredContent"]
+    del proxy.compiled_memory._store[first["memory_id"]]  # its record vanished (collection restored)
+    _add_lands_then_fails(proxy, monkeypatch)
+    result = run(call(proxy, "reliquary_compile_page", {"slug": "pg", "markdown": "new"}))
+    assert result["structuredContent"]["error"] == "index_failed"
+    tracked = proxy.pages.get("pg").memory_id
+    assert [mid for mid, rec in proxy.compiled_memory._store.items() if rec["metadata"]["slug"] == "pg"] in ([], [tracked])
+    assert result["structuredContent"]["index_confirmed"] is False  # the restored revision is not indexed
+
+
+# f -- an interrupted import still invalidates what it already touched -------
+
+def test_interrupted_ingest_marks_pages_of_already_updated_records_stale(tmp_path):
+    from blobs import BlobStore
+    from compiled import PageRegistry
+    from ingest import ingest_records
+    from test_audit_2026_11_ingest import Mem0LikeMemory
+
+    registry = PageRegistry(str(tmp_path / "compiled"), BlobStore(str(tmp_path / "blobs"), b"k"))
+    registry.put_revision("by-id", "s", {"derived_from": ["r1"], "status": "current"})
+    registry.put_revision("by-tax", "s", {"domain": "old-domain", "topic": "old-topic", "status": "current"})
+    memory = Mem0LikeMemory()
+    original = [{"id": "r1", "text": "Tokyo", "metadata": {"domain": "old-domain", "topic": "old-topic"}},
+                {"id": "r2", "text": "two", "metadata": {}}]
+    ingest_records(memory, original, user_id="u")
+    changed = [{"id": "r1", "text": "Osaka", "metadata": {"domain": "new-domain", "topic": "new-topic"}},
+               {"id": "r2", "text": "two, changed", "metadata": {}}]
+    real_update = memory.update
+
+    def update(memory_id, data, metadata=None):
+        if data == "two, changed":
+            raise ConnectionError("qdrant down")  # the run stops after r1 landed
+        return real_update(memory_id, data, metadata)
+
+    memory.update = update
+    with pytest.raises(ConnectionError):
+        ingest_records(memory, changed, user_id="u", page_registry=registry)
+    assert registry.get("by-id").status == "stale"
+    assert registry.get("by-tax").status == "stale"  # filed under r1's taxonomy before the update
+
+
+# g -- sessions without a recorded owner are dropped, never adopted ----------
+
+def test_ownerless_persisted_session_is_not_usable_by_any_credential(make_proxy, tmp_path):
+    from test_audit_2026_11_review_taxonomy_auth import CLAUDE, READER, _initialize, _ping
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "mcp_sessions.json").write_text(json.dumps({"legacy": "claude", "legacy-2": "openai"}))
+    tokens = (("ro", "read", "read-tok"), ("rw", "write", "both-tok"))
+    p = make_proxy(state_dir=str(state), static_tokens=tokens)
+    for headers in (CLAUDE, READER, {"authorization": "Bearer both-tok"}):
+        assert _ping(p, headers, "legacy") == 404
+    assert json.loads((state / "mcp_sessions.json").read_text()) == {}
+    session = _initialize(p, CLAUDE)  # the client re-initialises as after an idle timeout
+    assert _ping(p, CLAUDE, session) == 200
+
+
+def test_claim_never_assigns_an_owner(tmp_path):
+    from runtime import MCPSessionStore
+
+    store = MCPSessionStore(max_size=8, ttl=1000, clock=lambda: 0.0, max_per_owner=2)
+    store.add("unowned", "claude")  # e.g. built in memory without a credential
+    assert store.claim("unowned", "claude", "master:claude") is False
+    for n in range(3):
+        store.add(f"mine-{n}", "claude", owner="static:a")
+    assert sum(store.claim(f"mine-{n}", "claude", "static:a") for n in range(3)) == 2  # quota holds

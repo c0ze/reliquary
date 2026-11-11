@@ -128,6 +128,7 @@ def test_expired_post_reclaims_previously_uploaded_bytes(proxy):
             blob_id = result.json()["blob_id"]
             proxy.pending_uploads[slot["upload_id"]].expires_at = 1
             assert (await client.post(slot["upload_url"], content=PNG, headers=headers)).status_code == 410
+        await proxy._reap_expired_uploads()  # the POST schedules the settling pass
         assert proxy.blobs.info(blob_id) is None
     asyncio.run(scenario())
 
@@ -227,7 +228,10 @@ def test_synthesis_preference_respects_relevance(proxy, monkeypatch, synthesis_s
     async def raw(*args, **kwargs):
         return [{"id": "raw", "memory": "Reliquary MCP architecture", "score": 0.9}]
     async def synthesis(*args, **kwargs):
-        return [{"id": "compiled", "text": "summary", "score": synthesis_score, "route": "synthesis"}]
+        # Search orders by the quality key (vector score plus lexical and recency
+        # bonuses); the page matches the query terms as fully as the raw hit.
+        return [{"id": "compiled", "text": "Reliquary MCP architecture summary",
+                 "score": synthesis_score, "route": "synthesis"}]
     monkeypatch.setattr(proxy, "search_memories", raw)
     monkeypatch.setattr(proxy, "_synthesis_first_hits", synthesis)
     result = asyncio.run(proxy.handle_search_tool({"query": "Reliquary MCP architecture", "limit": 1}))

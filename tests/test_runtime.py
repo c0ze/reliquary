@@ -231,8 +231,8 @@ def test_sessions_survive_restart(tmp_path):
 
     now = [0.0]
     s1 = MCPSessionStore(max_size=4, ttl=1000, clock=lambda: now[0], session_store=file_store)
-    s1.add("sess-abc", "claude")
-    s1.add("sess-def", "openai")
+    s1.add("sess-abc", "claude", owner="master:claude")
+    s1.add("sess-def", "openai", owner="master:openai")
 
     # Simulate restart: new instance backed by same file, fresh clock
     s2 = MCPSessionStore(max_size=4, ttl=1000, clock=lambda: now[0], session_store=file_store)

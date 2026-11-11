@@ -22,6 +22,8 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 
+from persistence import atomic_write
+
 _BLOB_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_BLOB_ID_RE = re.compile(r"^[0-9a-zA-Z_\-]+$")
 
@@ -32,6 +34,11 @@ def _validate_blob_id(blob_id: str) -> None:
 
 
 _STORE_LOCK = threading.Lock()
+
+# An owner entry "upload:<upload_id>" marks the reference a pending upload slot
+# holds, so the slot can later consume exactly its own reference (and hand it
+# to its caption memory on commit). Old readers see just another owner string.
+UPLOAD_OWNER_PREFIX = "upload:"
 
 
 class BlobTooLarge(Exception):
@@ -115,14 +122,12 @@ class BlobStore:
             return None
 
     def _write_sidecar(self, info: BlobInfo) -> None:
-        path = self._sidecar_path(info.id)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(asdict(info), fh)
-        os.replace(tmp, path)
+        atomic_write(self._sidecar_path(info.id), json.dumps(asdict(info)).encode("utf-8"))
 
     # --- store / fetch -------------------------------------------------------
-    def put(self, data: bytes, *, mimetype: str | None = None) -> BlobInfo:
+    def put(self, data: bytes, *, mimetype: str | None = None, owner: str | None = None) -> BlobInfo:
+        """Store ``data`` (or add a reference to identical bytes). ``owner``, if
+        given, is recorded in the same sidecar write as the new reference."""
         if self.max_bytes and len(data) > self.max_bytes:
             raise BlobTooLarge(len(data), self.max_bytes)
 
@@ -132,16 +137,16 @@ class BlobStore:
             existing = self.info(blob_id)
             if existing is not None:
                 existing.ref_count += 1
+                if owner is not None and owner not in existing.owners:
+                    existing.owners.append(owner)
                 blob_path = self._blob_path(blob_id, existing.ext)
                 if not os.path.exists(blob_path):
                     # Self-heal a stale sidecar (bytes lost to a crash window or
                     # out-of-band removal) — otherwise this "successful" dedup
                     # would keep pointing at bytes that no longer exist.
                     os.makedirs(self._shard_dir(blob_id), exist_ok=True)
-                    tmp = f"{blob_path}.tmp"
-                    with open(tmp, "wb") as fh:
-                        fh.write(data)
-                    os.replace(tmp, blob_path)
+                    # The sidecar write below fsyncs the shared directory.
+                    atomic_write(blob_path, data, sync_dir=False)
                 self._write_sidecar(existing)
                 return existing
 
@@ -153,11 +158,8 @@ class BlobStore:
                 final_mime = sniffed_mime
 
             os.makedirs(self._shard_dir(blob_id), exist_ok=True)
-            blob_path = self._blob_path(blob_id, ext)
-            tmp = f"{blob_path}.tmp"
-            with open(tmp, "wb") as fh:
-                fh.write(data)
-            os.replace(tmp, blob_path)
+            # The sidecar write below fsyncs the shared directory.
+            atomic_write(self._blob_path(blob_id, ext), data, sync_dir=False)
 
             info = BlobInfo(
                 id=blob_id,
@@ -166,9 +168,26 @@ class BlobStore:
                 ext=ext,
                 ref_count=1,
                 created=time.time(),
+                owners=[owner] if owner is not None else [],
             )
             self._write_sidecar(info)
             return info
+
+    def iter_infos(self):
+        """Yield the BlobInfo of every blob with a readable sidecar."""
+        try:
+            shards = sorted(os.listdir(self.blob_dir))
+        except FileNotFoundError:
+            return
+        for shard in shards:
+            shard_path = os.path.join(self.blob_dir, shard)
+            if not os.path.isdir(shard_path):
+                continue
+            for name in sorted(os.listdir(shard_path)):
+                if name.endswith(".json") and _BLOB_ID_RE.match(name[:-5]):
+                    info = self.info(name[:-5])
+                    if info is not None:
+                        yield info
 
     def get(self, blob_id: str) -> tuple[bytes, str] | None:
         _validate_blob_id(blob_id)
@@ -195,6 +214,42 @@ class BlobStore:
             if memory_id not in info.owners:
                 info.owners.append(memory_id)
                 self._write_sidecar(info)
+
+    def transfer_owner(self, blob_id: str, old: str, new: str) -> bool:
+        """Hand the reference ``old`` holds to ``new`` in one sidecar write
+        (ref_count unchanged). False, and nothing changed, if ``old`` holds none."""
+        _validate_blob_id(blob_id)
+        with _STORE_LOCK:
+            info = self.info(blob_id)
+            if info is None or old not in info.owners:
+                return False
+            info.owners.remove(old)
+            if new in info.owners:
+                info.ref_count -= 1  # ``new`` already holds a reference of its own
+            else:
+                info.owners.append(new)
+            self._write_sidecar(info)
+            return True
+
+    def settle_owner(self, blob_id: str, owner: str, *, to: str | None = None) -> bool:
+        """The one way a pending upload's marked reference changes: hand
+        ``owner``'s reference to ``to``, or release it when ``to`` is None.
+        Fails closed: returns False, changing nothing, unless ``owner`` holds a
+        reference at that moment (checked under the store lock)."""
+        if to is not None:
+            return self.transfer_owner(blob_id, owner, to)
+        _validate_blob_id(blob_id)
+        with _STORE_LOCK:
+            info = self.info(blob_id)
+            if info is None or owner not in info.owners:
+                return False
+            info.owners.remove(owner)
+            info.ref_count -= 1
+            if info.ref_count > 0:
+                self._write_sidecar(info)
+            else:
+                self._unlink(info)
+            return True
 
     def is_owner(self, blob_id: str, memory_id: str) -> bool:
         """Return ``True`` iff ``memory_id`` is a registered owner of ``blob_id``."""
@@ -227,15 +282,18 @@ class BlobStore:
             if info.ref_count > 0:
                 self._write_sidecar(info)
                 return False
-            # Sidecar first: a crash between the two unlinks must not leave a
-            # sidecar pointing at missing bytes (an orphaned bytes file is
-            # harmless and gets rewritten by the next put of the same content).
-            for path in (self._sidecar_path(blob_id), self._blob_path(blob_id, info.ext)):
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
+            self._unlink(info)
             return True
+
+    def _unlink(self, info: BlobInfo) -> None:
+        # Sidecar first: a crash between the two unlinks must not leave a
+        # sidecar pointing at missing bytes (an orphaned bytes file is
+        # harmless and gets rewritten by the next put of the same content).
+        for path in (self._sidecar_path(info.id), self._blob_path(info.id, info.ext)):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
 
     # --- signed URLs ---------------------------------------------------------
     def _sig(self, blob_id: str, exp: int) -> str:

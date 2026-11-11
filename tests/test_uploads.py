@@ -360,6 +360,7 @@ def test_orphaned_upload_blob_reaped_after_restart(make_proxy, tmp_path):
         p1._save_pending_uploads()
 
         p2 = make_proxy(blob_dir=blob_dir, state_dir=state_dir)
+        await p2._reap_expired_uploads()  # settled by the first pass after start
         assert p2.blobs.get(blob_id) is None
 
     run(scenario())

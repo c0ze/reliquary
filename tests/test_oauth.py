@@ -349,7 +349,7 @@ def test_refresh_reuse_after_grace_is_plain_invalid_grant():
     _, refresh = p.issue_token_pair(client_id="c", scope="mcp")
     resp, _ = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})  # consumes `refresh`
     live = resp["refresh_token"]
-    p._refresh_tokens[refresh].consumed_at = time.time() - REFRESH_REUSE_GRACE - 1  # age past grace
+    p._refresh_tokens[p._token_key(refresh)].consumed_at = time.time() - REFRESH_REUSE_GRACE - 1  # age past grace
     _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
     assert err is not None and err[1] == "invalid_grant"
     resp2, err2 = p.exchange_code({"grant_type": "refresh_token", "refresh_token": live})
@@ -385,7 +385,7 @@ def test_refresh_rejects_foreign_client_when_not_pinned():
 def test_refresh_expired_invalid_grant():
     p = OAuthProvider(master_token="MASTER", mcp_resource_path="/claude/mcp", refresh_token_ttl=1)
     _, refresh = p.issue_token_pair(client_id="c", scope="mcp")
-    p._refresh_tokens[refresh].expires_at = time.time() - 1  # backdate past expiry
+    p._refresh_tokens[p._token_key(refresh)].expires_at = time.time() - 1  # backdate past expiry
     _, err = p.exchange_code({"grant_type": "refresh_token", "refresh_token": refresh})
     assert err is not None and err[1] == "invalid_grant"
 

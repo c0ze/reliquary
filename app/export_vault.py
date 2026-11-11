@@ -3,7 +3,9 @@
 
 Writes each page as ``<out>/<domain>/<slug>.md`` (markdown + YAML frontmatter,
 exactly the stored revision). One-way only (Reliquary -> vault); it never reads
-the vault back. Run:
+the vault back. It records the files it wrote in ``<out>/.reliquary-export.json``
+and, on the next run, removes those it no longer writes (deleted pages, pages
+whose domain changed); files it did not write are never touched. Run:
 
     python app/export_vault.py --out vault/
 
@@ -20,6 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from blobs import BlobStore  # noqa: E402
 from compiled import PageRegistry, slugify  # noqa: E402
+from persistence import JsonFileStore  # noqa: E402
+
+MANIFEST_NAME = ".reliquary-export.json"
 
 
 def export_vault(registry: PageRegistry, out_dir: str) -> int:
@@ -27,15 +32,24 @@ def export_vault(registry: PageRegistry, out_dir: str) -> int:
 
     Layout: ``<out_dir>/<domain-or-_>/<slug>.md``. Returns the number of files
     written. Uses an atomic tmp+replace write so a re-export never leaves a
-    partially-written file.
+    partially-written file. Files a previous export wrote (per the manifest) that
+    this run does not are removed.
     """
+    manifest = JsonFileStore(os.path.join(out_dir, MANIFEST_NAME))
+    previous = manifest.load().get("files")
+    previous = {f for f in previous if isinstance(f, str)} if isinstance(previous, list) else set()
+    exported: set[str] = set()
     written = 0
     for page in registry.list():
+        domain_dir = slugify(page.domain or "") or "_"
+        exported.add(f"{domain_dir}/{page.slug}.md")
         body = registry.read_body(page.slug)
         if body is None:
+            # Keep every earlier export of a page whose body is unreadable (it
+            # may be the last readable copy), wherever its domain put it.
+            exported.update(rel for rel in previous if rel.rsplit("/", 1)[-1] == f"{page.slug}.md")
             continue
         text, _blob_id = body
-        domain_dir = slugify(page.domain or "") or "_"
         dest_dir = os.path.join(out_dir, domain_dir)
         os.makedirs(dest_dir, exist_ok=True)
         path = os.path.join(dest_dir, f"{page.slug}.md")
@@ -44,6 +58,22 @@ def export_vault(registry: PageRegistry, out_dir: str) -> int:
             fh.write(text)
         os.replace(tmp, path)
         written += 1
+    for rel in sorted(previous - exported):
+        parts = rel.split("/")
+        # Only <dir>/<name>.md entries of the kind written above, never a path
+        # that could leave out_dir.
+        if len(parts) != 2 or not rel.endswith(".md") or any(p in ("", ".", "..") for p in parts):
+            continue
+        try:
+            os.remove(os.path.join(out_dir, *parts))
+        except FileNotFoundError:
+            pass
+        try:
+            os.rmdir(os.path.join(out_dir, parts[0]))  # only if now empty
+        except OSError:
+            pass
+    os.makedirs(out_dir, exist_ok=True)
+    manifest.save({"files": sorted(exported)})
     return written
 
 

@@ -100,7 +100,7 @@ def test_incremental_ingest_skips_unchanged_updates_changed_and_adds_new():
         incremental=True,
     )
 
-    assert summary == {"selected": 3, "added": 1, "updated": 1, "skipped": 1}
+    assert summary == {"selected": 3, "added": 1, "updated": 1, "skipped": 1, "duplicates": 0}
     assert [item["metadata"]["import_record_id"] for item in memory.added] == ["new"]
     assert memory.updated == [
         {
@@ -203,4 +203,4 @@ def test_bulk_ingest_without_registry_is_unchanged():
         user_id="u",
         page_registry=None,
     )
-    assert summary == {"selected": 1, "added": 1, "updated": 0, "skipped": 0}
+    assert summary == {"selected": 1, "added": 1, "updated": 0, "skipped": 0, "duplicates": 0}
