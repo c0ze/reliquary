@@ -521,6 +521,9 @@ class ReliquaryChatProxy:
         self._reap_retry_at = 0.0
         # The one background settling pass (see _schedule_reap), if running.
         self._reap_task: asyncio.Task | None = None
+        # Set when shutdown gave up waiting for that pass: from then on it
+        # applies and persists nothing, whenever its blocked lookup returns.
+        self._settling_abandoned = False
         self.pending_upload_store = (
             JsonFileStore(os.path.join(settings.state_dir, "pending_uploads.json"))
             if settings.state_dir
@@ -2962,12 +2965,23 @@ class ReliquaryChatProxy:
             fields["commit_users"] = [rec["commit_user_id"]]
         return PendingUpload(**fields)
 
-    def _save_pending_uploads(self) -> None:
+    def _save_pending_uploads(self) -> bool:
+        """Persist the slot table; False (logged) when the write failed. Most
+        saves only forget records, and a stale record on disk is forgotten at
+        the next start because its marker is gone. The three saves later steps
+        rely on (a new slot, its uploaded blob, a commit attempt's user) check
+        the result and undo their in-memory change when it is False, so memory
+        never runs ahead of disk."""
         if not self.pending_upload_store:
-            return
-        self.pending_upload_store.save(
-            {upload_id: asdict(upload) for upload_id, upload in self.pending_uploads.items()}
-        )
+            return True
+        try:
+            self.pending_upload_store.save(
+                {upload_id: asdict(upload) for upload_id, upload in self.pending_uploads.items()}
+            )
+        except Exception:
+            LOG.exception("Could not persist the upload slot table")
+            return False
+        return True
 
     def _drop_upload(self, upload_id: str) -> None:
         """Forget a slot and persist the change."""
@@ -3040,6 +3054,8 @@ class ReliquaryChatProxy:
                 except Exception:
                     LOG.exception("Settling upload slot %s failed", upload.id)
                     state, caption = None, None
+                if self._settling_abandoned:
+                    return  # shutdown already completed without this pass
                 if state is None:
                     self._reap_retry_at = time.monotonic() + UPLOAD_RECONCILE_RETRY
                     continue
@@ -3047,23 +3063,27 @@ class ReliquaryChatProxy:
                                         to=caption if state == "committed" else None)
                 settled.append(upload.id)
         finally:
-            self._busy_uploads.difference_update(upload.id for upload in due)
-            for upload_id in settled:
-                self.pending_uploads.pop(upload_id, None)
-            self._save_pending_uploads()
+            if not self._settling_abandoned:
+                self._busy_uploads.difference_update(upload.id for upload in due)
+                for upload_id in settled:
+                    self.pending_uploads.pop(upload_id, None)
+                self._save_pending_uploads()
 
     async def _stop_settling(self) -> None:
         """At shutdown: cancel the settling pass and wait (bounded) for it to
-        drain. A lookup still blocked in the memory backend keeps its slots
-        claimed until the process exits; they are settled after the restart."""
+        drain. A worker thread cannot be stopped: if its lookup is still
+        blocked after the grace period, the pass is abandoned. Its slots stay
+        claimed, and when the lookup returns the pass applies and persists
+        nothing; the slots are settled after the next start."""
         task = self._reap_task
         if task is None or task.done():
             return
         task.cancel()
         done, _pending = await asyncio.wait({task}, timeout=UPLOAD_SHUTDOWN_GRACE)
         if not done:
-            LOG.warning("Upload settling was still waiting on the memory backend at shutdown; "
-                        "its slots are settled after the next start")
+            self._settling_abandoned = True
+            LOG.warning("Upload settling left a memory-backend lookup running at shutdown; it will "
+                        "apply nothing, and its slots are settled after the next start")
 
     async def _reap_expired_uploads(self) -> None:
         """Schedule a settling pass and wait for the running one to finish (for
@@ -3125,7 +3145,11 @@ class ReliquaryChatProxy:
             profile=profile.name if profile else None,
             commit_users=[],
         )
-        self._save_pending_uploads()
+        if not self._save_pending_uploads():
+            self.pending_uploads.pop(upload_id, None)
+            return self.mcp_tool_result(
+                text="Could not record the upload slot (server storage); retry shortly.",
+                structured={"error": "state_write_failed"}, is_error=True)
         upload_url = self._absolute_url(f"/uploads/{upload_id}")
         commit_tool = "commit_image_upload" if profile and profile.name == "openai" else "reliquary_commit_image_upload"
         return self.mcp_tool_result(
@@ -3247,7 +3271,13 @@ class ReliquaryChatProxy:
         upload.blob_id = info.id
         upload.mimetype = info.mimetype
         upload.size = info.size
-        self._save_pending_uploads()
+        if not self._save_pending_uploads():
+            # Undo, so memory matches disk: no commit can have started (the slot
+            # is claimed), so the marked reference is certainly this slot's.
+            upload.blob_id = upload.mimetype = upload.size = None
+            self.blobs.settle_owner(info.id, self._slot_marker(upload_id))
+            await self.send_json(send, 503, {"error": "state_write_failed", "upload_id": upload_id})
+            return
         await self.send_json(
             send,
             201,
@@ -3378,10 +3408,18 @@ class ReliquaryChatProxy:
                     structured={"error": "already_committed", "upload_id": upload_id, "blob_id": upload.blob_id},
                     is_error=True,
                 )
-        if upload.commit_users is None or user_id not in upload.commit_users:
-            # Write-ahead: recorded before the caption can exist.
-            upload.commit_users = [*(upload.commit_users or []), user_id]
-            self._save_pending_uploads()
+        # Write-ahead: every attempt persists its user before a caption can
+        # exist, also when the user is already listed in memory (an earlier
+        # save may have failed). If this save fails, nothing is written and
+        # memory goes back to what is on disk.
+        recorded = upload.commit_users
+        if recorded is None or user_id not in recorded:
+            upload.commit_users = [*(recorded or []), user_id]
+        if not self._save_pending_uploads():
+            upload.commit_users = recorded
+            return self.mcp_tool_result(
+                text="Could not record the commit attempt (server storage); nothing was written. Retry shortly.",
+                structured={"error": "state_write_failed", "upload_id": upload_id}, is_error=True)
         failure: Exception | None = None
         try:
             result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)
