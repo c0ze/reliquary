@@ -175,6 +175,8 @@ UPLOAD_RECONCILE_RETRY = 60.0
 # A settling pass stops starting new lookups after this many seconds; the rest
 # wait for the next pass.
 UPLOAD_SETTLE_BUDGET = 10.0
+# How long lifespan shutdown waits for a cancelled settling pass to drain.
+UPLOAD_SHUTDOWN_GRACE = 5.0
 # Passive raster image types safe to serve inline same-origin. Anything else
 # (SVG, PDF, HTML, unknown) is forced to an octet-stream download by /blobs/{id}.
 _INLINE_SAFE_MIMETYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
@@ -378,9 +380,11 @@ class PendingUpload:
     # Endpoint that minted the slot ("claude"/"openai"). A slot can only be
     # finalized through the same endpoint it was created on.
     profile: str | None = None
-    # Recorded before a commit writes the caption, so a commit cut short (crash)
-    # can be reconciled: the caption may exist while the blob still names the slot.
-    commit_user_id: str | None = None
+    # Every user a commit attempt wrote (or may have written) a caption under,
+    # recorded before the caption write: [] means no attempt yet. A commit cut
+    # short is resolved by looking only under these users. None: a slot whose
+    # history is unknown (written by an older build); it is never resolved.
+    commit_users: list[str] | None = None
 
 
 class ReliquaryChatProxy:
@@ -514,9 +518,6 @@ class ReliquaryChatProxy:
         # Single event loop: claim a slot before any await. Cleanup must not
         # reclaim bytes while a POST or caption commit is in flight.
         self._busy_uploads: set[str] = set()
-        # Pre-marker slots whose commit outcome startup could not read: kept
-        # (expired or not) until a reconciliation gives a definite answer.
-        self._unresolved_legacy: set[str] = set()
         self._reap_retry_at = 0.0
         # The one background settling pass (see _schedule_reap), if running.
         self._reap_task: asyncio.Task | None = None
@@ -796,6 +797,7 @@ class ReliquaryChatProxy:
                 self._schedule_reap()  # settle slots left from before the restart
                 await send({"type": "lifespan.startup.complete"})
             elif message_type == "lifespan.shutdown":
+                await self._stop_settling()
                 await self.client.aclose()
                 await self.image_client.aclose()
                 await send({"type": "lifespan.shutdown.complete"})
@@ -2855,55 +2857,53 @@ class ReliquaryChatProxy:
                         "target_id": target_id, "status": "proposed"})
 
     def _load_pending_uploads(self) -> None:
-        """Restore persisted upload slots (if a state_dir is configured) and reap
-        any that already expired while the process was down — otherwise bytes that
-        were uploaded but never committed would orphan their blob across restarts."""
+        """Restore persisted upload slots (if a state_dir is configured). A
+        slot's blob reference is only ever released or handed over through its
+        own "upload:<id>" marker, and only when its owner is certain; anything
+        else is kept as bytes (a leak lint reports) rather than guessed. So a
+        record is restored only when it holds its marker and its commit history
+        is known. Forgotten, with no reference touched: malformed records,
+        records of the deployed build (no marker; their clients get
+        unknown_upload and upload again), records whose reference already went
+        to their caption, and marked records of unknown commit history."""
         if not self.pending_upload_store:
             return
         restored: dict[str, PendingUpload] = {}
-        dropped = False
-        for upload_id, rec in self.pending_upload_store.load().items():
+        loaded = self.pending_upload_store.load()
+        for upload_id, rec in loaded.items():
             upload = self._pending_upload_from_record(upload_id, rec)
-            if upload is not None:
-                restored[upload_id] = upload
+            if upload is None:
                 continue
-            dropped = True
-            # A malformed slot can still name the blob it holds a reference on.
-            # Keep it as an expired recovery record holding only what settling
-            # needs; it is released, or handed to its caption, once the outcome
-            # is known, and kept (retried later) while it is not.
-            blob_id = rec.get("blob_id") if isinstance(rec, dict) else None
-            if isinstance(blob_id, str) and re.fullmatch(r"[0-9a-f]{64}", blob_id):
-                commit_user_id = rec.get("commit_user_id")
-                restored[upload_id] = PendingUpload(
-                    id=upload_id, created_at=0.0, expires_at=0.0, blob_id=blob_id,
-                    commit_user_id=commit_user_id if isinstance(commit_user_id, str) else None)
-        for upload_id, upload in restored.items():
-            # Written before per-slot markers (or outlived its commit): whether it
-            # still holds an unmarked reference needs a memory lookup, which
-            # startup never waits for; a commit retry or the settling pass asks.
-            if upload.blob_id and not self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload_id}"):
-                self._unresolved_legacy.add(upload_id)
+            if not upload.blob_id:
+                upload.commit_users = upload.commit_users or []
+            elif upload.commit_users is None or not self._holds_marker(upload):
+                continue
+            restored[upload_id] = upload
         self.pending_uploads = restored
-        if dropped:
+        if len(restored) != len(loaded):
             self._save_pending_uploads()
         self._cleanup_expired_uploads()
 
-    def _find_slot_caption(self, upload: PendingUpload) -> tuple[str | None, str | None]:
-        """Read-only lookup (worker thread) for a caption memory carrying this
-        slot's server-set upload_id and blob_ref (a commit can write the caption
-        and stop before handing the slot's reference over), under the recorded
-        commit user and the default user: ("committed", caption_id),
-        ("pending", None) when there is none, (None, None) when the memory
-        backend could not be read."""
-        users = list(dict.fromkeys(user for user in (upload.commit_user_id, self.settings.user_id) if user))
+    @staticmethod
+    def _slot_marker(upload_id: str) -> str:
+        return f"{UPLOAD_OWNER_PREFIX}{upload_id}"
+
+    def _holds_marker(self, upload: PendingUpload) -> bool:
+        """Whether the slot still holds its blob reference (its marker)."""
+        return bool(upload.blob_id) and self.blobs.is_owner(upload.blob_id, self._slot_marker(upload.id))
+
+    def _find_slot_caption(self, upload: PendingUpload, users: list[str]) -> tuple[str | None, str | None]:
+        """Read-only lookup (worker thread) for a caption carrying this slot's
+        server-set upload_id and blob_ref under any of ``users``:
+        ("committed", caption_id), ("pending", None) when there is none,
+        (None, None) when the memory backend could not be read."""
         get_all = getattr(self.memory, "get_all", None)
         for user in users:
             try:
                 result = get_all(**self._get_all_kwargs(get_all, user_id=user, top_k=20,
                                                         metadata_filters={"upload_id": upload.id}))
             except Exception:
-                LOG.warning("Could not reconcile upload slot %s", upload.id, exc_info=True)
+                LOG.warning("Could not look up a caption for upload slot %s", upload.id, exc_info=True)
                 return None, None
             for record in self._memory_results(result):
                 metadata = (record.get("metadata") or {}) if isinstance(record, dict) else {}
@@ -2912,90 +2912,27 @@ class ReliquaryChatProxy:
                     return "committed", str(record["id"])
         return "pending", None
 
-    def _slot_lookup(self, upload: PendingUpload) -> tuple[str, str | None, str | None]:
-        """Read-only (worker thread): what the slot's reference needs. Returns
-        (kind, state, caption): kind "marked" (it holds an "upload:<id>" owner;
-        see _find_slot_caption), "legacy" (an unmarked pre-marker reference of
-        unknown outcome; see _reconcile_unmarked_slot) or "none" (holds nothing)."""
-        if upload.blob_id and self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload.id}"):
-            return ("marked", *self._find_slot_caption(upload))
-        if upload.blob_id and upload.id in self._unresolved_legacy:
-            return "legacy", self._reconcile_unmarked_slot(upload.id, upload.blob_id), None
-        return "none", "committed", None
-
-    def _apply_slot_lookup(self, upload: PendingUpload, kind: str, state: str | None, caption: str | None) -> bool:
-        """Act on a _slot_lookup result, on the event loop with no await, after
-        re-checking that the slot still is as the lookup saw it (a stale result
-        changes nothing). Hands the reference to the caption, releases it (only
-        for an expired slot), or marks a still-live pre-marker reference. True
-        once settled; False when the outcome is unknown and the record stays."""
-        marker = f"{UPLOAD_OWNER_PREFIX}{upload.id}"
-        if state is None:
-            return False
-        if kind == "marked":
-            if not upload.blob_id or not self.blobs.is_owner(upload.blob_id, marker):
-                return True  # settled meanwhile
-            if state == "committed":
-                self.blobs.transfer_owner(upload.blob_id, marker, caption)
-            elif upload.expires_at <= time.time():
-                self.blobs.delete(upload.blob_id, owner=marker)
-            upload.commit_user_id = None
-            return True
-        if kind == "legacy":
-            if upload.id not in self._unresolved_legacy or self.blobs.is_owner(upload.blob_id, marker):
-                return True  # settled meanwhile
-            self._unresolved_legacy.discard(upload.id)
-            if state == "pending":
-                if upload.expires_at <= time.time():
-                    self.blobs.delete(upload.blob_id)  # its unmarked pre-marker reference
-                else:
-                    self.blobs.register_owner(upload.blob_id, marker)
-        return True
-
     def _settling_lock(self):
-        """Lock for settling lookups, which only read: none with a server-backed
+        """Lock for caption lookups, which only read: none with a server-backed
         store (concurrent reads are safe, and a slow backend must not hold
         writers back), the exclusive lock with an embedded store (not
         thread-safe)."""
         return contextlib.nullcontext() if self._concurrent_reads else self.memory_lock.write()
 
-    async def _look_up_slot(self, upload: PendingUpload) -> tuple[str, str | None, str | None]:
-        """_slot_lookup in a worker thread, drained: a cancelled caller keeps
-        its claim on the slot until the worker has finished."""
+    async def _look_up_slot(self, upload: PendingUpload, users: tuple[str, ...] = ()) -> tuple[str | None, str | None]:
+        """Whether a commit attempt of this slot wrote a caption, looking under
+        every user an attempt recorded plus ``users``; changes nothing. No
+        recorded attempt means no caption can exist: ("pending", None) without
+        asking the backend. The lookup runs in a worker thread and is drained,
+        so a cancelled caller keeps its claim on the slot until it finishes."""
+        everyone = list(dict.fromkeys([*(upload.commit_users or []), *users]))
+        if not everyone:
+            return "pending", None
+
         async def lookup():
             async with self._settling_lock():
-                return await asyncio.to_thread(self._slot_lookup, upload)
+                return await asyncio.to_thread(self._find_slot_caption, upload, everyone)
         return await drain_on_cancel(lookup())
-
-    def _slot_needs_settling(self, upload: PendingUpload) -> bool:
-        """Whether the slot may still hold a blob reference: its marker, or an
-        unmarked pre-marker reference whose outcome is not known yet."""
-        if not upload.blob_id:
-            return False
-        return upload.id in self._unresolved_legacy or \
-            self.blobs.is_owner(upload.blob_id, f"{UPLOAD_OWNER_PREFIX}{upload.id}")
-
-    def _reconcile_unmarked_slot(self, upload_id: str, blob_id: str) -> str | None:
-        """Decide whether a slot whose blob carries no "upload:<id>" marker (one
-        persisted before markers existed, or one whose reference already went to
-        its caption) still holds a reference: "committed" when an owning memory's
-        server-set upload_id names the slot or no unmarked reference is left,
-        "pending" otherwise, None when the memory backend could not be read."""
-        info = self.blobs.info(blob_id)
-        if info is None or info.ref_count <= len(info.owners):
-            return "committed"
-        for owner in info.owners:
-            if owner.startswith(UPLOAD_OWNER_PREFIX):
-                continue
-            try:
-                record = self.memory.get(owner)
-            except Exception:
-                LOG.warning("Could not reconcile upload slot %s against memory %s", upload_id, owner,
-                            exc_info=True)
-                return None
-            if isinstance(record, dict) and (record.get("metadata") or {}).get("upload_id") == upload_id:
-                return "committed"
-        return "pending"
 
     @staticmethod
     def _pending_upload_from_record(upload_id: str, rec: Any) -> PendingUpload | None:
@@ -3006,8 +2943,7 @@ class ReliquaryChatProxy:
         fields: dict[str, Any] = {}
         for name, kinds in (("id", str), ("created_at", (int, float)), ("expires_at", (int, float)),
                             ("expected_mimetype", str), ("expected_size", int), ("filename", str),
-                            ("blob_id", str), ("mimetype", str), ("size", int), ("profile", str),
-                            ("commit_user_id", str)):
+                            ("blob_id", str), ("mimetype", str), ("size", int), ("profile", str)):
             value = rec.get(name)
             if value is None:
                 if name in ("id", "created_at", "expires_at"):
@@ -3019,6 +2955,11 @@ class ReliquaryChatProxy:
         blob_id = fields.get("blob_id")
         if blob_id is not None and not re.fullmatch(r"[0-9a-f]{64}", blob_id):
             return None
+        users = rec.get("commit_users")
+        if isinstance(users, list) and all(isinstance(user, str) for user in users):
+            fields["commit_users"] = list(users)
+        elif isinstance(rec.get("commit_user_id"), str):  # a 0.5.2 pre-release spelling
+            fields["commit_users"] = [rec["commit_user_id"]]
         return PendingUpload(**fields)
 
     def _save_pending_uploads(self) -> None:
@@ -3041,7 +2982,7 @@ class ReliquaryChatProxy:
             upload_id
             for upload_id, upload in self.pending_uploads.items()
             if upload.expires_at <= now and upload_id not in self._busy_uploads
-            and not self._slot_needs_settling(upload)
+            and not self._holds_marker(upload)
         ]
         for upload_id in expired:
             self.pending_uploads.pop(upload_id, None)
@@ -3069,12 +3010,15 @@ class ReliquaryChatProxy:
         self._reap_task = loop.create_task(self._settle_expired_uploads())
 
     async def _settle_expired_uploads(self) -> None:
-        """The settling pass. Claims its slots when it starts; each lookup runs
-        in a worker thread and is drained, so the claim (which keeps any other
-        pass, commit or POST off the slot) outlives a cancelled pass until the
-        worker is done. Results are applied on the loop after re-checking the
-        slot. Unanswered lookups keep their records and set the back-off at once;
-        a pass stops starting lookups after UPLOAD_SETTLE_BUDGET seconds."""
+        """The settling pass for expired slots still holding their marker. Each
+        slot is claimed for the whole pass, so no commit or caption delete can
+        touch it meanwhile; its lookup is drained, so the claim outlives a
+        cancelled pass until the worker is done. A caption written by one of
+        the slot's recorded attempts gets the reference; with none it is
+        released; if the backend cannot answer, the record and its reference
+        stay and the back-off starts. The blob store re-checks the marker when
+        it applies the result. Stops starting lookups after
+        UPLOAD_SETTLE_BUDGET seconds."""
         now = time.time()
         due = [upload for upload_id, upload in self.pending_uploads.items()
                if upload.expires_at <= now and upload_id not in self._busy_uploads]
@@ -3086,23 +3030,40 @@ class ReliquaryChatProxy:
                 if time.monotonic() >= deadline:
                     self._reap_retry_at = time.monotonic() + UPLOAD_RECONCILE_RETRY
                     break
+                if not self._holds_marker(upload):
+                    settled.append(upload.id)  # holds nothing
+                    continue
                 try:
-                    result = await self._look_up_slot(upload)
-                    done = self._apply_slot_lookup(upload, *result)
+                    state, caption = await self._look_up_slot(upload)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     LOG.exception("Settling upload slot %s failed", upload.id)
-                    done = False
-                if done:
-                    settled.append(upload.id)
-                else:
+                    state, caption = None, None
+                if state is None:
                     self._reap_retry_at = time.monotonic() + UPLOAD_RECONCILE_RETRY
+                    continue
+                self.blobs.settle_owner(upload.blob_id, self._slot_marker(upload.id),
+                                        to=caption if state == "committed" else None)
+                settled.append(upload.id)
         finally:
             self._busy_uploads.difference_update(upload.id for upload in due)
             for upload_id in settled:
                 self.pending_uploads.pop(upload_id, None)
             self._save_pending_uploads()
+
+    async def _stop_settling(self) -> None:
+        """At shutdown: cancel the settling pass and wait (bounded) for it to
+        drain. A lookup still blocked in the memory backend keeps its slots
+        claimed until the process exits; they are settled after the restart."""
+        task = self._reap_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        done, _pending = await asyncio.wait({task}, timeout=UPLOAD_SHUTDOWN_GRACE)
+        if not done:
+            LOG.warning("Upload settling was still waiting on the memory backend at shutdown; "
+                        "its slots are settled after the next start")
 
     async def _reap_expired_uploads(self) -> None:
         """Schedule a settling pass and wait for the running one to finish (for
@@ -3162,6 +3123,7 @@ class ReliquaryChatProxy:
             expected_size=expected_size,
             filename=filename,
             profile=profile.name if profile else None,
+            commit_users=[],
         )
         self._save_pending_uploads()
         upload_url = self._absolute_url(f"/uploads/{upload_id}")
@@ -3350,30 +3312,13 @@ class ReliquaryChatProxy:
                 structured={"error": "upload_not_ready", "upload_id": upload_id},
                 is_error=True,
             )
-        # Before (re)trying a commit, settle what the slot holds: an earlier
-        # commit may have written its caption and stopped before handing the
-        # reference over (whatever the slot recorded), and a pre-marker slot's
-        # reference may already belong to its caption. Claimed meanwhile.
-        self._busy_uploads.add(upload_id)
-        try:
-            kind, state, caption_id = await self._look_up_slot(upload)
-        finally:
-            self._busy_uploads.discard(upload_id)
-        if state is None:
-            return self.mcp_tool_result(
-                text=f"Could not check whether upload slot {upload_id} was already committed; retry shortly.",
-                structured={"error": "upload_in_progress", "upload_id": upload_id}, is_error=True)
-        # kind "none" (no marker, no unresolved pre-marker reference) reads as
-        # "committed": the reference was handed over already.
-        self._apply_slot_lookup(upload, kind, state, caption_id)
-        self._save_pending_uploads()
-        if state == "committed":
-            # Committing again would double-own the blob, and a failed retry's
-            # rollback would unlink the committed memory's bytes.
+        if not self._holds_marker(upload):
+            # Its reference is gone (handed to a caption or released): there is
+            # nothing this slot can commit.
             self._drop_upload(upload_id)
             return self.mcp_tool_result(
-                text=f"Upload slot {upload_id} was already committed.",
-                structured={"error": "already_committed", "upload_id": upload_id, "blob_id": upload.blob_id},
+                text=f"Upload slot {upload_id} no longer holds its bytes; upload the image again.",
+                structured={"error": "unknown_upload", "upload_id": upload_id},
                 is_error=True,
             )
 
@@ -3401,68 +3346,89 @@ class ReliquaryChatProxy:
                 metadata[key] = str(value).strip()
         normalize_taxonomy(metadata)
 
+        # Claimed for the whole commit: no settling pass or caption delete can
+        # act on the slot meanwhile, and expiry cannot release its reference.
+        # Drained: a cancelled caller must not leave a half-done commit.
         self._busy_uploads.add(upload_id)
         try:
-            # Write-ahead: if the process stops between the caption write and the
-            # ownership transfer, startup finds the caption by this slot's id.
-            upload.commit_user_id = user_id
-            self._save_pending_uploads()
-            # Drained: a cancelled caller must not leave a caption whose bytes
-            # are still held only by the slot.
             return await drain_on_cancel(self._commit_upload(upload, caption, user_id, metadata))
         finally:
             self._busy_uploads.discard(upload_id)
 
     async def _commit_upload(self, upload: PendingUpload, caption: str, user_id: str, metadata: dict) -> dict[str, Any]:
+        """Commit under the slot's claim. The slot's marked reference is only
+        handed to a caption that exists, or released when it is certain that
+        no recorded attempt wrote one; when that cannot be established, the
+        record and its reference stay for the settling pass."""
         upload_id = upload.id
-        slot_owner = f"{UPLOAD_OWNER_PREFIX}{upload_id}"
-        caption_landed = None
+        marker = self._slot_marker(upload_id)
+        if upload.commit_users:
+            # An earlier attempt may have written its caption (under its own
+            # user, or this one) and stopped before handing the reference over.
+            state, found = await self._look_up_slot(upload, (user_id,))
+            if state is None:
+                return self.mcp_tool_result(
+                    text=f"Could not check whether upload slot {upload_id} was already committed; retry shortly.",
+                    structured={"error": "upload_in_progress", "upload_id": upload_id}, is_error=True)
+            if state == "committed":
+                self._drop_upload(upload_id)
+                self.blobs.settle_owner(upload.blob_id, marker, to=found)
+                return self.mcp_tool_result(
+                    text=f"Upload slot {upload_id} was already committed.",
+                    structured={"error": "already_committed", "upload_id": upload_id, "blob_id": upload.blob_id},
+                    is_error=True,
+                )
+        if upload.commit_users is None or user_id not in upload.commit_users:
+            # Write-ahead: recorded before the caption can exist.
+            upload.commit_users = [*(upload.commit_users or []), user_id]
+            self._save_pending_uploads()
+        failure: Exception | None = None
         try:
             result = await self.add_memory(caption, user_id=user_id, metadata=metadata, infer=False)
-        except Exception:
-            # Mem0 inserts the vector before its history write, so the caption
-            # may exist although add() raised: look for it before releasing.
-            async with self._settling_lock():
-                state, caption_landed = await asyncio.to_thread(self._find_slot_caption, upload)
-            if state is None:
-                self._save_pending_uploads()  # keep the slot's recovery record
-                raise
-            if state == "pending":
-                self.blobs.delete(upload.blob_id, owner=slot_owner)
-                self._drop_upload(upload_id)
-                raise
-            self.blobs.transfer_owner(upload.blob_id, slot_owner, caption_landed)
-            LOG.warning("Caption for upload %s landed although Mem0 raised; committed it", upload_id)
-            result = {"results": [{"id": caption_landed, "event": "ADD"}]}
-        new_ids = added_memory_ids(result)
-        memory_id = new_ids[0] if new_ids else None
+            new_ids = added_memory_ids(result)
+            memory_id = new_ids[0] if new_ids else None
+        except Exception as exc:
+            failure, memory_id = exc, None
         if memory_id is None:
-            self.blobs.delete(upload.blob_id, owner=slot_owner)
-            self._drop_upload(upload_id)
-            return self.mcp_tool_result(
-                text="Uploaded the blob but failed to create its caption memory; rolled back.",
-                structured={"error": "memory_write_failed", "blob_id": upload.blob_id, "upload_id": upload_id},
-                is_error=True,
-            )
+            # Mem0 inserts the vector before its history write, so the caption
+            # may exist although add() failed: ask before releasing anything.
+            state, memory_id = await self._look_up_slot(upload)
+            if state != "committed":
+                if state == "pending":  # certain: no recorded attempt wrote a caption
+                    self._drop_upload(upload_id)
+                    self.blobs.settle_owner(upload.blob_id, marker)
+                else:
+                    self._save_pending_uploads()  # unknown: keep the record and its reference
+                if failure is not None:
+                    raise failure
+                return self.mcp_tool_result(
+                    text="Uploaded the blob but failed to create its caption memory.",
+                    structured={"error": "memory_write_failed", "blob_id": upload.blob_id, "upload_id": upload_id},
+                    is_error=True,
+                )
+            LOG.warning("Caption for upload %s landed although Mem0 failed; committing it", upload_id)
         try:
-            # The slot's reference becomes the caption's, in one sidecar write
-            # (already done when the caption was found after add() raised).
-            if caption_landed is None and not self.blobs.transfer_owner(upload.blob_id, slot_owner, memory_id):
-                raise RuntimeError("the upload slot no longer holds a blob reference")
-        except Exception:
-            LOG.exception(
-                "Failed to register uploaded blob owner blob_id=%s memory_id=%s; rolling back",
-                upload.blob_id,
-                memory_id,
-            )
+            handed_over = self.blobs.settle_owner(upload.blob_id, marker, to=memory_id)
+            error = None if handed_over else "the upload slot no longer holds a blob reference"
+        except Exception as exc:
+            error = str(exc)
+        if error is not None:
+            LOG.error("Failed to hand blob %s to caption %s: %s; rolling back", upload.blob_id, memory_id, error)
             try:
                 await self.delete_memory(memory_id)
+                deleted = True
             except Exception:
                 LOG.exception("Rollback delete_memory failed for memory_id=%s", memory_id)
-            self.blobs.delete(upload.blob_id, owner=slot_owner)
-            self._drop_upload(upload_id)
+                deleted = False
+            if deleted:
+                # Every recorded attempt was checked: no other caption holds a
+                # claim on these bytes.
+                self._drop_upload(upload_id)
+                self.blobs.settle_owner(upload.blob_id, marker)
+            else:
+                self._save_pending_uploads()  # the caption exists: keep its bytes for settling
             return self.mcp_tool_result(
-                text="Failed to finalize upload ownership; rolled back.",
+                text="Failed to finalize upload ownership.",
                 structured={
                     "error": "ownership_registration_failed",
                     "blob_id": upload.blob_id,
@@ -3473,6 +3439,9 @@ class ReliquaryChatProxy:
             )
 
         blob_id = upload.blob_id
+        mimetype = upload.mimetype
+        size = upload.size
+        self._drop_upload(upload_id)  # before the awaited fan-out, which can be cancelled        blob_id = upload.blob_id
         mimetype = upload.mimetype
         size = upload.size
         self._drop_upload(upload_id)  # before the awaited fan-out, which can be cancelled
@@ -3742,20 +3711,20 @@ class ReliquaryChatProxy:
                 is_error=True,
             )
         blob_ref = metadata.get("blob_ref")
-        if metadata.get("kind") != "image" or not blob_ref or not self.blobs.is_owner(str(blob_ref), memory_id):
+        owns = bool(blob_ref) and self.blobs.is_owner(str(blob_ref), memory_id)
+        slot = self._caption_slot(metadata)
+        # A caption whose commit stopped before the hand-over owns nothing yet;
+        # its bytes are still held by its upload slot's marker.
+        if metadata.get("kind") != "image" or not blob_ref or not (owns or (slot and self._holds_marker(slot))):
             return self.mcp_tool_result(
                 text=f"memory_id={memory_id} is not a deletable image (no owned blob).",
                 structured={"error": "not_an_image", "id": memory_id},
                 is_error=True,
             )
-        async def delete_caption_and_release():
-            await self.delete_memory(memory_id)
-            return self.blobs.delete(str(blob_ref), owner=memory_id)
-
-        # Caption delete and reference release are one transaction, drained
-        # against caller cancellation, and both precede the awaited fan-out: a
-        # blob owned by a deleted memory could never be removed through the API.
-        unlinked = await drain_on_cancel(delete_caption_and_release())
+        busy = await self._delete_caption(memory_id, metadata, owned_blob=str(blob_ref) if owns else None)
+        if busy is not None:
+            return busy
+        unlinked = self.blobs.info(str(blob_ref)) is None
         await self._fan_out_staleness([memory_id], metadata)
         return self.mcp_tool_result(
             text=f"Deleted image memory_id={memory_id} (blob_id={blob_ref}, blob_unlinked={bool(unlinked)}).",
@@ -3766,6 +3735,46 @@ class ReliquaryChatProxy:
                 "blob_unlinked": bool(unlinked),
             },
         )
+
+    def _caption_slot(self, metadata: dict[str, Any]) -> PendingUpload | None:
+        """The pending upload slot an image caption came from (its server-set
+        upload_id and blob_ref), if that slot is still recorded."""
+        upload_id = metadata.get("upload_id")
+        slot = self.pending_uploads.get(upload_id) if isinstance(upload_id, str) else None
+        if slot is None or not slot.blob_id or slot.blob_id != metadata.get("blob_ref"):
+            return None
+        return slot
+
+    async def _delete_caption(self, memory_id: str, metadata: dict[str, Any], *,
+                              owned_blob: str | None) -> dict[str, Any] | None:
+        """Delete a memory and, in one transaction drained against caller
+        cancellation, release the blob reference it owns (``owned_blob``) and
+        retire the pending slot it came from: that slot's marked reference was
+        held for this caption, so it goes with it. Claims the slot first; if a
+        commit or settling pass holds it, nothing is deleted and the caller is
+        asked to retry. Returns that error result, or None when done."""
+        slot = self._caption_slot(metadata)
+        if slot is not None:
+            if slot.id in self._busy_uploads:
+                return self.mcp_tool_result(
+                    text="This image's upload is being processed; retry shortly.",
+                    structured={"error": "upload_in_progress", "upload_id": slot.id}, is_error=True)
+            self._busy_uploads.add(slot.id)
+
+        async def transaction():
+            await self.delete_memory(memory_id)
+            if owned_blob:
+                self.blobs.delete(owned_blob, owner=memory_id)
+            if slot is not None:
+                self._drop_upload(slot.id)
+                self.blobs.settle_owner(slot.blob_id, self._slot_marker(slot.id))
+
+        try:
+            await drain_on_cancel(transaction())
+        finally:
+            if slot is not None:
+                self._busy_uploads.discard(slot.id)
+        return None
 
     async def handle_delete_tool(self, arguments: dict[str, Any], *, allow_user_id: bool = False, tool_prefix: str = "") -> dict[str, Any]:
         record_id = str(arguments.get("id") or "").strip()
@@ -3831,7 +3840,9 @@ class ReliquaryChatProxy:
                                 "suggested_action": f"Call {tool_prefix}delete_image with memory_id={record_id}."},
                     is_error=True,
                 )
-        await self.delete_memory(record_id)
+        busy = await self._delete_caption(record_id, existing_meta, owned_blob=None)
+        if busy is not None:
+            return busy
         await self._fan_out_staleness([record_id], existing_meta)
         return self.mcp_tool_result(
             text=f"Deleted memory {existing.get('title', record_id)} (id={record_id}).",

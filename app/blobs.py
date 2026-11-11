@@ -231,6 +231,26 @@ class BlobStore:
             self._write_sidecar(info)
             return True
 
+    def settle_owner(self, blob_id: str, owner: str, *, to: str | None = None) -> bool:
+        """The one way a pending upload's marked reference changes: hand
+        ``owner``'s reference to ``to``, or release it when ``to`` is None.
+        Fails closed: returns False, changing nothing, unless ``owner`` holds a
+        reference at that moment (checked under the store lock)."""
+        if to is not None:
+            return self.transfer_owner(blob_id, owner, to)
+        _validate_blob_id(blob_id)
+        with _STORE_LOCK:
+            info = self.info(blob_id)
+            if info is None or owner not in info.owners:
+                return False
+            info.owners.remove(owner)
+            info.ref_count -= 1
+            if info.ref_count > 0:
+                self._write_sidecar(info)
+            else:
+                self._unlink(info)
+            return True
+
     def is_owner(self, blob_id: str, memory_id: str) -> bool:
         """Return ``True`` iff ``memory_id`` is a registered owner of ``blob_id``."""
         _validate_blob_id(blob_id)
@@ -262,15 +282,18 @@ class BlobStore:
             if info.ref_count > 0:
                 self._write_sidecar(info)
                 return False
-            # Sidecar first: a crash between the two unlinks must not leave a
-            # sidecar pointing at missing bytes (an orphaned bytes file is
-            # harmless and gets rewritten by the next put of the same content).
-            for path in (self._sidecar_path(blob_id), self._blob_path(blob_id, info.ext)):
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
+            self._unlink(info)
             return True
+
+    def _unlink(self, info: BlobInfo) -> None:
+        # Sidecar first: a crash between the two unlinks must not leave a
+        # sidecar pointing at missing bytes (an orphaned bytes file is
+        # harmless and gets rewritten by the next put of the same content).
+        for path in (self._sidecar_path(info.id), self._blob_path(info.id, info.ext)):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
 
     # --- signed URLs ---------------------------------------------------------
     def _sig(self, blob_id: str, exp: int) -> str:
