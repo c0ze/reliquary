@@ -88,7 +88,7 @@ def test_expired_committed_slot_does_not_eat_another_images_reference(make_proxy
 
     slot, committed = run(before_crash())
     restarted = make_proxy(memory=memory, state_dir=state)
-    restarted.pending_uploads[slot].expires_at = 1  # it expires after the restart
+    assert slot not in restarted.pending_uploads  # its reference went to the caption: forgotten
 
     async def after_restart():
         added = await call(restarted, "reliquary_add_image",
@@ -124,7 +124,7 @@ def test_replay_guard_is_per_slot_when_slots_share_bytes(make_proxy, tmp_path):
         return retry["structuredContent"], other["structuredContent"]
 
     retry, other = run(after_restart())
-    assert retry.get("error") == "already_committed"
+    assert retry.get("error") == "unknown_upload"  # the slot that outlived its commit was forgotten
     assert "error" not in other, other
     info = restarted.blobs.info(committed["blob_id"])
     assert sorted(info.owners) == sorted([committed["memory_id"], other["memory_id"]])
@@ -138,7 +138,7 @@ def _legacy_slot(upload_id, blob_id, *, expires_at=1e12):
             "size": len(PNG), "profile": "claude"}
 
 
-def test_legacy_slots_are_reconciled_against_caption_upload_ids(make_proxy, tmp_path):
+def test_deployed_format_slots_are_forgotten_without_touching_references(make_proxy, tmp_path):
     from blobs import BlobStore
     from conftest import FakeMemory
 
@@ -155,37 +155,13 @@ def test_legacy_slots_are_reconciled_against_caption_upload_ids(make_proxy, tmp_
         "upl_X": _legacy_slot("upl_X", blob), "upl_Y": _legacy_slot("upl_Y", blob)}))
 
     proxy = make_proxy(memory=memory, state_dir=str(state))
-    assert proxy.blobs.info(blob).ref_count == 2  # startup decides nothing; the commit retry asks
-    retry = run(call(proxy, "reliquary_commit_image_upload", {"upload_id": "upl_X", "caption": "again"}))
-    assert retry["structuredContent"]["error"] == "already_committed"
-    proxy.pending_uploads["upl_Y"].expires_at = 1
+    assert proxy.pending_uploads == {}
+    for slot in ("upl_X", "upl_Y"):
+        retry = run(call(proxy, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "again"}))
+        assert retry["structuredContent"]["error"] == "unknown_upload"  # the client uploads again
     run(proxy._reap_expired_uploads())
     info = proxy.blobs.info(blob)
-    assert info.owners == [caption] and info.ref_count == 1
-
-
-def test_legacy_slot_that_cannot_be_reconciled_never_releases_bytes(make_proxy, tmp_path, monkeypatch):
-    from blobs import BlobStore
-    from conftest import FakeMemory
-
-    memory = FakeMemory()
-    store = BlobStore(str(tmp_path / "blobs"), b"test-signing-key")
-    blob = store.put(PNG).id
-    store.put(PNG)
-    caption = memory.add("cat", user_id="my_lord", metadata={"upload_id": "upl_X"})["results"][0]["id"]
-    store.register_owner(blob, caption)
-    state = tmp_path / "state"
-    state.mkdir()
-    (state / "pending_uploads.json").write_text(json.dumps({"upl_X": _legacy_slot("upl_X", blob)}))
-
-    def down(memory_id):
-        raise ConnectionError("qdrant down")
-
-    monkeypatch.setattr(memory, "get", down)
-    proxy = make_proxy(memory=memory, state_dir=str(state))
-    proxy.pending_uploads["upl_X"].expires_at = 1
-    proxy._cleanup_expired_uploads()
-    assert proxy.blobs.info(blob).ref_count == 2  # leaked (lint shows it), never unlinked
+    assert info.owners == [caption] and info.ref_count == 2  # Y's bytes stay as a leak lint reports
 
 
 def test_lint_counts_a_slot_marker_only_while_its_slot_is_pending(tmp_path):

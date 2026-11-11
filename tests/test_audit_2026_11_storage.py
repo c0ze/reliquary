@@ -456,7 +456,7 @@ def test_retried_commit_after_a_crash_does_not_double_own_the_blob(make_proxy, t
     retry = run(call(restarted, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "cat (retry)"}))
     info = restarted.blobs.info(committed["blob_id"])
     assert info.owners == [committed["memory_id"]] and info.ref_count == 1
-    assert retry["structuredContent"]["error"] == "already_committed"
+    assert retry["structuredContent"]["error"] == "unknown_upload"  # forgotten at the restart
     assert slot not in restarted.pending_uploads
     assert len(memory._store) == 1
 
@@ -492,7 +492,7 @@ def test_startup_skips_type_invalid_upload_slots(make_proxy, tmp_path):
     assert json.loads((state / "pending_uploads.json").read_text()) == {}
 
 
-def test_startup_releases_the_blob_of_an_unusable_slot(make_proxy, tmp_path):
+def test_startup_keeps_the_blob_of_an_unusable_slot(make_proxy, tmp_path):
     from blobs import BlobStore
 
     state = tmp_path / "state"
@@ -501,8 +501,9 @@ def test_startup_releases_the_blob_of_an_unusable_slot(make_proxy, tmp_path):
     (state / "pending_uploads.json").write_text(json.dumps({
         "upl_bad": {"id": "upl_bad", "created_at": 1.0, "expires_at": None, "blob_id": blob.id}}))
     proxy = make_proxy(state_dir=str(state))
-    run(proxy._reap_expired_uploads())  # settled by the first pass after start
-    assert proxy.blobs.info(blob.id) is None
+    run(proxy._reap_expired_uploads())
+    # Round 5: whose reference it was cannot be read, so it is kept (lint reports it).
+    assert proxy.blobs.info(blob.id) is not None and "upl_bad" not in proxy.pending_uploads
 
 
 def test_startup_keeps_a_slot_with_an_unknown_field(make_proxy, tmp_path):

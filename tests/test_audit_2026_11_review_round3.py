@@ -68,7 +68,7 @@ def _backend_down(*args, **kwargs):
 
 # 1a -- every marked slot is reconciled by upload_id before release ---------
 
-def test_marked_slot_without_commit_record_hands_its_reference_to_an_existing_caption(make_proxy, tmp_path):
+def test_marked_slot_of_unknown_commit_history_is_forgotten_and_keeps_its_bytes(make_proxy, tmp_path):
     from conftest import FakeMemory
 
     memory = FakeMemory()
@@ -76,19 +76,21 @@ def test_marked_slot_without_commit_record_hands_its_reference_to_an_existing_ca
     first = make_proxy(memory=memory, state_dir=str(state))
     slot = run(new_upload(first))
     blob = first.pending_uploads[slot].blob_id
-    # A build that marked slots but did not record commit_user_id wrote the
-    # caption and stopped before handing the reference over.
-    caption = memory.add("cat", user_id="my_lord",
-                         metadata={"kind": "image", "blob_ref": blob, "upload_id": slot})["results"][0]["id"]
+    # A build that marked slots but did not record its commit attempts wrote
+    # the caption and stopped before handing the reference over.
+    memory.add("cat", user_id="my_lord", metadata={"kind": "image", "blob_ref": blob, "upload_id": slot})
     saved = json.loads((state / "pending_uploads.json").read_text())
-    saved[slot].pop("commit_user_id", None)
+    saved[slot].pop("commit_users", None)
     saved[slot]["expires_at"] = 1
     (state / "pending_uploads.json").write_text(json.dumps(saved))
 
     restarted = make_proxy(memory=memory, state_dir=str(state))
-    run(restarted._reap_expired_uploads())  # settled by the first pass after start
+    run(restarted._reap_expired_uploads())
+    # Round 5: its history is unknown, so nothing is guessed: the record is
+    # forgotten and the marker keeps the bytes (lint reports the leak).
+    assert slot not in restarted.pending_uploads
     info = restarted.blobs.info(blob)
-    assert info is not None and info.owners == [caption] and info.ref_count == 1
+    assert info is not None and info.owners == [f"upload:{slot}"]
 
 
 def test_expiry_at_runtime_reconciles_a_marked_slot_before_releasing(make_proxy, tmp_path):
@@ -100,6 +102,7 @@ def test_expiry_at_runtime_reconciles_a_marked_slot_before_releasing(make_proxy,
     blob = proxy.pending_uploads[slot].blob_id
     caption = memory.add("cat", user_id="my_lord",
                          metadata={"kind": "image", "blob_ref": blob, "upload_id": slot})["results"][0]["id"]
+    proxy.pending_uploads[slot].commit_users = ["my_lord"]  # the attempt was recorded before the write
     proxy.pending_uploads[slot].expires_at = 1
     run(call(proxy, "reliquary_add_memory", {"text": "an ordinary write reaps expired slots"}))
     assert slot not in proxy.pending_uploads
@@ -277,7 +280,7 @@ def test_unresolved_commit_record_survives_expiry_and_restart_until_reconciled(m
     assert again.blobs.info(blob).owners == [caption]
 
 
-def test_malformed_slot_with_an_unknown_commit_outcome_is_kept(make_proxy, tmp_path, monkeypatch):
+def test_malformed_slot_is_forgotten_and_keeps_its_bytes(make_proxy, tmp_path, monkeypatch):
     from conftest import FakeMemory
 
     memory = FakeMemory()
@@ -287,21 +290,18 @@ def test_malformed_slot_with_an_unknown_commit_outcome_is_kept(make_proxy, tmp_p
     saved[slot]["expires_at"] = None  # malformed
     (state / "pending_uploads.json").write_text(json.dumps(saved))
     blob = saved[slot]["blob_id"]
-    real_get_all = memory.get_all
-    memory.get_all = _backend_down
     restarted = make_proxy(memory=memory, state_dir=str(state))
     run(restarted._reap_expired_uploads())
+    # Round 5: no guess about a record that cannot be read; the bytes stay.
+    assert slot not in restarted.pending_uploads
     assert restarted.blobs.info(blob).owners == [f"upload:{slot}"]
-    assert slot in restarted.pending_uploads
-    memory.get_all = real_get_all
-    reloaded = make_proxy(memory=memory, state_dir=str(state))
-    run(reloaded._reap_expired_uploads())
-    assert reloaded.blobs.info(blob).owners == [caption]
-    assert slot not in reloaded.pending_uploads
+    fetched = run(call(restarted, "reliquary_fetch_image", {"id": blob}))
+    assert "error" not in fetched["structuredContent"]
 
 
 def test_reaping_backs_off_while_the_memory_backend_is_down(proxy, fake_memory, monkeypatch):
     slot = run(new_upload(proxy))
+    proxy.pending_uploads[slot].commit_users = ["my_lord"]  # an attempt may have written a caption
     proxy.pending_uploads[slot].expires_at = 1
     calls = []
 

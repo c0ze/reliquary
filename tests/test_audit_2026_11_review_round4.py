@@ -93,8 +93,8 @@ async def _until(predicate, timeout=5.0):
 def test_commit_retry_on_a_marked_slot_without_commit_record_finds_the_landed_caption(proxy, fake_memory):
     slot = run(new_upload(proxy))
     blob = proxy.pending_uploads[slot].blob_id
-    assert proxy.pending_uploads[slot].commit_user_id is None
-    # The caption landed, and the reference never moved (e.g. an older build).
+    # An attempt recorded its user, wrote the caption and stopped before the hand-over.
+    proxy.pending_uploads[slot].commit_users = ["my_lord"]
     caption = fake_memory.add("cat", user_id="my_lord",
                               metadata={"kind": "image", "blob_ref": blob, "upload_id": slot})["results"][0]["id"]
     retry = run(call(proxy, "reliquary_commit_image_upload", {"upload_id": slot, "caption": "cat again"}))
@@ -106,24 +106,11 @@ def test_commit_retry_on_a_marked_slot_without_commit_record_finds_the_landed_ca
 
 # 2 -- a cancelled settling pass keeps its claim until its worker is done ----
 
-def test_cancelled_reaper_cannot_release_a_legacy_reference_twice(make_proxy, tmp_path, monkeypatch):
-    from blobs import BlobStore
-    from conftest import FakeMemory
-
-    memory = FakeMemory()
-    store = BlobStore(str(tmp_path / "blobs"), b"test-signing-key")
-    blob = store.put(PNG).id   # the other caption's reference
-    store.put(PNG)             # the legacy slot's unmarked reference
-    other = memory.add("other", user_id="my_lord", metadata={"blob_ref": blob})["results"][0]["id"]
-    store.register_owner(blob, other)
-    state = tmp_path / "state"
-    state.mkdir()
-    (state / "pending_uploads.json").write_text(json.dumps({"upl_L": _slot("upl_L", blob, expires_at=1)}))
-    real_get = memory.get
-    memory.get = lambda memory_id: (_ for _ in ()).throw(ConnectionError("qdrant down"))
-    proxy = make_proxy(memory=memory, state_dir=str(state))  # outcome unknown at startup
-    gate = Gate(real_get)
-    memory.get = gate
+def test_cancelled_reaper_cannot_release_a_reference_twice(make_proxy, tmp_path, monkeypatch):
+    memory, state, blob, other = _expired_marked_slot_sharing_bytes(make_proxy, tmp_path)
+    proxy = make_proxy(memory=memory, state_dir=str(state))
+    gate = Gate(memory.get_all)
+    memory.get_all = gate
 
     async def scenario():
         first = asyncio.create_task(proxy._reap_expired_uploads())
@@ -160,7 +147,9 @@ def _expired_marked_slot_sharing_bytes(make_proxy, tmp_path):
     store.put(PNG, owner="upload:upl_X")
     state = tmp_path / "state"
     state.mkdir()
-    (state / "pending_uploads.json").write_text(json.dumps({"upl_X": _slot("upl_X", blob, expires_at=1)}))
+    # One commit attempt was recorded (so settling must look for a caption).
+    (state / "pending_uploads.json").write_text(json.dumps(
+        {"upl_X": {**_slot("upl_X", blob, expires_at=1), "commit_users": ["my_lord"]}}))
     return memory, state, blob, other
 
 

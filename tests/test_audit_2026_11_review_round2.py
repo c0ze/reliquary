@@ -145,7 +145,7 @@ def test_crash_before_the_caption_landed_leaves_an_ordinary_pending_slot(make_pr
     assert info.owners == [committed["structuredContent"]["memory_id"]] and info.ref_count == 1
 
 
-def test_malformed_marked_slot_releases_only_its_own_reference(make_proxy, tmp_path):
+def test_malformed_marked_slot_releases_no_reference(make_proxy, tmp_path):
     from blobs import BlobStore
 
     store = BlobStore(str(tmp_path / "blobs"), b"test-signing-key")
@@ -157,10 +157,12 @@ def test_malformed_marked_slot_releases_only_its_own_reference(make_proxy, tmp_p
         "upl_bad": {**_legacy_slot("upl_bad", blob), "expires_at": None},
         "upl_good": _legacy_slot("upl_good", blob)}))
     proxy = make_proxy(state_dir=str(state))
-    run(proxy._reap_expired_uploads())  # settled by the first pass after start
+    run(proxy._reap_expired_uploads())
+    # Round 5: a malformed record and a deployed-format record are forgotten and
+    # no reference is touched (a leak lint reports, never a guessed release).
     info = proxy.blobs.info(blob)
-    assert info is not None and info.ref_count == 1 and info.owners == []
-    assert "upl_good" in proxy.pending_uploads  # still holds its unmarked reference
+    assert info is not None and info.ref_count == 2 and info.owners == ["upload:upl_bad"]
+    assert proxy.pending_uploads == {}
 
 
 # b -- must-do steps run before the awaited staleness fan-out ---------------
