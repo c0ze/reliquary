@@ -100,9 +100,14 @@ files.
 Upload-marker compatibility boundary: a pending upload slot now marks the blob
 reference it holds as an `upload:<upload_id>` owner in the blob's sidecar
 (`<blob_dir>/<ab>/<sha256>.json`), and hands it to the caption memory on
-commit. A build older than this one misreads that marker: it treats the upload
+commit. A slot's reference is released or handed over only through that marker
+and only when its owner is certain; otherwise the bytes stay (a leak lint
+reports). Upgrading: slots pending in the deployed build carry no marker and
+are forgotten at the first start without touching any reference (their clients
+get `unknown_upload` and upload again; their bytes stay as an orphan lint
+reports). A build older than this one misreads the marker: it treats the upload
 as already committed and never reclaims its bytes. Before starting an older
 build, let pending uploads commit or expire (a slot lives at most the upload
 TTL, 10 minutes, unless its commit outcome could not be read and it is kept for
-a retry: check that `pending_uploads.json` is empty), or remove the `upload:` entries from the sidecars' `owners`
-by hand without changing `ref_count`.
+a retry: check that `pending_uploads.json` is empty), or remove the `upload:`
+entries from the sidecars' `owners` by hand without changing `ref_count`.

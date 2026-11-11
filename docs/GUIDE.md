@@ -733,12 +733,20 @@ Lint also reports two integrity categories, with or without stats:
 
 Expired upload slots are reaped by a background pass that startup, memory
 writes, new upload slots and expired upload POSTs or commits start; no request
-waits for it. A slot that still holds uploaded bytes is first checked for a
-caption memory carrying its `upload_id` (a commit can stop after writing the
-caption): the bytes go to that caption, or are released if there is none. While
-the memory backend cannot be read, the slot is kept in `pending_uploads.json`
-and retried at most once a minute, so lint does not report its blob as an
-orphan. A commit retry runs the same check first.
+waits for it, and shutdown cancels it. Uploaded bytes are only released or
+handed to a caption when their owner is certain; otherwise they are kept (lint
+reports the leak). A slot whose commit never started is released at expiry. A
+slot whose commit was attempted is first checked for a caption carrying its
+`upload_id` under every user an attempt recorded (a commit can stop after
+writing the caption): the bytes go to that caption, or are released if there is
+none. While the memory backend cannot be read, the slot is kept in
+`pending_uploads.json` and retried at most once a minute, so lint does not
+report its blob as an orphan. A commit retry runs the same check first.
+Deleting a caption whose upload slot is still pending retires that slot and its
+bytes with it (or answers `upload_in_progress` while a commit or the settling
+pass holds the slot). Slots left by a build without upload markers are
+forgotten at startup without touching their bytes: commit answers
+`unknown_upload` and the client uploads again.
 
 ---
 
